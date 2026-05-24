@@ -187,11 +187,13 @@ def process_batch_on_gpu(batch, device, target_size=256):
         
             
             # Map Active(True) to Class 0, Passive(False) to Class 1
-            if "is_dynamic" in batch:
-                is_dyn_batch = batch["is_dynamic"][b_idx]
-                # is_dyn_batch shape is (N, max_instances). n_idx is instance index (0-indexed but uid is 1-indexed)
-                # n_idx corresponds to uid-1.
-                is_dyn_val = is_dyn_batch[torch.arange(len(n_idx), device=device), n_idx]
+            if "is_dynamic" in batch and batch["is_dynamic"][0] is not None:
+                # 🌟 修复：先将 Python List 堆叠成 PyTorch Tensor 🌟
+                is_dyn_tensor = torch.stack([x.to(device, non_blocking=True) for x in batch["is_dynamic"]])
+                is_dyn_batch = is_dyn_tensor[b_idx]
+                
+                # is_dyn_batch shape is (N, max_instances). n_idx is instance index
+                is_dyn_val = is_dyn_batch[torch.arange(len(n_idx), device=device), n_idx.long()]
                 cls_dense[b_idx, t_idx, 0, cy, cx] = (~is_dyn_val).float() # True -> 0.0, False -> 1.0
             else:
                 cls_dense[b_idx, t_idx, 0, cy, cx] = 0.0 # fallback Active
