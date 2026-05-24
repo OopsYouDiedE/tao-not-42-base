@@ -41,38 +41,39 @@ def decode_dfl_boxes(pred_dist, reg_max=16):
     return distances
 
 def load_yolo_backbone_weights(model, checkpoint_path):
-    if not os.path.exists(checkpoint_path): return
+    if not os.path.exists(checkpoint_path): 
+        print(f"⚠️ 权重文件 {checkpoint_path} 不存在，跳过加载。")
+        return
     try:
         ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-        state_dict = ckpt["model"].state_dict() if hasattr(ckpt["model"], "state_dict") else ckpt
-    except Exception: return
-    layer_specs = [
-        ("model.0.", "segmenter.stem.net."),
-        ("model.1.", "segmenter.stage2.0.net."), ("model.2.", "segmenter.stage2.1."),
-        ("model.3.", "segmenter.stage3.0.net."), ("model.4.", "segmenter.stage3.1."),
-        ("model.5.", "segmenter.stage4.0.net."), ("model.6.", "segmenter.stage4.1."),
-        ("model.7.", "segmenter.stage5.0.net."), ("model.8.", "segmenter.stage5.1."),
-        ("model.9.", "segmenter.stage5.2.")
-    ]
+        state_dict = ckpt["model"].state_dict() if hasattr(ckpt, "get") and "model" in ckpt else ckpt
+    except Exception as e: 
+        print(f"⚠️ 加载权重失败: {e}")
+        return
+        
     target_state = model.state_dict()
     updates = {}
-    for src_prefix, tgt_prefix in layer_specs:
-        for src_key in state_dict:
-            if src_key.startswith(src_prefix):
-                tgt_key = src_key.replace(src_prefix, tgt_prefix)
-                tgt_key = tgt_key.replace("conv.", "0.").replace("bn.", "1.")
-                if "cv1." in tgt_key: tgt_key = tgt_key.replace("cv1.", "stem.net.")
-                if "cv2." in tgt_key: tgt_key = tgt_key.replace("cv2.", "out.net.")
-                if "m." in tgt_key:
-                    tgt_key = tgt_key.replace("m.", "blocks.")
-                    tgt_key = tgt_key.replace(".cv1.", ".conv1.net.").replace(".cv2.", ".conv2.net.")
-                if tgt_key in target_state and target_state[tgt_key].shape == state_dict[src_key].shape:
-                    updates[tgt_key] = state_dict[src_key]
+    
+    for src_key, src_val in state_dict.items():
+        # Ultralytics pt 文件的 key 通常是 model.model.0.conv.weight
+        # 我们 MyYOLOE 的 key 是 segmenter.model.0.conv.weight
+        if src_key.startswith("model.model."):
+            tgt_key = src_key.replace("model.model.", "segmenter.model.")
+        elif src_key.startswith("model."):
+            tgt_key = src_key.replace("model.", "segmenter.")
+        else:
+            tgt_key = src_key
+            
+        if tgt_key in target_state and target_state[tgt_key].shape == src_val.shape:
+            updates[tgt_key] = src_val
+            
     target_state.update(updates)
     model.load_state_dict(target_state)
+    print(f"✅ 成功加载 YOLO 预训练权重: {checkpoint_path} (匹配了 {len(updates)} 个张量)")
 def freeze_backbone(model):
+    print("❄️ 正在冻结 YOLOE 分割模块 (保持其强大的 Zero-shot 基础能力)...")
     for name, param in model.segmenter.named_parameters():
-        if "stem" in name or "stage" in name: param.requires_grad = False
+        param.requires_grad = False
 
 # =====================================================================
 # 3. 经验回放池 (Replay Buffer) 与 GPU 数据流水线
@@ -144,14 +145,21 @@ def extract_instances(preds, score_thresh=0.3, nms_thresh=0.5, max_det=20):
                         (rows >= y1.view(N_masks, 1, 1)) & (rows < y2.view(N_masks, 1, 1))
             masks = masks * mask_crop.float() - 10.0 * (~mask_crop).float()
             
-            masks_bool = torch.sigmoid(masks) > 0.5
+            masks_bool = (masks > 0) & mask_crop
         else:
             masks_bool = None
+            
+        classes = None
+        if "classification" in preds:
+            cls_logits = preds["classification"][b, :, valid.nonzero()[:, 0], valid.nonzero()[:, 1]].T
+            # class index with max probability
+            classes = torch.argmax(cls_logits, dim=-1)[keep]
         
         results.append({
             "scores": sel_scores[keep],
             "boxes": decoded_boxes_norm[keep],
-            "masks": masks_bool
+            "masks": masks_bool,
+            "classes": classes
         })
     return results
 
@@ -179,8 +187,19 @@ def compute_instance_loss(preds, targets, step=0):
         
     if w["mask"] > 0:
         loss_mask = compute_per_instance_mask_loss(preds, targets, pos_mask)
+        
+    loss_cls = torch.tensor(0.0, device=device)
+    if w.get("cls", 0) > 0 and "dense_classification" in preds and "cls_dense" in targets:
+        pred_cls_dense = preds["dense_classification"].permute(0,2,3,1)[pos_mask]
+        pred_cls_o2o = preds["classification"].permute(0,2,3,1)[pos_mask]
+        
+        gt_cls = targets["cls_dense"][:, 0][pos_mask].long()
+        
+        loss_cls_dense = F.cross_entropy(pred_cls_dense, gt_cls)
+        loss_cls_o2o = F.cross_entropy(pred_cls_o2o, gt_cls)
+        loss_cls = (loss_cls_dense + loss_cls_o2o) * 0.5
     
-    return loss_obj, loss_box, loss_mask
+    return loss_obj, loss_box, loss_mask, loss_cls
 
 def compute_per_instance_mask_loss(preds, targets, pos_mask):
     B, _, H_feat, W_feat = preds["objectness"].shape
@@ -213,6 +232,9 @@ def compute_per_instance_mask_loss(preds, targets, pos_mask):
     
     seg_batch = targets["seg_small"][b_indices]
     gt_masks_small = (seg_batch == inst_ids.view(num_instances, 1, 1)).float()
+    
+    if gt_masks_small.shape[-2:] != pred_logits_small.shape[-2:]:
+        gt_masks_small = F.interpolate(gt_masks_small.unsqueeze(1), size=pred_logits_small.shape[-2:], mode='nearest').squeeze(1)
     
     preds_sig = torch.sigmoid(pred_logits_small).flatten(1)
     targets_flat = gt_masks_small.flatten(1)
@@ -339,7 +361,8 @@ def get_loss_weights(step):
         "depth": 3.0 if step < 2000 else 1.5,
         "photo": ramp(3000, 5000, 1.0),
         "ego":   3.0,
-        "flow":  ramp(500, 1500, 1.0),
+        "flow":  ramp(0, 500, 1.0),
+        "cls":   ramp(500, 1500, 1.0),
         "anom":  ramp(4000, 6000, 1.0),
         "smooth": 0.05,
         "gate":   0.05,
@@ -360,7 +383,7 @@ def compute_physics_loss(preds, targets, img_t=None, img_next=None, mode="superv
     B, H, W = preds["depth"].shape
     w = get_loss_weights(step)
     
-    loss_obj, loss_box, loss_mask = compute_instance_loss(preds, targets, step=step)
+    loss_obj, loss_box, loss_mask, loss_cls = compute_instance_loss(preds, targets, step=step)
     
     loss_ego = torch.tensor(0.0, device=device)
     if mode == "supervised" and "cam_pos_t" in targets and "cam_pos_next" in targets:
@@ -414,24 +437,42 @@ def compute_physics_loss(preds, targets, img_t=None, img_next=None, mode="superv
     norm_obj = loss_obj / get_ema_loss("Obj", loss_obj)
     norm_box = loss_box / get_ema_loss("Box", loss_box)
     norm_mask = loss_mask / get_ema_loss("Mask", loss_mask)
-    norm_depth = loss_depth / get_ema_loss("Depth", loss_depth)
-    norm_photo = loss_photo / get_ema_loss("Photo", loss_photo)
+    norm_depth = loss_depth / get_ema_loss("Dep", loss_depth)
+    norm_photo = loss_photo / get_ema_loss("Pht", loss_photo)
     norm_ego = loss_ego / get_ema_loss("Ego", loss_ego)
-    norm_flow = loss_flow / get_ema_loss("Flow", loss_flow)
-    norm_anom = loss_anom / get_ema_loss("Anom", loss_anom)
+    norm_flow = loss_flow / get_ema_loss("Flw", loss_flow)
+    norm_anom = loss_anom / get_ema_loss("Ano", loss_anom)
+    norm_cls = loss_cls / get_ema_loss("Cls", loss_cls)
     
-    total = (
-        norm_obj * w["obj"] + norm_box * w["box"] + norm_mask * w["mask"] +
-        norm_depth * w["depth"] + norm_photo * w["photo"] + loss_smooth * w["smooth"] +
-        norm_ego * w["ego"] + norm_flow * w["flow"] + norm_anom * w["anom"] + loss_gate * w["gate"]
+    total_loss = (
+        w.get("obj", 1.0) * norm_obj + 
+        w.get("box", 0.0) * norm_box + 
+        w.get("mask", 0.0) * norm_mask +
+        w.get("depth", 1.0) * norm_depth + 
+        w.get("photo", 0.0) * norm_photo + 
+        w.get("ego", 1.0) * norm_ego +
+        w.get("flow", 0.0) * norm_flow + 
+        w.get("anom", 0.0) * norm_anom + 
+        w.get("cls", 0.0) * norm_cls +
+        w.get("smooth", 0.05) * loss_smooth +
+        w.get("gate", 0.05) * loss_gate
     )
     
-    return total, {
-        "Obj": loss_obj.detach(), "Box": loss_box.detach(), "Mask": loss_mask.detach(),
-        "Depth": loss_depth.detach(), "Photo": loss_photo.detach(),
-        "Ego": loss_ego.detach(), "Flow": loss_flow.detach(),
-        "Anom": loss_anom.detach(), "Gate": loss_gate.detach()
-    }, warped_img
+    loss_dict = {
+        "Obj": loss_obj.item(),
+        "Box": loss_box.item(),
+        "Mask": loss_mask.item(),
+        "Depth": loss_depth.item(),
+        "Photo": loss_photo.item(),
+        "Ego": loss_ego.item(),
+        "Flow": loss_flow.item(),
+        "Anom": loss_anom.item(),
+        "Gate": loss_gate.item(),
+        "Cls": loss_cls.item(),
+        "Tot": total_loss.item()
+    }
+    
+    return total_loss, loss_dict, warped_img
 
 def generate_intrinsics(H, W, device):
     fx = fy = 35.0 / 32.0 * W

@@ -1,40 +1,25 @@
-import cv2
-import numpy as np
-import torch
-import torch.nn.functional as F
-import wandb
 import os
-from utils import extract_instances, six_d_to_matrix
 
-def depth_to_color(depth_map, d_min=None, d_max=None):
-    if d_min is None: d_min = depth_map.min()
-    if d_max is None: d_max = depth_map.max()
-    if d_max > d_min:
-        d_norm = (depth_map - d_min) / (d_max - d_min)
-    else:
-        d_norm = np.zeros_like(depth_map)
-    d_uint8 = (np.clip(d_norm, 0, 1) * 255).astype(np.uint8)
-    return cv2.applyColorMap(d_uint8, cv2.COLORMAP_MAGMA)
+with open('vis.py', 'r', encoding='utf-8') as f:
+    lines = f.readlines()
 
-def flow_to_color(flow_np):
-    flow_np = flow_np.astype(np.float32)
-    # Subtract median to remove global camera motion and highlight relative parallax/object motion
-    flow_np[..., 0] -= np.median(flow_np[..., 0])
-    flow_np[..., 1] -= np.median(flow_np[..., 1])
+import_lines = []
+func_lines = []
+tail_lines = []
+
+state = 0
+for line in lines:
+    if "def save_visualization" in line:
+        state = 1
+    elif state == 1 and line.startswith("def generate_intrinsics"):
+        state = 2
     
-    h, w = flow_np.shape[:2]
-    hsv = np.zeros((h, w, 3), dtype=np.uint8)
-    hsv[..., 1] = 255
-    mag, ang = cv2.cartToPolar(flow_np[..., 0], flow_np[..., 1])
-    hsv[..., 0] = ang * 180 / np.pi / 2
-    mag_max = np.max(mag)
-    if mag_max > 1e-3:
-        hsv[..., 2] = (mag / mag_max * 255).astype(np.uint8)
-    else:
-        hsv[..., 2] = 0
-    return cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
+    if state == 0:
+        import_lines.append(line)
+    elif state == 2:
+        tail_lines.append(line)
 
-def save_visualization(video_t, target_t, pred_t, step, warped_img=None, output_dir="vis_outputs"):
+new_func = """def save_visualization(video_t, target_t, pred_t, step, warped_img=None, output_dir="vis_outputs"):
     os.makedirs(output_dir, exist_ok=True)
     img_tensor = video_t[0].permute(1, 2, 0).cpu().numpy()
     base_bgr = cv2.cvtColor((img_tensor * 255).astype(np.uint8), cv2.COLOR_RGB2BGR)
@@ -172,68 +157,9 @@ def save_visualization(video_t, target_t, pred_t, step, warped_img=None, output_
 # =====================================================================
 # 6. 核心物理监督 Loss 与主循环
 # =====================================================================
-def generate_intrinsics(H, W, device):
-    fx = fy = 35.0 / 32.0 * W
-    cx, cy = W / 2.0, H / 2.0
-    K = torch.tensor([[fx, 0, cx], [0, fy, cy], [0, 0, 1]], device=device, dtype=torch.float32)
-    K_inv = torch.inverse(K)
-    return K, K_inv
+"""
 
-def inverse_warp(img_next, depth, pose, K, K_inv):
-    B, _, H, W = depth.shape
-    device = depth.device
-    
-    y, x = torch.meshgrid(torch.arange(H, device=device), torch.arange(W, device=device), indexing='ij')
-    x = x.flatten().expand(B, -1)
-    y = y.flatten().expand(B, -1)
-    ones = torch.ones_like(x)
-    pixels = torch.stack([x, y, ones], dim=1) 
-    
-    points_3d = torch.bmm(K_inv.expand(B, 3, 3), pixels.float()) 
-    points_3d = points_3d * depth.view(B, 1, H*W)
-    
-    t = pose[:, :3].unsqueeze(2)
-    R = six_d_to_matrix(pose[:, 3:])
-    
-    points_3d_next = torch.bmm(R, points_3d) + t
-    
-    pixels_next = torch.bmm(K.expand(B, 3, 3), points_3d_next)
-    z_next_raw = pixels_next[:, 2:3, :]
-    z_next_safe = torch.clamp(z_next_raw, min=0.01).float()
-    x_next = (pixels_next[:, 0:1, :].float() / z_next_safe).to(pixels_next.dtype)
-    y_next = (pixels_next[:, 1:2, :].float() / z_next_safe).to(pixels_next.dtype)
-    
-    x_norm = 2.0 * x_next / (W - 1) - 1.0
-    y_norm = 2.0 * y_next / (H - 1) - 1.0
-    
-    grid = torch.cat([x_norm, y_norm], dim=1).view(B, 2, H, W).permute(0, 2, 3, 1)
-    grid = torch.clamp(grid, -2.0, 2.0)
-    
-    warped_img = F.grid_sample(img_next, grid, mode='bilinear', padding_mode='border', align_corners=True)
-    warped_img = torch.nan_to_num(warped_img, 0.0)
-    
-    valid_mask = ((x_norm > -1.0) & (x_norm < 1.0) & (y_norm > -1.0) & (y_norm < 1.0)).view(B, 1, H, W).float()
-    safe_depth_mask = ((depth > 0.01) & (z_next_raw.view(B, 1, H, W) > 0.01)).float()
-    valid_mask = valid_mask * safe_depth_mask
-    
-    return warped_img, valid_mask
-
-def edge_aware_smoothness_loss(depth, img):
-    mean_depth = depth.mean(dim=[2, 3], keepdim=True).float()
-    norm_depth = (depth.float() / torch.clamp(mean_depth, min=1e-4)).to(depth.dtype)
-    grad_depth_x = torch.abs(norm_depth[:, :, :, :-1] - norm_depth[:, :, :, 1:])
-    grad_depth_y = torch.abs(norm_depth[:, :, :-1, :] - norm_depth[:, :, 1:, :])
-    grad_img_x = torch.mean(torch.abs(img[:, :, :, :-1] - img[:, :, :, 1:]), dim=1, keepdim=True)
-    grad_img_y = torch.mean(torch.abs(img[:, :, :-1, :] - img[:, :, 1:, :]), dim=1, keepdim=True)
-    grad_depth_x *= torch.exp(-grad_img_x)
-    grad_depth_y *= torch.exp(-grad_img_y)
-    return grad_depth_x.mean() + grad_depth_y.mean()
-
-def dice_loss(preds, targets, smooth=1e-5):
-    preds = torch.sigmoid(preds)
-    preds = preds.flatten()
-    targets = targets.flatten()
-    intersection = (preds * targets).sum()
-    dice = (2. * intersection + smooth) / (preds.sum() + targets.sum() + smooth)
-    return 1.0 - dice
-
+with open('vis.py', 'w', encoding='utf-8') as f:
+    f.writelines(import_lines)
+    f.write(new_func)
+    f.writelines(tail_lines)

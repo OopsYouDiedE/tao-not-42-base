@@ -43,7 +43,7 @@ class AsyncDataBuffer:
         ds = ds.repeat()
         
         def process_video_frames(x):
-            return {
+            out = {
                 'video': x['video'],               
                 'segmentations': x['segmentations'], 
                 'depth': x['depth'],
@@ -51,6 +51,9 @@ class AsyncDataBuffer:
                 'cam_pos': x['camera']['positions'],
                 'cam_quat': x['camera']['quaternions']
             }
+            if 'instances' in x and 'is_dynamic' in x['instances']:
+                out['is_dynamic'] = x['instances']['is_dynamic']
+            return out
             
         ds = ds.map(process_video_frames, num_parallel_calls=tf.data.AUTOTUNE)
         ds = ds.prefetch(tf.data.AUTOTUNE)
@@ -63,6 +66,8 @@ class AsyncDataBuffer:
                 "cam_pos": torch.from_numpy(item['cam_pos']).pin_memory(),
                 "cam_quat": torch.from_numpy(item['cam_quat']).pin_memory()
             }
+            if 'is_dynamic' in item:
+                pinned_item['is_dynamic'] = torch.from_numpy(item['is_dynamic']).pin_memory()
             
             # Decode forward_flow from uint16 (Fallback logic works perfectly for Kubric MOVi-E)
             flow_np = item['forward_flow'].astype(np.float32)
@@ -137,6 +142,7 @@ def process_batch_on_gpu(batch, device, target_size=256):
     
     bboxes_dense = torch.zeros(B, T, 4, H_feat, W_feat, device=device)
     obj_dense = torch.zeros(B, T, 1, H_feat, W_feat, device=device)
+    cls_dense = torch.zeros(B, T, 1, H_feat, W_feat, device=device)
     y_grid = torch.arange(H, device=device, dtype=torch.int16).view(1, 1, 1, H, 1)
     x_grid = torch.arange(W, device=device, dtype=torch.int16).view(1, 1, 1, 1, W)
     
@@ -165,8 +171,17 @@ def process_batch_on_gpu(batch, device, target_size=256):
         if len(n_idx) > 0:
             cy = torch.clamp(((ymin[n_idx, b_idx, t_idx] + ymax[n_idx, b_idx, t_idx]) / 2 / 8).long(), 0, H_feat - 1)
             cx = torch.clamp(((xmin[n_idx, b_idx, t_idx] + xmax[n_idx, b_idx, t_idx]) / 2 / 8).long(), 0, W_feat - 1)
-            
             obj_dense[b_idx, t_idx, 0, cy, cx] = 1.0
+            
+            # Map Active(True) to Class 0, Passive(False) to Class 1
+            if "is_dynamic" in batch:
+                is_dyn_batch = batch["is_dynamic"][b_idx]
+                # is_dyn_batch shape is (N, max_instances). n_idx is instance index (0-indexed but uid is 1-indexed)
+                # n_idx corresponds to uid-1.
+                is_dyn_val = is_dyn_batch[torch.arange(len(n_idx), device=device), n_idx]
+                cls_dense[b_idx, t_idx, 0, cy, cx] = (~is_dyn_val).float() # True -> 0.0, False -> 1.0
+            else:
+                cls_dense[b_idx, t_idx, 0, cy, cx] = 0.0 # fallback Active
             
             grid_x = (cx.float() * 8.0 + 4.0)
             grid_y = (cy.float() * 8.0 + 4.0)
@@ -196,19 +211,53 @@ def process_batch_on_gpu(batch, device, target_size=256):
     
     return {
         "video": video,
-        "seg_raw": seg,
-        "mask": active_mask_float.unsqueeze(2),
-        "bbox": bboxes_global,           
+        "seg_raw": seg_long,
+        "seg_small": seg_small,
         "depth": depth_m_clamped,
         "log_depth": log_depth_target,
         "flow": flow_norm,
         "cam_pos": cam_pos,
         "cam_quat": cam_quat,
-        "obj_dense": obj_dense,
         "bboxes_dense": bboxes_dense,
-        "seg_small": seg_small
+        "obj_dense": obj_dense,
+        "cls_dense": cls_dense,
+        "bboxes_global": bboxes_global,
+        "is_dynamic": batch.get("is_dynamic")
     }
 
-# =====================================================================
-# 4. NMS 实例提取与逐实例 Loss
-# =====================================================================
+import queue
+
+class CUDAPrefetcher:
+    """Overlaps GPU data processing with training to maximize GPU utilization."""
+    def __init__(self, buffer, device, target_size=256, max_prefetch=2):
+        self.buffer = buffer
+        self.device = device
+        self.target_size = target_size
+        self.queue = queue.Queue(maxsize=max_prefetch)
+        self.stream = torch.cuda.Stream(device=device) if device.type == 'cuda' else None
+        self.thread = threading.Thread(target=self._worker, daemon=True)
+        self.thread.start()
+
+    def _worker(self):
+        while True:
+            try:
+                batch = self.buffer.get_batch()
+                if self.stream is not None:
+                    with torch.cuda.stream(self.stream):
+                        batch_gpu = process_batch_on_gpu(batch, self.device, self.target_size)
+                else:
+                    batch_gpu = process_batch_on_gpu(batch, self.device, self.target_size)
+                self.queue.put(batch_gpu)
+            except Exception as e:
+                print(f"Prefetcher worker error: {e}")
+                import time
+                time.sleep(1)
+
+    def next(self):
+        batch_gpu = self.queue.get()
+        if self.stream is not None:
+            torch.cuda.current_stream().wait_stream(self.stream)
+            for k, v in batch_gpu.items():
+                if isinstance(v, torch.Tensor):
+                    v.record_stream(torch.cuda.current_stream())
+        return batch_gpu

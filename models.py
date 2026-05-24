@@ -157,6 +157,7 @@ class TAONot42VisionModel(nn.Module):
         # We output the tracked o2o predictions for active usage!
         return {
             'objectness': preds['o2o_objectness'],
+            'classification': preds['o2o_classification'],
             'box_dist': preds['o2o_boxes'] if w['box'] > 0 else None,
             'boxes': decode_dfl_boxes(preds['o2o_boxes'], reg_max=32) if w['box'] > 0 else None,
             'mask_coefficients': preds['o2o_mask_coefficients'] if w['mask'] > 0 else None, 
@@ -173,6 +174,7 @@ class TAONot42VisionModel(nn.Module):
             
             # We also attach dense supervision targets for computing gradients
             'dense_objectness': preds['objectness'],
+            'dense_classification': preds['classification'],
             'dense_box_dist': preds['boxes'],
             'dense_mask_coefficients': preds['mask_coefficients']
         }

@@ -429,6 +429,10 @@ class YOLOESegment26(nn.Module):
         
         self.obj_proj = nn.Conv2d(embed, 1, 1)
         self.one2one_obj_proj = nn.Conv2d(embed, 1, 1)
+        
+        # Open-Vocabulary Semantic Prompts: Active (Class 0) and Passive (Class 1)
+        # Replacing the traditional classification conv with explicit prompt embeddings
+        self.class_prompts = nn.Parameter(torch.randn(2, embed))
 
     def forward(self, x):
         proto_out, semseg = self.proto(x)
@@ -444,12 +448,20 @@ class YOLOESegment26(nn.Module):
         obj_foreground = self.obj_proj(scores[0])
         obj_foreground_o2o = self.one2one_obj_proj(scores_o2o[0])
         
+        # Explicit Dot Product Matching: Object Embeddings * Prompt Embeddings
+        # scores[0] is (B, embed, H, W)
+        # class_prompts is (2, embed)
+        cls_scores = torch.einsum('b c h w, k c -> b k h w', scores[0], self.class_prompts)
+        cls_scores_o2o = torch.einsum('b c h w, k c -> b k h w', scores_o2o[0], self.class_prompts)
+        
         return {
             'features': features,
             'objectness': obj_foreground,
+            'classification': cls_scores,
             'boxes': boxes[0],
             'mask_coefficients': mc[0],
             'o2o_objectness': obj_foreground_o2o,
+            'o2o_classification': cls_scores_o2o,
             'o2o_boxes': boxes_o2o[0],
             'o2o_mask_coefficients': mc_o2o[0],
             'mask_prototypes': proto_out
