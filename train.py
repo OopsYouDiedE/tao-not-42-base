@@ -233,6 +233,7 @@ if __name__ == '__main__':
     parser.add_argument('--yolo_weights', type=str, default='yolo11s-seg.pt')
     parser.add_argument('--use_wandb', action='store_true', default=False)
     parser.add_argument('--freeze', action='store_true', default=False)
+    parser.add_argument('--finetune_after_epoch', type=int, default=0, help='在第几个Epoch后开启自监督微调 (填0表示不开启)')
     args = parser.parse_args()
 
     try:
