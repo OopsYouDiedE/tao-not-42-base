@@ -188,11 +188,20 @@ def process_batch_on_gpu(batch, device, target_size=256):
             
             # Map Active(True) to Class 0, Passive(False) to Class 1
             if "is_dynamic" in batch and batch["is_dynamic"][0] is not None:
-                # 🌟 修复：先将 Python List 堆叠成 PyTorch Tensor 🌟
-                is_dyn_tensor = torch.stack([x.to(device, non_blocking=True) for x in batch["is_dynamic"]])
-                is_dyn_batch = is_dyn_tensor[b_idx]
+                # 🌟 修复 3.0：处理每个视频目标数量不一致的问题 (动态 Padding) 🌟
+                dyn_list = [x.to(device, non_blocking=True) for x in batch["is_dynamic"]]
                 
-                # is_dyn_batch shape is (N, max_instances). n_idx is instance index
+                # 1. 找出当前 batch 中最多的实例数 (比如 19)
+                max_len = max(len(x) for x in dyn_list)
+                
+                # 2. 将不够长的 tensor 在末尾补齐 (F.pad 默认用 False/0 填充末尾)
+                padded_dyn = [F.pad(x, (0, max_len - len(x))) for x in dyn_list]
+                
+                # 3. 现在它们一样长了，可以安全 stack 成 [B, max_len] 的矩阵了！
+                is_dyn_tensor = torch.stack(padded_dyn) 
+                
+                # 4. 取出对应数据
+                is_dyn_batch = is_dyn_tensor[b_idx]
                 is_dyn_val = is_dyn_batch[torch.arange(len(n_idx), device=device), n_idx.long()]
                 cls_dense[b_idx, t_idx, 0, cy, cx] = (~is_dyn_val).float() # True -> 0.0, False -> 1.0
             else:
@@ -236,8 +245,7 @@ def process_batch_on_gpu(batch, device, target_size=256):
         "bboxes_dense": bboxes_dense,
         "obj_dense": obj_dense,
         "cls_dense": cls_dense,
-        "bboxes_global": bboxes_global,
-        "is_dynamic": batch.get("is_dynamic")
+        "bboxes_global": bboxes_global
     }
 
 import queue
