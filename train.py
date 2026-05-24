@@ -222,6 +222,18 @@ if __name__ == '__main__':
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu')
     parser.add_argument('--checkpoint', type=str, default='tao_not_42_weights.pth')
     parser.add_argument('--yolo_weights', type=str, default='yolo11s-seg.pt')
+    parser.add_argument('--use_wandb', action='store_true', default=False)
+    parser.add_argument('--freeze', action='store_true', default=False)
+    args = parser.parse_args()
+
+    device = torch.device(args.device)
+    model = TAONot42Base(img_size=args.img_size).to(device)
+
+    if args.compile_model:
+        try:
+            model = torch.compile(model)
+            print("🚀 torch.compile 开启成功")
+        except Exception as e:
             print(f"⚠️ torch.compile 开启失败 (将使用正常模式): {e}")
 
     if args.yolo_weights:
@@ -281,6 +293,13 @@ if __name__ == '__main__':
         
         epoch_loss_sum = 0.0
         
+        for step_in_epoch in range(args.steps_per_epoch):
+            batch = prefetcher.next()
+            
+            videos = batch["video"]
+            b, t, c, h, w = videos.shape
+            state = None
+            
             for chunk_start in range(0, t, args.seq_len):
                 chunk_end = min(chunk_start + args.seq_len, t)
                 optimizer.zero_grad(set_to_none=True)
@@ -370,62 +389,6 @@ if __name__ == '__main__':
         # --- Epoch 结束 ---
         avg_epoch_loss = epoch_loss_sum / args.steps_per_epoch
         print(f"\n✅ Epoch {epoch} 结束 | 平均 Loss: {avg_epoch_loss:.4f} | Mode: {mode}")
-                        if "stage5" in name: param.requires_grad = True
-                elif global_step == args.unfreeze_step_2 and mode == "supervised":
-                    print(f"\n🔓 [Step {global_step}] 解冻 Stage 4 中层特征...")
-                    for name, param in model.segmenter.named_parameters():
-                        if "stage4" in name: param.requires_grad = True
-                        
-                global_step += 1
-                epoch_loss_sum += total_seq_loss.item()
-                
-                if global_step % 10 == 0:
-                    elapsed = time.time() - start_time
-                    tot_val = total_seq_loss.item()
-                    cs = chunk_steps
-                    
-                    def get_val(k): return loss_dict_acc[k].item()/cs if isinstance(loss_dict_acc[k], torch.Tensor) else loss_dict_acc[k]/cs
-                    
-                    print(f"[{elapsed:.1f}s] E{epoch} S{global_step} [{mode[:3]}] | Tot:{tot_val:.4f} | "
-                          f"Obj:{get_val('Obj'):.2f} Bx:{get_val('Box'):.2f} "
-                          f"Msk:{get_val('Mask'):.2f} Dep:{get_val('Depth'):.2f} "
-                          f"Pht:{get_val('Photo'):.2f} Ego:{get_val('Ego'):.2f} "
-                          f"Flw:{get_val('Flow'):.2f} Ano:{get_val('Anom'):.2f} Cls:{get_val('Cls'):.2f}")
-                    
-                    if args.use_wandb:
-                        log_dict = {f"Loss/{k}": get_val(k) for k in loss_dict_acc}
-                        log_dict.update({
-                            "Loss/Total": tot_val,
-                            "System/Step": global_step,
-                            "System/Epoch": epoch,
-                            "System/Mode": 0 if mode == "supervised" else 1,
-                if global_step % 10 == 0:
-                    elapsed = time.time() - start_time
-                    tot_val = total_seq_loss.item()
-                    cs = chunk_steps
-                    
-                    def get_val(k): return loss_dict_acc[k].item()/cs if isinstance(loss_dict_acc[k], torch.Tensor) else loss_dict_acc[k]/cs
-                    
-                    print(f"[{elapsed:.1f}s] E{epoch} S{global_step} [{mode[:3]}] | Tot:{tot_val:.4f} | "
-                          f"Obj:{get_val('Obj'):.2f} Bx:{get_val('Box'):.2f} "
-                          f"Msk:{get_val('Mask'):.2f} Dep:{get_val('Depth'):.2f} "
-                          f"Pht:{get_val('Photo'):.2f} Ego:{get_val('Ego'):.2f} "
-                          f"Flw:{get_val('Flow'):.2f} Ano:{get_val('Anom'):.2f} Cls:{get_val('Cls'):.2f}")
-                    
-                    if args.use_wandb:
-                        log_dict = {f"Loss/{k}": get_val(k) for k in loss_dict_acc}
-                        log_dict.update({
-                            "Loss/Total": tot_val,
-                            "System/Step": global_step,
-                            "System/Epoch": epoch,
-                            "System/Mode": 0 if mode == "supervised" else 1,
-                            "System/Buffer_Size": len(buffer.buffer)
-                        })
-                        wandb.log(log_dict, step=global_step)
-        
-        # --- Epoch 结束 ---
-        avg_epoch_loss = epoch_loss_sum / args.steps_per_epoch
-        print(f"\n✅ Epoch {epoch} 结束 | 平均 Loss: {avg_epoch_loss:.4f} | Mode: {mode}")
         
         epoch_ckpt_path = args.checkpoint.replace(".pth", f"_epoch_{epoch}.pth")
         torch.save(model.state_dict(), epoch_ckpt_path)
@@ -471,14 +434,52 @@ if __name__ == '__main__':
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu')
     parser.add_argument('--checkpoint', type=str, default='tao_not_42_weights.pth')
     parser.add_argument('--yolo_weights', type=str, default='yolo11s-seg.pt')
-    parser.add_argument('--freeze', action='store_true', default=True)
-    parser.add_argument('--use_wandb', action='store_true', default=True)
-    parser.add_argument('--wandb_project', type=str, default='TAO-NOT-42')
-    parser.add_argument('--finetune_after_epoch', type=int, default=None)
-
+    parser.add_argument('--use_wandb', action='store_true', default=False)
+    parser.add_argument('--freeze', action='store_true', default=False)
     args = parser.parse_args()
-    print('====== TAO-NOT-42 V12 配置 ======')
-    for k, v in vars(args).items(): print(f"{k}: {v}")
+
+    device = torch.device(args.device)
+    model = TAONot42Base(img_size=args.img_size).to(device)
+
+    if args.compile_model:
+        try:
+            model = torch.compile(model)
+            print("🚀 torch.compile 开启成功")
+        except Exception as e:
+            print(f"⚠️ torch.compile 开启失败 (将使用正常模式): {e}")
+
+    if args.yolo_weights:
+        if not os.path.exists(args.yolo_weights):
+            print(f"🌍 正在自动下载 YOLO11 预训练权重 {args.yolo_weights} ...")
+            import urllib.request
+            try:
+                urllib.request.urlretrieve(f"https://github.com/ultralytics/assets/releases/download/v8.3.0/{args.yolo_weights}", args.yolo_weights)
+            except Exception as e:
+                print(f"下载失败: {e}")
+        load_yolo_backbone_weights(model, args.yolo_weights)
+        if args.freeze: freeze_backbone(model)
+            
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
+    scaler = torch.amp.GradScaler(device.type) if device.type == 'cuda' else None
     
-    if args.mode == 'train':
+    buffer = AsyncDataBuffer(
+        split='train', 
+        max_buffer_size=args.max_buffer_size, 
+        batch_size=args.batch_size, 
+        max_samples=args.max_samples
+    )
+    prefetcher = CUDAPrefetcher(buffer, device, target_size=args.img_size)
+    
+    if args.use_wandb:
+        try:
+            wandb.init(project="tao-not-42-v12", config=vars(args))
+        except:
+            print("⚠️ wandb 初始化失败，将禁用。")
+            args.use_wandb = False
+            
+    try:
         train_model(args)
+    except KeyboardInterrupt:
+        print("\n🛑 训练被用户中断。")
+    finally:
+        buffer.stop()
