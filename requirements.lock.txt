@@ -1,4 +1,0 @@
-h5py>=3.10
-numpy>=1.26
-opencv-python>=4.9
-torch>=2.2
