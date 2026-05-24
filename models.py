@@ -54,34 +54,20 @@ class MyYOLOE(nn.Module):
         self.model[21].f = [-1, 10]
         self.model[23].f = [16, 19, 22]
 
-
-    def forward(self, x, gru_state_injection=None):
+    def forward(self, x):
         y = []
         for i, m in enumerate(self.model):
-            if isinstance(m.f, list):
-                if i == 23 and gru_state_injection is not None:
-                    # Inject ConvGRU spatiotemporal state into the YOLOE Head!
-                    # y[16] is P3, y[19] is P4, y[22] is P5
-                    x_in = [gru_state_injection, y[19], y[22]]
-                else:
-                    x_in = [y[j] for j in m.f]
-                x = m(x_in)
-            else:
-                x = m(x)
+            x = m([y[j] for j in m.f] if isinstance(m.f, list) else x)
             y.append(x)
-            
+        
+        # 提取各个尺度的特征
         f1 = y[0]
         f2 = y[1]
         p3_fused = y[16]
-        
-        # We also return the raw Head output
-        if gru_state_injection is None:
-            # If no injection, just return spatial features
-            return f1, f2, p3_fused
-        else:
-            # Return final predictions computed ON the injected gru_state
-            preds = y[23]
-            return preds
+        p4 = y[19]
+        p5 = y[22]
+        return f1, f2, p3_fused, p4, p5
+
 
 class TAONot42VisionModel(nn.Module):
     def __init__(self, base_channels=48, hidden_channels=768):
@@ -99,23 +85,17 @@ class TAONot42VisionModel(nn.Module):
         b, _, h, w = peripheral.shape
         state = state or {}
         
-        # Step 1: Spatial Backbone Pass
-        f1, f2, p3_fused = self.segmenter(peripheral)
+        f1, f2, p3_fused, p4, p5 = self.segmenter(peripheral)
         
-        # Step 2: Temporal Memory Update (40x40 Bottleneck)
-        # 1. Downsample P3 (80x80 -> 40x40) to save 4x ConvGRU FLOPs
+        # Step 2: GRU 时空融合
         p3_down = torch.nn.functional.avg_pool2d(p3_fused, kernel_size=2, stride=2)
-        
-        # 2. Run ConvGRU at 40x40
         gru_state = state.get('gru', None)
         next_gru_state = self.conv_gru(p3_down, dt, gru_state)
-        
-        # 3. Upsample ConvGRU state back to 80x80 and add original P3 as high-freq residual
         next_gru_state_up = torch.nn.functional.interpolate(next_gru_state, size=p3_fused.shape[-2:], mode='bilinear', align_corners=False)
         spatiotemporal_p3 = p3_fused + next_gru_state_up
         
-        # Step 3: Spatiotemporal Object Tracking (One-to-One Head Pass)
-        preds = self.segmenter(peripheral, gru_state_injection=spatiotemporal_p3)
+        # Step 3: 直接调用检测头 (YOLOESegment26 是 segmenter.model 的最后一层)
+        preds = self.segmenter.model[-1]([spatiotemporal_p3, p4, p5])
         
         # The rest of the physics pipeline runs on the temporally tracked spatiotemporal_p3
         depth_logits = self.depth_decoder(f1, f2, spatiotemporal_p3, spatiotemporal_p3)
