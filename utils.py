@@ -169,7 +169,9 @@ def compute_instance_loss(preds, targets, step=0):
     loss_obj = focal_loss(preds["objectness"], targets["obj_dense"])
     pos_mask = targets["obj_dense"][:, 0] > 0.5
     if pos_mask.sum() == 0:
-        return loss_obj, torch.tensor(0.0, device=device), torch.tensor(0.0, device=device)
+        # 巧妙利用 preds 乘 0 保留计算图叶子节点的连通性
+        dummy_loss = preds["boxes"].sum() * 0.0 + preds["mask_coefs"].sum() * 0.0
+        return loss_obj, dummy_loss, dummy_loss
     
     loss_box = torch.tensor(0.0, device=device)
     loss_mask = torch.tensor(0.0, device=device)

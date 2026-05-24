@@ -169,10 +169,22 @@ def process_batch_on_gpu(batch, device, target_size=256):
         valid_mask = (true_area >= 10) & (box_area <= 4 * true_area) & valid_bt
         
         n_idx, b_idx, t_idx = torch.where(valid_mask)
+        
         if len(n_idx) > 0:
+            # 1. 提取这些有效目标的面积
+            areas = box_area[n_idx, b_idx, t_idx]
+            
+            # 2. 按照面积降序获取排序后的索引 (大目标在前，小目标在后)
+            sort_idx = torch.argsort(areas, descending=True)
+            
+            # 3. 对 batch, time, instance 的索引重新排序
+            n_idx = n_idx[sort_idx]
+            b_idx = b_idx[sort_idx]
+            t_idx = t_idx[sort_idx]
             cy = torch.clamp(((ymin[n_idx, b_idx, t_idx] + ymax[n_idx, b_idx, t_idx]) / 2 / 8).long(), 0, H_feat - 1)
             cx = torch.clamp(((xmin[n_idx, b_idx, t_idx] + xmax[n_idx, b_idx, t_idx]) / 2 / 8).long(), 0, W_feat - 1)
             obj_dense[b_idx, t_idx, 0, cy, cx] = 1.0
+        
             
             # Map Active(True) to Class 0, Passive(False) to Class 1
             if "is_dynamic" in batch:

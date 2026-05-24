@@ -8,7 +8,16 @@ from models import TAONot42VisionModel
 from load_dataset import AsyncDataBuffer, process_batch_on_gpu, CUDAPrefetcher
 from utils import compute_physics_loss, extract_instances, load_yolo_backbone_weights, freeze_backbone, setup_finetune_mode
 from vis import save_visualization
-
+def get_loss_weights(step):
+    """
+    动态损失权重调度器。
+    返回各个分支的权重，如果权重为 0，模型底层会自动跳过该分支的前向计算。
+    """
+    return {
+        "Obj": 1.0, "Box": 1.0, "Mask": 1.0, "Depth": 1.0,
+        "Photo": 1.0, "Ego": 1.0, "Flow": 1.0, "Anom": 1.0,
+        "Gate": 1.0, "Cls": 1.0
+    }
 def train_model(args):
     device = torch.device(args.device)
     if device.type == 'cuda': torch.backends.cudnn.benchmark = True
@@ -105,7 +114,7 @@ def train_model(args):
                     target_t["cam_quat_t"] = batch["cam_quat"][:, step]
                     
                     with torch.autocast(device_type=device.type, enabled=(scaler is not None)):
-                        out = model(x_t, dt_t, global_step, state)
+                        out, next_state = model(x_t, dt_t, global_step, state, get_loss_weights_fn=get_loss_weights)
                         state = out["next_state"]
                         loss, loss_dict, warped_img = compute_physics_loss(out, target_t, x_t, x_next, mode=mode, step=global_step)
                         

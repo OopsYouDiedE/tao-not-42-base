@@ -353,7 +353,11 @@ class YOLOESegment26(nn.Module):
         # Explicit Dot Product Matching: Object Embeddings * Prompt Embeddings
         # scores[0] is (B, embed, H, W)
         # class_prompts is (2, embed)
-        cls_scores = torch.einsum('b c h w, k c -> b k h w', scores[0], self.class_prompts)
+        norm_scores = F.normalize(scores[0], p=2, dim=1)
+        norm_prompts = F.normalize(self.class_prompts, p=2, dim=1)
+
+        # 计算余弦相似度并乘以缩放温度系数 (如 10.0，使 sigmoid 激活具有更好的区分度)
+        cls_scores = torch.einsum('b c h w, k c -> b k h w', norm_scores, norm_prompts) * 10.0
         cls_scores_o2o = torch.einsum('b c h w, k c -> b k h w', scores_o2o[0], self.class_prompts)
         
         return {
