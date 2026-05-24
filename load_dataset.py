@@ -95,7 +95,8 @@ class AsyncDataBuffer:
             "depth": [item['depth'] for item in batch_list],
             "forward_flow": [item['forward_flow'] for item in batch_list],
             "cam_pos": [item['cam_pos'] for item in batch_list],
-            "cam_quat": [item['cam_quat'] for item in batch_list]
+            "cam_quat": [item['cam_quat'] for item in batch_list],
+            "is_dynamic": [item.get('is_dynamic') for item in batch_list]
         }
 
 def process_batch_on_gpu(batch, device, target_size=256):

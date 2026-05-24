@@ -120,7 +120,8 @@ class C3k2(nn.Module):
             self.m = nn.ModuleList(C3k(self.c, self.c, 2, shortcut, g, e2) if c3k else Bottleneck(self.c, self.c, shortcut, g, k=(3, 3), e=e2) for _ in range(n))
     def forward(self, x):
         y = list(self.cv1(x).chunk(2, 1))
-        y.extend(m(y[-1]) for m in self.m)
+        for m in self.m:
+            y.append(m(y[-1]))
         return self.cv2(torch.cat(y, 1))
 
 class TimeAwareConvGRUCell(nn.Module):
