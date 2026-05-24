@@ -36,7 +36,16 @@ def train_model(args):
         max_samples=args.max_samples
     )
     
-    if args.use_wandb: wandb.init(project=args.wandb_project, config=vars(args))
+    if args.use_wandb:
+        try:
+            import google.colab
+            from google.colab import userdata
+            wandb_key = userdata.get('WANDB_API_KEY')
+            if wandb_key:
+                wandb.login(key=wandb_key)
+        except Exception:
+            pass
+        wandb.init(project=args.wandb_project, config=vars(args))
         
     model.train()
     mode = "supervised"
@@ -207,7 +216,7 @@ if __name__ == '__main__':
     parser.add_argument('--checkpoint', type=str, default='tao_not_42_weights.pth')
     parser.add_argument('--yolo_weights', type=str, default='')
     parser.add_argument('--freeze', action='store_true', default=False)
-    parser.add_argument('--use_wandb', action='store_true', default=False)
+    parser.add_argument('--use_wandb', action='store_true', default=True)
     parser.add_argument('--wandb_project', type=str, default='TAO-NOT-42')
     parser.add_argument('--finetune_after_epoch', type=int, default=None)
 
