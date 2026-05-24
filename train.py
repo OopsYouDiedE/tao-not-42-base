@@ -226,49 +226,6 @@ if __name__ == '__main__':
     parser.add_argument('--freeze', action='store_true', default=False)
     args = parser.parse_args()
 
-    device = torch.device(args.device)
-    model = TAONot42VisionModel(img_size=args.img_size).to(device)
-
-    if args.compile_model:
-        try:
-            model = torch.compile(model)
-            print("🚀 torch.compile 开启成功")
-        except Exception as e:
-            print(f"⚠️ torch.compile 开启失败 (将使用正常模式): {e}")
-
-    if args.yolo_weights:
-        if not os.path.exists(args.yolo_weights):
-            print(f"🌍 正在自动下载 YOLO11 预训练权重 {args.yolo_weights} ...")
-            import urllib.request
-            try:
-                urllib.request.urlretrieve(f"https://github.com/ultralytics/assets/releases/download/v8.3.0/{args.yolo_weights}", args.yolo_weights)
-            except Exception as e:
-                print(f"下载失败: {e}")
-        load_yolo_backbone_weights(model, args.yolo_weights)
-        if args.freeze: freeze_backbone(model)
-            
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
-    scaler = torch.amp.GradScaler(device.type) if device.type == 'cuda' else None
-    
-    buffer = AsyncDataBuffer(
-        split='train', 
-        max_buffer_size=args.max_buffer_size, 
-        batch_size=args.batch_size, 
-        max_samples=args.max_samples
-    )
-    prefetcher = CUDAPrefetcher(buffer, device, target_size=args.img_size)
-    
-    if args.use_wandb:
-        try:
-            import google.colab
-            from google.colab import userdata
-            wandb_key = userdata.get('WANDB_API_KEY')
-            if wandb_key:
-                wandb.login(key=wandb_key)
-        except Exception:
-            pass
-        wandb.init(project=args.wandb_project, config=vars(args))
-        
     try:
         train_model(args)
     except KeyboardInterrupt:
