@@ -207,6 +207,9 @@ if __name__ == '__main__':
     parser.add_argument('--checkpoint', type=str, default='tao_not_42_weights.pth')
     parser.add_argument('--yolo_weights', type=str, default='')
     parser.add_argument('--freeze', action='store_true', default=False)
+    parser.add_argument('--use_wandb', action='store_true', default=False)
+    parser.add_argument('--wandb_project', type=str, default='TAO-NOT-42')
+    parser.add_argument('--finetune_after_epoch', type=int, default=None)
 
     args = parser.parse_args()
     print('====== TAO-NOT-42 V12 配置 ======')

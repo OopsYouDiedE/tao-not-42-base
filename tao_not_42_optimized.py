@@ -30,7 +30,12 @@ import wandb
 # =====================================================================
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 import sys
-IN_COLAB = 'google.colab' in sys.modules
+
+try:
+    import google.colab
+    IN_COLAB = True
+except ImportError:
+    IN_COLAB = False
 
 if IN_COLAB:
     os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"

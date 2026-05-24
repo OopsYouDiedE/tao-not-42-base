@@ -1,7 +1,12 @@
 import torch
 import sys
 
-IN_COLAB = 'google.colab' in sys.modules
+try:
+    import google.colab
+    IN_COLAB = True
+except ImportError:
+    IN_COLAB = False
+
 if IN_COLAB:
     import tensorflow as tf
     import tensorflow_datasets as tfds
