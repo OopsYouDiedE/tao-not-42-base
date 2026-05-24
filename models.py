@@ -1,0 +1,178 @@
+import torch
+import torch.nn as nn
+from blocks import (
+    Conv, C3k2, SPPF, C2PSA, Concat, 
+    FastSAMStyleSegmenter, DepthDecoder, TimeAwareConvGRUCell, 
+    EgoPoseHead, FlowDecoder, FeaturePredictorHead, _FastSAMPredictionHead, YOLOESegment26
+)
+
+class MyYOLOE(nn.Module):
+    def __init__(self):
+        super().__init__()
+        
+        def c(dim): return int(dim * 0.5)
+        def n(depth): return max(round(depth * 0.5), 1)
+        
+        self.model = nn.Sequential(
+            Conv(3, c(64), 3, 2), # 0 (f1)
+            Conv(c(64), c(128), 3, 2), # 1 (f2)
+            C3k2(c(128), c(256), n=n(2), c3k=False, e=0.25), # 2
+            Conv(c(256), c(256), 3, 2), # 3
+            C3k2(c(256), c(512), n=n(2), c3k=False, e=0.25), # 4
+            Conv(c(512), c(512), 3, 2), # 5
+            C3k2(c(512), c(512), n=n(2), c3k=True), # 6
+            Conv(c(512), c(1024), 3, 2), # 7
+            C3k2(c(1024), c(1024), n=n(2), c3k=True), # 8
+            SPPF(c(1024), c(1024), k=5, n=3, shortcut=True), # 9
+            C2PSA(c(1024), c(1024), n=n(2), e=0.5), # 10
+            
+            nn.Upsample(scale_factor=2.0, mode='nearest'), # 11
+            Concat(dimension=1), # 12. Takes [11, 6]
+            C3k2(c(1024) + c(512), c(512), n=n(2), c3k=True), # 13
+            
+            nn.Upsample(scale_factor=2.0, mode='nearest'), # 14
+            Concat(dimension=1), # 15. Takes [14, 4]
+            C3k2(c(512) + c(512), c(256), n=n(2), c3k=True), # 16 (P3)
+            
+            Conv(c(256), c(256), 3, 2), # 17
+            Concat(dimension=1), # 18. Takes [17, 13]
+            C3k2(c(256) + c(512), c(512), n=n(2), c3k=True), # 19 (P4)
+            
+            Conv(c(512), c(512), 3, 2), # 20
+            Concat(dimension=1), # 21. Takes [20, 10]
+            C3k2(c(512) + c(1024), c(1024), n=n(2), c3k=True, e=0.5, attn=True), # 22 (P5)
+            
+            YOLOESegment26(nc=80, nm=32, npr=256, embed=512, reg_max=32, ch=(128, 256, 512)) # 23
+        )
+
+        for m in self.model:
+            m.f = -1
+            
+        self.model[12].f = [-1, 6]
+        self.model[15].f = [-1, 4]
+        self.model[18].f = [-1, 13]
+        self.model[21].f = [-1, 10]
+        self.model[23].f = [16, 19, 22]
+
+
+    def forward(self, x, gru_state_injection=None):
+        y = []
+        for i, m in enumerate(self.model):
+            if isinstance(m.f, list):
+                if i == 23 and gru_state_injection is not None:
+                    # Inject ConvGRU spatiotemporal state into the YOLOE Head!
+                    # y[16] is P3, y[19] is P4, y[22] is P5
+                    x_in = [gru_state_injection, y[19], y[22]]
+                else:
+                    x_in = [y[j] for j in m.f]
+                x = m(x_in)
+            else:
+                x = m(x)
+            y.append(x)
+            
+        f1 = y[0]
+        f2 = y[1]
+        p3_fused = y[16]
+        
+        # We also return the raw Head output
+        if gru_state_injection is None:
+            # If no injection, just return spatial features
+            return f1, f2, p3_fused
+        else:
+            # Return final predictions computed ON the injected gru_state
+            preds = y[23]
+            return preds
+
+class TAONot42VisionModel(nn.Module):
+    def __init__(self, base_channels=48, hidden_channels=768):
+        super().__init__()
+        self.segmenter = MyYOLOE()
+        self.depth_decoder = DepthDecoder(128, 64, 32, ch_gru=128)
+        self.conv_gru = TimeAwareConvGRUCell(128, 128)
+        self.pose_head = EgoPoseHead(128)
+        self.flow_head = FlowDecoder(128)
+        self.feature_predictor = FeaturePredictorHead(128)
+        self.state_update_gate_head = nn.Sequential(nn.Linear(128 + 1, 64), nn.SiLU(), nn.Linear(64, 1))
+        
+
+    def forward(self, peripheral, dt, step, state=None, get_loss_weights_fn=None):
+        b, _, h, w = peripheral.shape
+        state = state or {}
+        
+        # Step 1: Spatial Backbone Pass
+        f1, f2, p3_fused = self.segmenter(peripheral)
+        
+        # Step 2: Temporal Memory Update (40x40 Bottleneck)
+        # 1. Downsample P3 (80x80 -> 40x40) to save 4x ConvGRU FLOPs
+        p3_down = torch.nn.functional.avg_pool2d(p3_fused, kernel_size=2, stride=2)
+        
+        # 2. Run ConvGRU at 40x40
+        gru_state = state.get('gru', None)
+        next_gru_state = self.conv_gru(p3_down, dt, gru_state)
+        
+        # 3. Upsample ConvGRU state back to 80x80 and add original P3 as high-freq residual
+        next_gru_state_up = torch.nn.functional.interpolate(next_gru_state, size=p3_fused.shape[-2:], mode='bilinear', align_corners=False)
+        spatiotemporal_p3 = p3_fused + next_gru_state_up
+        
+        # Step 3: Spatiotemporal Object Tracking (One-to-One Head Pass)
+        preds = self.segmenter(peripheral, gru_state_injection=spatiotemporal_p3)
+        
+        # The rest of the physics pipeline runs on the temporally tracked spatiotemporal_p3
+        depth_logits = self.depth_decoder(f1, f2, spatiotemporal_p3, spatiotemporal_p3)
+
+        depth_logits = torch.nn.functional.interpolate(depth_logits, size=(h, w), mode='bilinear', align_corners=False).squeeze(1)
+        log_depth_pred = depth_logits
+        depth_pred = torch.exp(torch.clamp(log_depth_pred, min=-4.6, max=4.6)) 
+        
+        ego_pose = self.pose_head(spatiotemporal_p3)
+        
+        # w is required, assume it's passed or all active
+        w = get_loss_weights_fn(step) if get_loss_weights_fn else {'flow': 1, 'box': 1, 'mask': 1, 'anom': 1}
+        
+        if w['flow'] > 0:
+            raw_flow = self.flow_head(spatiotemporal_p3)
+            pred_flow = 1.5 * torch.tanh(raw_flow)
+            preds['flow'] = pred_flow
+        else:
+            pred_flow = None
+        
+        prev_ego_pose = state.get('prev_ego', torch.zeros_like(ego_pose))
+        if gru_state is not None and w['anom'] > 0:
+            # Anomaly map can be 40x40 since it compares GRU states directly!
+            pred_current_feature = self.feature_predictor(gru_state, prev_ego_pose)
+            feature_error_map = torch.nn.functional.smooth_l1_loss(pred_current_feature, next_gru_state, reduction='none').mean(dim=1)
+        else:
+            feature_error_map = torch.zeros(b, next_gru_state.shape[2], next_gru_state.shape[3], device=peripheral.device)
+        
+        selected_feature = spatiotemporal_p3.mean(dim=[2, 3])
+        gate_in = torch.cat([selected_feature, dt.view(-1, 1)], dim=-1)
+        raw_gate = self.state_update_gate_head(gate_in)
+        gate = torch.sigmoid(raw_gate).view(-1, 1, 1, 1)
+        
+        # VERY IMPORTANT: final_gru_state MUST be 40x40 to feed back into next iteration!
+        final_gru_state = gru_state * (1.0 - gate) + next_gru_state * gate if gru_state is not None else next_gru_state
+        
+        from utils import decode_dfl_boxes
+        
+        # We output the tracked o2o predictions for active usage!
+        return {
+            'objectness': preds['o2o_objectness'],
+            'box_dist': preds['o2o_boxes'] if w['box'] > 0 else None,
+            'boxes': decode_dfl_boxes(preds['o2o_boxes'], reg_max=32) if w['box'] > 0 else None,
+            'mask_coefficients': preds['o2o_mask_coefficients'] if w['mask'] > 0 else None, 
+            'mask_prototypes': preds['mask_prototypes'] if w['mask'] > 0 else None,               
+            'depth': depth_pred,                              
+            'log_depth': log_depth_pred,                      
+            'ego_pose': ego_pose,                             
+            'flow': pred_flow,
+            'features': spatiotemporal_p3,
+            'anomaly_map': feature_error_map,                 
+            'feature_error': feature_error_map.mean(),
+            'state_update_gate': gate.view(b),
+            'next_state': {'gru': final_gru_state, 'prev_ego': ego_pose},
+            
+            # We also attach dense supervision targets for computing gradients
+            'dense_objectness': preds['objectness'],
+            'dense_box_dist': preds['boxes'],
+            'dense_mask_coefficients': preds['mask_coefficients']
+        }
