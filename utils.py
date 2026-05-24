@@ -40,10 +40,21 @@ def decode_dfl_boxes(pred_dist, reg_max=16):
     distances = (prob * weights.view(1, 1, reg_max, 1, 1)).sum(dim=2)  # (B, 4, H, W)
     return distances
 
+import urllib.request # 确保文件顶部有引入，或者直接在函数里引入
+
 def load_yolo_backbone_weights(model, checkpoint_path):
     if not os.path.exists(checkpoint_path): 
-        print(f"⚠️ 权重文件 {checkpoint_path} 不存在，跳过加载。")
-        return
+        print(f"⚠️ 权重文件 {checkpoint_path} 不存在，正在尝试自动从 GitHub 下载...")
+        try:
+            # Ultralytics 的官方权重下载链接 (YOLO11 的权重存放在 v8.3.0 release 中)
+            url = f"https://github.com/ultralytics/assets/releases/download/v8.3.0/{checkpoint_path}"
+            urllib.request.urlretrieve(url, checkpoint_path)
+            print(f"✅ 自动下载成功: {checkpoint_path}")
+        except Exception as e:
+            print(f"❌ 下载失败: {e}")
+            print(f"👉 请手动下载 {checkpoint_path} 并放置在项目根目录下。")
+            return
+
     try:
         ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
         state_dict = ckpt["model"].state_dict() if hasattr(ckpt, "get") and "model" in ckpt else ckpt
