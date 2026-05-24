@@ -98,7 +98,7 @@ class TAONot42VisionModel(nn.Module):
         preds = self.segmenter.model[-1]([spatiotemporal_p3, p4, p5])
         
         # The rest of the physics pipeline runs on the temporally tracked spatiotemporal_p3
-        depth_logits = self.depth_decoder(f1, f2, spatiotemporal_p3, spatiotemporal_p3)
+        depth_logits = self.depth_decoder(f1, f2, spatiotemporal_p3, None)
 
         depth_logits = torch.nn.functional.interpolate(depth_logits, size=(h, w), mode='bilinear', align_corners=False).squeeze(1)
         log_depth_pred = depth_logits
