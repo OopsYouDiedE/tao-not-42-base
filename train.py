@@ -7,7 +7,7 @@ import torch.nn.functional as F
 from models import TAONot42VisionModel
 from load_dataset import AsyncDataBuffer, process_batch_on_gpu
 from utils import compute_physics_loss, extract_instances, load_yolo_backbone_weights, freeze_backbone, setup_finetune_mode
-from vis import save_combined_visualization
+from vis import save_visualization
 
 def train_model(args):
     device = torch.device(args.device)

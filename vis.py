@@ -1,8 +1,10 @@
 import cv2
 import numpy as np
 import torch
+import torch.nn.functional as F
 import wandb
 import os
+from utils import extract_instances, six_d_to_matrix
 
 def depth_to_color(depth_map, d_min=None, d_max=None):
     if d_min is None: d_min = depth_map.min()
