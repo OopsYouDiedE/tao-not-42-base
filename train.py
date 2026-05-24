@@ -16,7 +16,9 @@ def get_loss_weights(step):
     return {
         "Obj": 1.0, "Box": 1.0, "Mask": 1.0, "Depth": 1.0,
         "Photo": 1.0, "Ego": 1.0, "Flow": 1.0, "Anom": 1.0,
-        "Gate": 1.0, "Cls": 1.0
+        "Gate": 1.0, "Cls": 1.0,
+        # 🌟 修复1：新增小写键，精准对齐 models.py 的索引 🌟
+        "box": 1.0, "mask": 1.0, "flow": 1.0, "anom": 1.0
     }
 def train_model(args):
     device = torch.device(args.device)
@@ -114,7 +116,7 @@ def train_model(args):
                     target_t["cam_quat_t"] = batch["cam_quat"][:, step]
                     
                     with torch.autocast(device_type=device.type, enabled=(scaler is not None)):
-                        out, next_state = model(x_t, dt_t, global_step, state, get_loss_weights_fn=get_loss_weights)
+                        out = model(x_t, dt_t, global_step, state, get_loss_weights_fn=get_loss_weights)
                         state = out["next_state"]
                         loss, loss_dict, warped_img = compute_physics_loss(out, target_t, x_t, x_next, mode=mode, step=global_step)
                         
