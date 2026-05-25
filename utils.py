@@ -180,9 +180,11 @@ def compute_instance_loss(preds, targets, step=0):
     loss_obj = focal_loss(preds["objectness"], targets["obj_dense"])
     pos_mask = targets["obj_dense"][:, 0] > 0.5
     if pos_mask.sum() == 0:
-        # 巧妙利用 preds 乘 0 保留计算图叶子节点的连通性
-        dummy_loss = preds["boxes"].sum() * 0.0 + preds["mask_coefs"].sum() * 0.0
-        return loss_obj, dummy_loss, dummy_loss
+        dummy_loss = torch.tensor(0.0, device=device)
+        if preds.get("boxes") is not None: dummy_loss = dummy_loss + preds["boxes"].sum() * 0.0
+        if preds.get("mask_coefficients") is not None: dummy_loss = dummy_loss + preds["mask_coefficients"].sum() * 0.0
+        if preds.get("dense_classification") is not None: dummy_loss = dummy_loss + preds["dense_classification"].sum() * 0.0
+        return loss_obj, dummy_loss, dummy_loss, dummy_loss
     
     loss_box = torch.tensor(0.0, device=device)
     loss_mask = torch.tensor(0.0, device=device)
@@ -383,13 +385,14 @@ def get_loss_weights(step):
 
 LOSS_EMA = {}
 def get_ema_loss(name, current_val, alpha=0.95):
-    val = current_val.item()
-    if val == 0: return 1.0
-    if name not in LOSS_EMA:
-        LOSS_EMA[name] = val
-    else:
-        LOSS_EMA[name] = LOSS_EMA[name] * alpha + val * (1 - alpha)
-    return max(LOSS_EMA[name], 1e-4)
+    with torch.no_grad():
+        val = current_val.detach()
+        if name not in LOSS_EMA:
+            LOSS_EMA[name] = val
+        else:
+            LOSS_EMA[name] = LOSS_EMA[name] * alpha + val * (1 - alpha)
+        ema_val = torch.clamp(LOSS_EMA[name], min=1e-4)
+        return torch.where(val == 0.0, torch.tensor(1.0, device=val.device), ema_val)
 
 def compute_physics_loss(preds, targets, img_t=None, img_next=None, mode="supervised", teacher_forcing_ego=None, step=0):
     device = preds["depth"].device
@@ -472,17 +475,17 @@ def compute_physics_loss(preds, targets, img_t=None, img_next=None, mode="superv
     )
     
     loss_dict = {
-        "Obj": loss_obj.item(),
-        "Box": loss_box.item(),
-        "Mask": loss_mask.item(),
-        "Depth": loss_depth.item(),
-        "Photo": loss_photo.item(),
-        "Ego": loss_ego.item(),
-        "Flow": loss_flow.item(),
-        "Anom": loss_anom.item(),
-        "Gate": loss_gate.item(),
-        "Cls": loss_cls.item(),
-        "Tot": total_loss.item()
+        "Obj": loss_obj.detach(),
+        "Box": loss_box.detach(),
+        "Mask": loss_mask.detach(),
+        "Depth": loss_depth.detach(),
+        "Photo": loss_photo.detach(),
+        "Ego": loss_ego.detach(),
+        "Flow": loss_flow.detach(),
+        "Anom": loss_anom.detach(),
+        "Gate": loss_gate.detach(),
+        "Cls": loss_cls.detach(),
+        "Tot": total_loss.detach()
     }
     
     return total_loss, loss_dict, warped_img
