@@ -88,7 +88,7 @@ class TAONot42VisionModel(nn.Module):
     def __init__(self, base_channels=48, hidden_channels=768):
         super().__init__()
         self.segmenter = MyYOLOE()
-        self.depth_decoder = DepthDecoder(128, 64, 32, ch_gru=128)
+        self.depth_decoder = DepthDecoder(128, 64, 32)
         self.conv_gru = TimeAwareConvGRUCell(128, 128)
         self.conv_gru_p4 = TimeAwareConvGRUCell(256, 256)
         self.conv_gru_p5 = TimeAwareConvGRUCell(512, 512)
