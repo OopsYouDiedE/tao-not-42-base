@@ -566,7 +566,7 @@ def compute_physics_loss(
     loss_photo = torch.tensor(0.0, device=device)
     loss_smooth = torch.tensor(0.0, device=device)
 
-    if img_t is not None and img_next is not None and targets.get("has_next", True):
+    if img_t is not None and img_next is not None:
         K, K_inv = generate_intrinsics(H, W, device)
         warped_img, valid_warp_mask = inverse_warp(
             img_next, preds["depth"].unsqueeze(1), preds["ego_pose"], K, K_inv
@@ -586,6 +586,10 @@ def compute_physics_loss(
             sky_mask_1 = (targets["seg_raw"] == 0).float().unsqueeze(1)
 
             mask = valid_warp_mask * (1 - sky_mask_1) * auto_mask
+            if "has_next" in targets:
+                has_next_mask = targets["has_next"].view(-1, 1, 1, 1).float()
+                mask = mask * has_next_mask
+                
             loss_photo = (warp_loss * mask).sum() / mask.sum().clamp(min=1)
             loss_smooth = edge_aware_smoothness_loss(preds["depth"].unsqueeze(1), img_t)
 

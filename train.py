@@ -171,7 +171,7 @@ def train_model(args):
                     target_t["cam_pos_t"] = batch["cam_pos"][:, step]
                     target_t["cam_quat_t"] = batch["cam_quat"][:, step]
                     
-                    target_t["has_next"] = (step + 1 < t)
+                    target_t["has_next"] = torch.tensor(step + 1 < t, device=device)
                     
                     if "cls_dense" in target_t:
                         if global_step < 1000:
@@ -235,6 +235,9 @@ def train_model(args):
 
                     batched_x_t = torch.cat(chunk_x_t, dim=0)
                     batched_x_next = torch.cat(chunk_x_next, dim=0)
+                    
+                    if "has_next" not in batched_targets:
+                        batched_targets["has_next"] = torch.stack([t["has_next"] for t in chunk_targets])
 
                     total_seq_loss, loss_dict, warped_img = compute_physics_loss(
                         batched_preds,
