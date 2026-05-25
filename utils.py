@@ -560,7 +560,13 @@ def compute_physics_loss(
 
     loss_flow = torch.tensor(0.0, device=device)
     if w["flow"] > 0 and preds.get("flow") is not None and "flow_target" in targets:
-        loss_flow = F.smooth_l1_loss(preds["flow"], targets["flow_target"])
+        raw_loss_flow = F.smooth_l1_loss(preds["flow"], targets["flow_target"], reduction="none")
+        if "has_next" in targets:
+            valid_flow_mask = targets["has_next"].view(-1, 1, 1, 1).float()
+            # Normalize by valid mask sum and the other dimensions (C, H, W)
+            loss_flow = (raw_loss_flow * valid_flow_mask).sum() / (valid_flow_mask.sum().clamp(min=1) * raw_loss_flow.shape[1] * raw_loss_flow.shape[2] * raw_loss_flow.shape[3])
+        else:
+            loss_flow = raw_loss_flow.mean()
 
     warped_img = None
     loss_photo = torch.tensor(0.0, device=device)

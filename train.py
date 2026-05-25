@@ -168,6 +168,8 @@ def train_model(args):
                             target_t[k] = v[:, step] if v is not None else None
                     if step + 1 < t:
                         target_t["flow_target"] = batch["flow"][:, step]
+                    else:
+                        target_t["flow_target"] = torch.zeros_like(batch["flow"][:, 0])
 
                     if step + 1 < t:
                         target_t["cam_pos_next"] = batch["cam_pos"][:, step + 1]
