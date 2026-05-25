@@ -214,37 +214,40 @@ def process_batch_on_gpu(batch, device, target_size=256):
     obj_dense = []
     cls_dense = []
 
+    max_uid = int(seg_long.max().item())
+    valid_bt = None
+    ymin = ymax = xmin = xmax = true_area = box_area = None
+    if max_uid > 0:
+        uids = torch.arange(1, max_uid + 1, device=device, dtype=torch.int16).view(
+            -1, 1, 1, 1, 1
+        )
+        masks = seg_long.to(torch.int16).unsqueeze(0) == uids
+        valid_bt = masks.any(dim=-1).any(dim=-1)
+
+        val_H = torch.tensor(H, dtype=torch.int16, device=device)
+        val_W = torch.tensor(W, dtype=torch.int16, device=device)
+        val_neg1 = torch.tensor(-1, dtype=torch.int16, device=device)
+
+        y_grid = torch.arange(H, device=device, dtype=torch.int16).view(1, 1, 1, H, 1)
+        x_grid = torch.arange(W, device=device, dtype=torch.int16).view(1, 1, 1, 1, W)
+
+        ymin = torch.where(masks, y_grid, val_H).amin(dim=(3, 4))
+        ymax = torch.where(masks, y_grid, val_neg1).amax(dim=(3, 4))
+
+        xmin = torch.where(masks, x_grid, val_W).amin(dim=(3, 4))
+        xmax = torch.where(masks, x_grid, val_neg1).amax(dim=(3, 4))
+
+        true_area = masks.sum(dim=(3, 4), dtype=torch.int32)
+        box_area = torch.clamp((xmax - xmin) * (ymax - ymin), min=1)
+
     for stride in [8, 16, 32]:
         H_feat, W_feat = H // stride, W // stride
         
         b_d = torch.zeros(B, T, 4, H_feat, W_feat, device=device)
         o_d = torch.zeros(B, T, 1, H_feat, W_feat, device=device)
         c_d = torch.zeros(B, T, 1, H_feat, W_feat, device=device)
-        
-        y_grid = torch.arange(H, device=device, dtype=torch.int16).view(1, 1, 1, H, 1)
-        x_grid = torch.arange(W, device=device, dtype=torch.int16).view(1, 1, 1, 1, W)
 
-        max_uid = int(seg_long.max().item())
         if max_uid > 0:
-            uids = torch.arange(1, max_uid + 1, device=device, dtype=torch.int16).view(
-                -1, 1, 1, 1, 1
-            )
-            masks = seg_long.to(torch.int16).unsqueeze(0) == uids
-            valid_bt = masks.any(dim=-1).any(dim=-1)
-
-            val_H = torch.tensor(H, dtype=torch.int16, device=device)
-            val_W = torch.tensor(W, dtype=torch.int16, device=device)
-            val_neg1 = torch.tensor(-1, dtype=torch.int16, device=device)
-
-            ymin = torch.where(masks, y_grid, val_H).amin(dim=(3, 4))
-            ymax = torch.where(masks, y_grid, val_neg1).amax(dim=(3, 4))
-
-            xmin = torch.where(masks, x_grid, val_W).amin(dim=(3, 4))
-            xmax = torch.where(masks, x_grid, val_neg1).amax(dim=(3, 4))
-
-            true_area = masks.sum(dim=(3, 4), dtype=torch.int32)
-            box_area = torch.clamp((xmax - xmin) * (ymax - ymin), min=1)
-
             # Valid area conditions based on FPN stride
             if stride == 8:
                 stride_mask = box_area < (32 ** 2)

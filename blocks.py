@@ -262,25 +262,7 @@ class FlowDecoder(nn.Module):
         return self.head(x)
 
 
-class _FastSAMPredictionHead(nn.Module):
-    def __init__(self, in_channels, hidden_channels=256):
-        super().__init__()
-        self.spatial_feature = YOLOConv(in_channels, hidden_channels, kernel_size=3)
-        self.objectness = nn.Conv2d(hidden_channels, 1, kernel_size=1)
-        self.reg_max = 32  # DFL regression bins
-        self.boxes = nn.Conv2d(hidden_channels, 4 * self.reg_max, kernel_size=1)
-        nn.init.constant_(self.boxes.bias, 0.0)
-        self.mask_coefficients = nn.Conv2d(hidden_channels, 32, kernel_size=1)
-        self.grid_cache = {}
 
-    def forward(self, x):
-        feat_sp = self.spatial_feature(x)
-        return {
-            "features": feat_sp,
-            "objectness": self.objectness(feat_sp),
-            "boxes": self.boxes(feat_sp),
-            "mask_coefficients": self.mask_coefficients(feat_sp),
-        }
 
 
 class EgoPoseHead(nn.Module):
@@ -295,7 +277,7 @@ class EgoPoseHead(nn.Module):
     def forward(self, x):
         pooled = self.pool(x).flatten(1)
         pose = self.fc(pooled)
-        t = torch.tanh(pose[:, :3]) * 1.0
+        t = torch.tanh(pose[:, :3]) * 5.0
         # 零初始化保证初始输出为0，加上理想单位正交基
         identity_6d = torch.tensor([1.0, 0.0, 0.0, 0.0, 1.0, 0.0], device=pose.device)
         rot_6d = identity_6d + torch.tanh(pose[:, 3:]) * 0.5
@@ -321,7 +303,7 @@ class FeaturePredictorHead(nn.Module):
 
 
 class DepthDecoder(nn.Module):
-    def __init__(self, ch_p3=256, ch_f2=96, ch_f1=48, ch_gru=256):
+    def __init__(self, ch_p3=256, ch_f2=96, ch_f1=48):
         super().__init__()
         self.up1 = nn.Sequential(
             nn.Upsample(scale_factor=2.0, mode="bilinear", align_corners=False),
@@ -400,6 +382,7 @@ class YOLOESegment26(nn.Module):
         # Open-Vocabulary Semantic Prompts: Active (Class 0) and Passive (Class 1)
         # Replacing the traditional classification conv with explicit prompt embeddings
         self.class_prompts = nn.Parameter(torch.randn(2, embed))
+        self.class_prompts.requires_grad_(False)
 
     def forward(self, x):
         proto_out = self.proto(x)
@@ -510,60 +493,4 @@ class C2f(nn.Module):
         return self.out(torch.cat(parts, dim=1))
 
 
-class FastSAMStyleSegmenter(nn.Module):
-    def __init__(self, base=48, hidden=768):
-        super().__init__()
-        # 骨干网络各 Stage 定义：提取不同感受野与空间分辨率的特征
-        self.stem = YOLOConv(3, base, stride=2)
-        self.stage2 = nn.Sequential(
-            YOLOConv(base, base * 2, stride=2), C2f(base * 2, base * 2, repeats=2)
-        )
-        self.stage3 = nn.Sequential(
-            YOLOConv(base * 2, base * 4, stride=2), C2f(base * 4, base * 4, repeats=4)
-        )  # P3 尺度（输入分辨率的 1/8）
-        self.stage4 = nn.Sequential(
-            YOLOConv(base * 4, base * 8, stride=2), C2f(base * 8, base * 8, repeats=4)
-        )  # P4 尺度（输入分辨率的 1/16）
-        self.stage5 = nn.Sequential(
-            YOLOConv(base * 8, hidden, stride=2),
-            C2f(hidden, hidden, repeats=2),
-            SPPF(hidden, hidden),
-        )  # P5 尺度（高层语义信息，1/32）
 
-        # 💡 极简 FPN 融合模块：激活原本闲置的高层 Stage4/Stage5 特征，增强大尺度与全图上下文的物理理解力
-        # 1. 将 Stage 5 抽象语义特征的通道数用 1x1 卷积压缩，并使用邻近插值上采样 2 倍至与 Stage 4 尺度一致
-        self.up_5_to_4 = nn.Sequential(
-            YOLOConv(hidden, base * 8, kernel_size=1),
-            nn.Upsample(scale_factor=2.0, mode="nearest"),
-        )
-        # 2. 对 Stage 4 的融合特征进行 3x3 卷积，消除上采样产生的混叠效应
-        self.fuse_4 = YOLOConv(base * 8, base * 8, kernel_size=3)
-        # 3. 类似地，将融合后的 P4 特征压缩通道并上采样 2 倍，与 P3 尺度对齐
-        self.up_4_to_3 = nn.Sequential(
-            YOLOConv(base * 8, base * 4, kernel_size=1),
-            nn.Upsample(scale_factor=2.0, mode="nearest"),
-        )
-        # 4. 对最终融合后的 P3 特征（实例提取的黄金分辨率）进行 3x3 卷积平滑
-        self.fuse_3 = YOLOConv(base * 4, base * 4, kernel_size=3)
-
-        self.mask_prototypes = nn.Sequential(
-            YOLOConv(base * 4, base * 4, kernel_size=3),
-            YOLOConv(base * 4, base * 2, kernel_size=3),
-            nn.Conv2d(base * 2, 32, kernel_size=1),
-        )
-        self.prediction_head = _FastSAMPredictionHead(base * 4, hidden_channels=256)
-
-    def forward(self, x):
-        f1 = self.stem(x)
-        f2 = self.stage2(f1)
-        p3 = self.stage3(f2)
-        f4 = self.stage4(p3)
-        f5 = self.stage5(f4)  # 运行高层骨干推理
-
-        # 💡 自顶向下特征侧边融合 (Feature Pyramid Fusion)
-        f4_fused = self.fuse_4(f4 + self.up_5_to_4(f5))
-        p3_fused = self.fuse_3(p3 + self.up_4_to_3(f4_fused))
-
-        prototypes = self.mask_prototypes(p3_fused)
-        preds = self.prediction_head(p3_fused)
-        return (f1, f2, p3_fused), prototypes, preds

@@ -72,6 +72,8 @@ class MyYOLOE(nn.Module):
     def forward(self, x):
         y = []
         for i, m in enumerate(self.model):
+            if i == 23:
+                break
             x = m([y[j] for j in m.f] if isinstance(m.f, list) else x)
             y.append(x)
 
@@ -188,7 +190,7 @@ class TAONot42VisionModel(nn.Module):
         raw_gate = self.state_update_gate_head(gate_in)
         gate = torch.sigmoid(raw_gate).view(-1, 1, 1, 1)
 
-        # VERY IMPORTANT: final_gru_state MUST be 40x40 to feed back into next iteration!
+        # VERY IMPORTANT: final_gru_state MUST be tracked to feed back into next iteration!
         final_gru_state = (
             gru_state * (1.0 - gate) + next_gru_state * gate
             if gru_state is not None

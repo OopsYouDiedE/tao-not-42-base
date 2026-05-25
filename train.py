@@ -188,9 +188,9 @@ def train_model(args):
                     if "cls_dense" in target_t:
                         if global_step < 1000:
                             if isinstance(target_t["cls_dense"], list):
-                                target_t["cls_dense"] = [torch.zeros_like(x) for x in target_t["cls_dense"]]
+                                target_t["cls_dense"] = [torch.full_like(x, -100) for x in target_t["cls_dense"]]
                             else:
-                                target_t["cls_dense"] = torch.zeros_like(target_t["cls_dense"])
+                                target_t["cls_dense"] = torch.full_like(target_t["cls_dense"], -100)
                         else:
                             if step < 2:
                                 if isinstance(target_t["cls_dense"], list):
@@ -320,6 +320,8 @@ def train_model(args):
                     for name, param in model.segmenter.named_parameters():
                         if any(f"model.{i}." in name for i in range(20, 23)):
                             param.requires_grad = True
+                        else:
+                            param.requires_grad = False
                 elif global_step == args.unfreeze_step_2 and mode == "supervised":
                     print(
                         f"\n🔓 [Step {args.unfreeze_step_2}] 解冻 P4 中层特征 (Stage 4)..."

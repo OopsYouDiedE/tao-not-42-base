@@ -75,11 +75,12 @@ def load_yolo_backbone_weights(model, checkpoint_path):
 
     try:
         ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-        state_dict = (
-            ckpt["model"].state_dict()
-            if hasattr(ckpt, "get") and "model" in ckpt
-            else ckpt
-        )
+        if isinstance(ckpt, dict) and "model" in ckpt:
+            state_dict = ckpt["model"].state_dict()
+        elif hasattr(ckpt, "state_dict"):
+            state_dict = ckpt.state_dict()
+        else:
+            state_dict = ckpt
     except Exception as e:
         print(f"⚠️ 加载权重失败: {e}")
         return
@@ -539,10 +540,11 @@ def get_ema_loss(name, current_val, alpha=0.95):
         val = current_val.detach()
         if val > 0.0:
             if name not in LOSS_EMA:
-                LOSS_EMA[name] = val
+                LOSS_EMA[name] = val.item()
             else:
-                LOSS_EMA[name] = LOSS_EMA[name] * alpha + val * (1 - alpha)
-        ema_val = torch.clamp(LOSS_EMA.get(name, torch.tensor(1e-4, device=val.device)), min=1e-4)
+                LOSS_EMA[name] = LOSS_EMA[name] * alpha + val.item() * (1 - alpha)
+        ema_val = torch.tensor(LOSS_EMA.get(name, 1e-4), device=val.device)
+        ema_val = torch.clamp(ema_val, min=1e-4)
         return torch.where(val == 0.0, torch.tensor(1.0, device=val.device), ema_val)
 
 
@@ -633,7 +635,7 @@ def compute_physics_loss(
             identity_loss = photo_loss_fn(img_next, img_t)
 
             auto_mask = (warp_loss < identity_loss).float()
-            sky_mask_1 = (targets["seg_raw"] == 0).float().unsqueeze(1)
+            sky_mask_1 = targets["sky_mask"].float().unsqueeze(1)
 
             mask = valid_warp_mask * (1 - sky_mask_1) * auto_mask
             if "has_next" in targets:
@@ -643,9 +645,7 @@ def compute_physics_loss(
             loss_photo = (warp_loss * mask).sum() / mask.sum().clamp(min=1)
 
     loss_anom = preds["feature_error"].mean()
-    loss_gate = F.smooth_l1_loss(
-        preds["state_update_gate"], torch.zeros_like(preds["state_update_gate"])
-    )
+    loss_gate = preds["state_update_gate"].abs().mean() * 0.01
 
     norm_obj = loss_obj / get_ema_loss("Obj", loss_obj)
     norm_box = loss_box / get_ema_loss("Box", loss_box)
