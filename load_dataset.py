@@ -200,6 +200,14 @@ def process_batch_on_gpu(batch, device, target_size=256):
 
     active_mask = seg_long > 0
     active_mask_float = active_mask.float()
+    
+    seg_small = (
+        F.interpolate(
+            seg.flatten(0, 1).unsqueeze(1), size=(H // 8, W // 8), mode="nearest"
+        )
+        .squeeze(1)
+        .view(B, T, H // 8, W // 8)
+    )
 
     # Build multi-scale targets for P3 (stride 8), P4 (stride 16), P5 (stride 32)
     bboxes_dense = []
