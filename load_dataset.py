@@ -252,7 +252,7 @@ import queue
 
 class CUDAPrefetcher:
     """Overlaps GPU data processing with training to maximize GPU utilization."""
-    def __init__(self, buffer, device, target_size=256, max_prefetch=2):
+    def __init__(self, buffer, device, target_size=256, max_prefetch=4):
         self.buffer = buffer
         self.device = device
         self.target_size = target_size

@@ -103,7 +103,14 @@ def save_visualization(video_t, target_t, pred_t, step, warped_img=None, output_
         y_idx, x_idx = np.where(obj_t > 0.5)
         for y, x in zip(y_idx, x_idx):
             b = boxes_t[:, y, x]
-            cv2.rectangle(gt_canvas, (int(b[0]*W), int(b[1]*H)), (int(b[2]*W), int(b[3]*H)), (0, 255, 0), 2)
+            # b is [l, t, r, b] in stride units. grid size is 8.0
+            grid_x = x * 8.0 + 4.0
+            grid_y = y * 8.0 + 4.0
+            xmin = int(grid_x - b[0] * 8.0)
+            ymin = int(grid_y - b[1] * 8.0)
+            xmax = int(grid_x + b[2] * 8.0)
+            ymax = int(grid_y + b[3] * 8.0)
+            cv2.rectangle(gt_canvas, (xmin, ymin), (xmax, ymax), (0, 255, 0), 2)
             
     cv2.putText(gt_canvas, "Ground Truth", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
     

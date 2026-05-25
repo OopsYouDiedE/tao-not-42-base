@@ -274,7 +274,7 @@ if __name__ == '__main__':
     parser.add_argument('--img_size', type=int, default=256)
     parser.add_argument('--seq_len', type=int, default=12)
     parser.add_argument('--batch_size', type=int, default=6)
-    parser.add_argument('--max_buffer_size', type=int, default=64)
+    parser.add_argument("--max_buffer_size", type=int, default=64, help="异步流数据缓冲池大小")
     parser.add_argument('--max_samples', type=int, default=None)
     parser.add_argument('--num_workers', type=int, default=0)
     parser.add_argument('--vis_interval', type=int, default=100)
