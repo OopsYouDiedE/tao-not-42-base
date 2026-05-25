@@ -289,26 +289,37 @@ class C3k2(nn.Module):
 # =====================================================================
 # 3. 物理与时间模块 (Time & Physics Modules)
 # =====================================================================
-class TimeAwareConvGRUCell(nn.Module):
-    def __init__(self, input_channels, hidden_channels, num_frequencies=8):
+class SpatioTemporalAttentionBlock(nn.Module):
+    def __init__(self, channels, num_heads=4, num_frequencies=16):
         super().__init__()
-        self.hidden_channels = hidden_channels
-        self.register_buffer("frequencies", 2.0 ** torch.arange(num_frequencies) * ((2.0 * torch.pi) / 16.0))
-        self.time_mlp = nn.Sequential(nn.Linear(num_frequencies * 2, 64), nn.SiLU(), nn.Linear(64, hidden_channels * 2))
-        gate_channels = input_channels + hidden_channels
-        self.update_gate = nn.Conv2d(gate_channels, hidden_channels, 3, padding=1)
-        self.reset_gate = nn.Conv2d(gate_channels, hidden_channels, 3, padding=1)
-        self.candidate = nn.Conv2d(gate_channels, hidden_channels, 3, padding=1)
+        self.channels = channels
+        self.conv3d = nn.Conv3d(channels, channels, kernel_size=3, padding=1, bias=False)
+        self.bn3d = nn.BatchNorm3d(channels)
+        self.act = nn.SiLU(inplace=True)
+        self.attn = nn.MultiheadAttention(embed_dim=channels, num_heads=num_heads, batch_first=True)
+        self.norm = nn.LayerNorm(channels)
+        
+        self.register_buffer("frequencies", torch.exp(torch.linspace(-5, 3, num_frequencies)))
+        self.time_mlp = nn.Sequential(nn.Linear(num_frequencies * 2, 64), nn.SiLU(), nn.Linear(64, channels))
 
-    def forward(self, x, dt, state=None):
-        state = x.new_zeros(x.shape[0], self.hidden_channels, x.shape[2], x.shape[3]) if state is None else F.interpolate(state, size=x.shape[-2:], mode="bilinear", align_corners=False)
-        scaled_time = dt.view(-1, 1) * self.frequencies.view(1, -1)
-        gamma, beta = self.time_mlp(torch.cat([torch.sin(scaled_time), torch.cos(scaled_time)], dim=-1)).chunk(2, dim=-1)
-        modulated_state = state * (gamma.view(-1, self.hidden_channels, 1, 1) + 1.0) + beta.view(-1, self.hidden_channels, 1, 1)
-
-        gates_in = torch.cat([x, modulated_state], dim=1)
-        update, reset = torch.sigmoid(self.update_gate(gates_in)), torch.sigmoid(self.reset_gate(gates_in))
-        return (1.0 - update) * modulated_state + update * torch.tanh(self.candidate(torch.cat([x, reset * modulated_state], dim=1)))
+    def forward(self, x, t):
+        B, T, C, H, W = x.shape
+        x3d = x.permute(0, 2, 1, 3, 4)
+        x3d = self.act(self.bn3d(self.conv3d(x3d)))
+        x3d = x3d.permute(0, 2, 1, 3, 4).contiguous()
+        
+        scaled_time = t.unsqueeze(-1) * self.frequencies.view(1, 1, -1)
+        fourier_feats = torch.cat([torch.sin(scaled_time), torch.cos(scaled_time)], dim=-1)
+        time_embed = self.time_mlp(fourier_feats)
+        
+        x3d = x3d + time_embed.view(B, T, C, 1, 1)
+        
+        x_flat = x3d.permute(0, 3, 4, 1, 2).reshape(B * H * W, T, C)
+        attn_out, _ = self.attn(x_flat, x_flat, x_flat)
+        x_flat = self.norm(x_flat + attn_out)
+        
+        out = x_flat.view(B, H, W, T, C).permute(0, 3, 4, 1, 2).contiguous()
+        return out
 
 class FlowDecoder(nn.Module):
     def __init__(self, ch_p3=256, ch_f2=96, ch_f1=48):
@@ -422,45 +433,62 @@ class TAONot42VisionModel(nn.Module):
         super().__init__()
         self.segmenter = MyYOLOE()
         self.depth_decoder, self.flow_head = DepthDecoder(128, 64, 32), FlowDecoder(128, 64, 32)
-        self.conv_gru, self.conv_gru_p4, self.conv_gru_p5 = TimeAwareConvGRUCell(128, 128), TimeAwareConvGRUCell(256, 256), TimeAwareConvGRUCell(512, 512)
+        self.st_block = SpatioTemporalAttentionBlock(128)
+        self.st_block_p4 = SpatioTemporalAttentionBlock(256)
+        self.st_block_p5 = SpatioTemporalAttentionBlock(512)
         self.pose_head, self.feature_predictor = EgoPoseHead(128), FeaturePredictorHead(128)
-        self.state_update_gate_head = nn.Sequential(nn.Linear(129, 64), nn.SiLU(), nn.Linear(64, 1))
+        self.state_update_gate_head = nn.Sequential(nn.Linear(128, 64), nn.SiLU(), nn.Linear(64, 1))
 
     def extract_features(self, peripheral): return self.segmenter(peripheral)
 
-    def forward_physics(self, f1, f2, p3_fused, p4, p5, dt, step, state=None, get_loss_weights_fn=None, original_shape=None):
-        b, state = f1.shape[0], state or {}
-        h, w = original_shape if original_shape else (f1.shape[2] * 2, f1.shape[3] * 2)
+    def forward_physics(self, f1, f2, p3_fused, p4, p5, dt, step, get_loss_weights_fn=None, original_shape=None):
+        B, T = f1.shape[:2]
+        h, w = original_shape if original_shape else (f1.shape[3] * 2, f1.shape[4] * 2)
 
-        def update_gru(gru_cell, p_feat, gru_state):
-            next_state = gru_cell(F.avg_pool2d(p_feat, 2, 2), dt, gru_state)
-            return next_state, p_feat + F.interpolate(next_state, size=p_feat.shape[-2:], mode="bilinear", align_corners=False)
+        t0 = torch.rand(B, 1, device=f1.device) * 1000.0
+        t_abs = t0 + torch.cumsum(dt, dim=1)
 
-        next_gru, spatiotemporal_p3 = update_gru(self.conv_gru, p3_fused, state.get("gru"))
-        next_gru_p4, spatiotemporal_p4 = update_gru(self.conv_gru_p4, p4, state.get("gru_p4"))
-        next_gru_p5, spatiotemporal_p5 = update_gru(self.conv_gru_p5, p5, state.get("gru_p5"))
+        def update_st(block, p_feat):
+            B_s, T_s, C_s, H_s, W_s = p_feat.shape
+            pooled = F.avg_pool2d(p_feat.flatten(0, 1), 2, 2).view(B_s, T_s, C_s, H_s//2, W_s//2)
+            st_out = block(pooled, t_abs)
+            st_out_up = F.interpolate(st_out.flatten(0, 1), size=(H_s, W_s), mode="bilinear", align_corners=False).view(B_s, T_s, C_s, H_s, W_s)
+            return st_out, p_feat + st_out_up
 
-        preds = torch.utils.checkpoint.checkpoint(lambda p3, p4, p5: self.segmenter.model[-1]([p3, p4, p5]), spatiotemporal_p3, spatiotemporal_p4, spatiotemporal_p5, use_reentrant=False)
+        next_st, spatiotemporal_p3 = update_st(self.st_block, p3_fused)
+        next_st_p4, spatiotemporal_p4 = update_st(self.st_block_p4, p4)
+        next_st_p5, spatiotemporal_p5 = update_st(self.st_block_p5, p5)
 
-        depth_pred = torch.exp(torch.clamp(F.interpolate(self.depth_decoder(f1, f2, spatiotemporal_p3), size=(h, w), mode="bilinear", align_corners=False).squeeze(1), min=-4.6, max=4.6))
-        ego_pose = self.pose_head(spatiotemporal_p3)
+        preds = torch.utils.checkpoint.checkpoint(
+            lambda p3, p4, p5: self.segmenter.model[-1]([p3, p4, p5]),
+            spatiotemporal_p3.flatten(0, 1), spatiotemporal_p4.flatten(0, 1), spatiotemporal_p5.flatten(0, 1), use_reentrant=False
+        )
+
+        depth_pred = torch.exp(torch.clamp(F.interpolate(self.depth_decoder(f1.flatten(0, 1), f2.flatten(0, 1), spatiotemporal_p3.flatten(0, 1)), size=(h, w), mode="bilinear", align_corners=False).squeeze(1), min=-4.6, max=4.6)).view(B*T, h, w)
+        ego_pose = self.pose_head(spatiotemporal_p3.flatten(0, 1))
+        
         lw = get_loss_weights_fn(step) if get_loss_weights_fn else {"flow": 1, "box": 1, "mask": 1, "anom": 1}
         
-        gate = torch.sigmoid(self.state_update_gate_head(torch.cat([spatiotemporal_p3.mean(dim=[2, 3]), dt.view(-1, 1)], dim=-1))).view(-1, 1, 1, 1)
-        mix_st = lambda o, n: o * (1.0 - gate) + n * gate if o is not None else n
+        flow_pred = None
+        if lw["flow"] > 0:
+            flow_pred = self.flow_head(f1.flatten(0, 1), f2.flatten(0, 1), spatiotemporal_p3.flatten(0, 1)) * 1.5
+            
+        gate = torch.sigmoid(self.state_update_gate_head(spatiotemporal_p3.mean(dim=[3, 4]).flatten(0, 1))).view(B*T)
 
-        final_gru, final_gru_p4, final_gru_p5 = mix_st(state.get("gru"), next_gru), mix_st(state.get("gru_p4"), next_gru_p4), mix_st(state.get("gru_p5"), next_gru_p5)
-
-        feat_err = F.smooth_l1_loss(self.feature_predictor(state.get("gru"), state.get("prev_ego", torch.zeros_like(ego_pose))), final_gru.detach(), reduction="none").mean(dim=1) if state.get("gru") is not None and lw["anom"] > 0 else torch.zeros(b, next_gru.shape[2], next_gru.shape[3], device=f1.device)
-
+        feat_err = torch.zeros(B, T, next_st.shape[-2], next_st.shape[-1], device=f1.device)
+        if lw["anom"] > 0 and T > 1:
+            prev_st = next_st[:, :-1].flatten(0, 1)
+            prev_ego = ego_pose.view(B, T, 9)[:, :-1].flatten(0, 1)
+            predicted_st = self.feature_predictor(prev_st, prev_ego).view(B, T-1, *next_st.shape[2:])
+            feat_err[:, 1:] = F.smooth_l1_loss(predicted_st, next_st[:, 1:], reduction="none").mean(dim=2)
+            
         return {
             "objectness": preds["o2o_objectness"], "classification": preds["o2o_classification"],
             "box_dist": preds["o2o_boxes"] if lw["box"] > 0 else None, "boxes": decode_dfl_boxes(preds["o2o_boxes"], 32) if lw["box"] > 0 else None,
             "mask_coefficients": preds["o2o_mask_coefficients"] if lw["mask"] > 0 else None, "mask_prototypes": preds["mask_prototypes"] if lw["mask"] > 0 else None,
             "depth": depth_pred, "log_depth": torch.log(depth_pred), "ego_pose": ego_pose,
-            "flow": self.flow_head(f1, f2, spatiotemporal_p3) * 1.5 if lw["flow"] > 0 else None,
-            "features": spatiotemporal_p3, "anomaly_map": feat_err, "feature_error": feat_err.mean(), "state_update_gate": gate.view(b),
-            "next_state": {"gru": final_gru, "gru_p4": final_gru_p4, "gru_p5": final_gru_p5, "prev_ego": ego_pose},
+            "flow": flow_pred,
+            "features": spatiotemporal_p3.flatten(0, 1), "anomaly_map": feat_err.flatten(0, 1), "feature_error": feat_err.mean(), "state_update_gate": gate,
             "dense_objectness": preds["objectness"], "dense_classification": preds["classification"], "dense_box_dist": preds["boxes"], "dense_mask_coefficients": preds["mask_coefficients"],
         }
 
@@ -775,7 +803,7 @@ class TAOTrainer:
 
     def _setup_finetune(self):
         for param in self.model.segmenter.parameters(): param.requires_grad = False
-        for m in [self.model.depth_decoder, self.model.pose_head, self.model.conv_gru, self.model.conv_gru_p4, self.model.conv_gru_p5, self.model.feature_predictor, self.model.state_update_gate_head, self.model.flow_head]:
+        for m in [self.model.depth_decoder, self.model.pose_head, self.model.st_block, self.model.st_block_p4, self.model.st_block_p5, self.model.feature_predictor, self.model.state_update_gate_head, self.model.flow_head]:
             for p in m.parameters(): p.requires_grad = True
         self.model.segmenter.model[-1].obj_proj.requires_grad_(True); self.model.segmenter.model[-1].one2one_obj_proj.requires_grad_(True)
         if hasattr(self.model.segmenter.model[-1], "class_prompts"): self.model.segmenter.model[-1].class_prompts.requires_grad_(True)
@@ -814,34 +842,71 @@ class TAOTrainer:
                     if any(f"model.{i}." in n for i in (range(20, 23) if self.global_step == self.args.unfreeze_step_1 else range(16, 20))): p.requires_grad = True
         return loss_sum / self.args.steps_per_epoch
 
-    def _extract_target_t(self, batch, step, max_t):
-        tgt = {k: (v if k == "is_dynamic" else ([x[:, step] for x in v] if isinstance(v, list) else (v[:, step] if v is not None else None))) for k, v in batch.items() if k not in ("video", "flow")}
-        tgt.update({"flow_target": batch["flow"][:, step] if step + 1 < max_t else torch.zeros_like(batch["flow"][:, 0]), "cam_pos_next": batch["cam_pos"][:, step + 1 if step + 1 < max_t else step], "cam_quat_next": batch["cam_quat"][:, step + 1 if step + 1 < max_t else step], "cam_pos_t": batch["cam_pos"][:, step], "cam_quat_t": batch["cam_quat"][:, step], "has_next": torch.full((batch["video"].shape[0],), step + 1 < max_t, device=self.device, dtype=torch.bool)})
-        if "cls_dense" in tgt and (self.global_step < 1000 or step < 2): tgt["cls_dense"] = [torch.full_like(x, -100) for x in tgt["cls_dense"]] if isinstance(tgt["cls_dense"], list) else torch.full_like(tgt["cls_dense"], -100)
+    def _extract_target_chunk(self, batch, c_start, c_end, max_t):
+        T = c_end - c_start
+        B = batch["video"].shape[0]
+        tgt = {}
+        for k, v in batch.items():
+            if k in ("video", "flow"): continue
+            if k == "is_dynamic":
+                tgt[k] = v.unsqueeze(1).expand(-1, T, -1).flatten(0, 1) if v is not None else None
+            elif isinstance(v, list):
+                tgt[k] = [x[:, c_start:c_end].flatten(0, 1) for x in v]
+            else:
+                tgt[k] = v[:, c_start:c_end].flatten(0, 1) if v is not None else None
+        
+        flow = batch.get("flow")
+        if flow is not None:
+            flow_tgt = torch.zeros_like(flow[:, c_start:c_end])
+            for i, step in enumerate(range(c_start, c_end)):
+                flow_tgt[:, i] = flow[:, step] if step + 1 < max_t else torch.zeros_like(flow[:, 0])
+            tgt["flow_target"] = flow_tgt.flatten(0, 1)
+        
+        tgt["cam_pos_t"] = batch["cam_pos"][:, c_start:c_end].flatten(0, 1)
+        tgt["cam_quat_t"] = batch["cam_quat"][:, c_start:c_end].flatten(0, 1)
+        
+        cam_pos_next = torch.zeros_like(batch["cam_pos"][:, c_start:c_end])
+        cam_quat_next = torch.zeros_like(batch["cam_quat"][:, c_start:c_end])
+        has_next = torch.zeros(B, T, device=self.device, dtype=torch.bool)
+        for i, step in enumerate(range(c_start, c_end)):
+            cam_pos_next[:, i] = batch["cam_pos"][:, step + 1 if step + 1 < max_t else step]
+            cam_quat_next[:, i] = batch["cam_quat"][:, step + 1 if step + 1 < max_t else step]
+            has_next[:, i] = step + 1 < max_t
+            
+        tgt["cam_pos_next"] = cam_pos_next.flatten(0, 1)
+        tgt["cam_quat_next"] = cam_quat_next.flatten(0, 1)
+        tgt["has_next"] = has_next.flatten(0, 1)
+        
+        if "cls_dense" in tgt and self.global_step < 1000:
+            pass
+            
         return tgt
 
     def _train_chunk(self, batch):
         v_seq, t_max = batch["video"], batch["video"].shape[1]
-        state, loss_acc = None, {k: 0.0 for k in ["Obj", "Box", "Mask", "Depth", "Photo", "Ego", "Flow", "Anom", "Gate", "Cls"]}
+        loss_acc = {k: 0.0 for k in ["Obj", "Box", "Mask", "Depth", "Photo", "Ego", "Flow", "Anom", "Gate", "Cls"]}
         total_loss = 0.0
 
         for c_start in range(0, t_max, self.args.seq_len):
             c_end = min(c_start + self.args.seq_len, t_max)
             c_vids = v_seq[:, c_start:c_end]
+            T_chunk = c_end - c_start
             self.optimizer.zero_grad(set_to_none=True)
 
             with torch.autocast(device_type=self.device.type, enabled=(self.scaler is not None)):
                 with contextlib.nullcontext() if (self.mode == "supervised" and self.global_step >= self.args.unfreeze_step_1) else torch.no_grad():
-                    feats = [f.view(v_seq.shape[0], c_end - c_start, *f.shape[1:]) for f in self.model.extract_features(c_vids.reshape(-1, *c_vids.shape[2:]))]
+                    feats = [f.view(v_seq.shape[0], T_chunk, *f.shape[1:]) for f in self.model.extract_features(c_vids.reshape(-1, *c_vids.shape[2:]))]
                 
-                c_preds, c_tgts = [], []
-                for i_step, step in enumerate(range(c_start, c_end)):
-                    dt = torch.full((v_seq.shape[0],), 1.0 / 24.0 if step > 0 else 0.0, device=self.device)
-                    out = self.model.forward_physics(*(f[:, i_step] for f in feats), dt, self.global_step, state, get_loss_weights, c_vids.shape[-2:])
-                    state = out.pop("next_state")
-                    c_preds.append(out); c_tgts.append(self._extract_target_t(batch, step, t_max))
+                dt = torch.full((v_seq.shape[0], T_chunk), 1.0 / 24.0, device=self.device)
                 
-                loss, l_dict, w_img = compute_physics_loss(concat_dicts(c_preds), concat_dicts(c_tgts), c_vids.flatten(0, 1), torch.cat([v_seq[:, min(s+1, t_max-1)] for s in range(c_start, c_end)], dim=0), self.mode, self.global_step)
+                preds = self.model.forward_physics(*feats, dt, self.global_step, get_loss_weights, c_vids.shape[-2:])
+                tgts = self._extract_target_chunk(batch, c_start, c_end, t_max)
+                
+                img_next = torch.zeros_like(c_vids)
+                for i, step in enumerate(range(c_start, c_end)):
+                    img_next[:, i] = v_seq[:, min(step+1, t_max-1)]
+                    
+                loss, l_dict, w_img = compute_physics_loss(preds, tgts, c_vids.flatten(0, 1), img_next.flatten(0, 1), self.mode, self.global_step)
 
             if self.scaler:
                 self.scaler.scale(loss).backward(); self.scaler.unscale_(self.optimizer)
@@ -849,18 +914,18 @@ class TAOTrainer:
             else:
                 loss.backward(); torch.nn.utils.clip_grad_norm_(self.model.parameters(), 5.0); self.optimizer.step()
 
-            state = {k: v.detach() if isinstance(v, torch.Tensor) else v for k, v in state.items()}
             total_loss += loss.item()
-            for k in loss_acc: loss_acc[k] += l_dict[k] * (c_end - c_start)
+            for k in loss_acc: loss_acc[k] += l_dict[k] * T_chunk
 
             if (self.global_step + 1) % self.args.vis_interval == 0:
-                fp = save_visualization(c_vids[:, -1], c_tgts[-1], c_preds[-1], self.global_step + 1, w_img[-v_seq.shape[0]:] if w_img is not None else None)
+                def slice_b(v): return v[-v_seq.shape[0]:] if v is not None and not isinstance(v, list) else ([x[-v_seq.shape[0]:] for x in v] if v is not None else None)
+                fp = save_visualization(c_vids[:, -1], {k: slice_b(v) for k, v in tgts.items()}, {k: slice_b(v) for k, v in preds.items()}, self.global_step + 1, w_img[-v_seq.shape[0]:] if w_img is not None else None)
                 if wandb and fp: wandb.log({"Vis": wandb.Image(fp)}, step=self.global_step)
             
             self.global_step += 1
             if self.global_step % 10 == 0:
-                print(f"[{time.time()-self.start_time:.1f}s] S{self.global_step} | Tot:{loss.item():.4f} | " + " ".join([f"{k}:{loss_acc[k]/(c_end-c_start):.2f}" for k in ["Obj", "Box", "Mask", "Depth", "Ego", "Flow", "Anom"]]))
-                if wandb: wandb.log({**{f"Loss/{k}": loss_acc[k]/(c_end-c_start) for k in loss_acc}, "Loss/Total": loss.item(), "Step": self.global_step}, step=self.global_step)
+                print(f"[{time.time()-self.start_time:.1f}s] S{self.global_step} | Tot:{loss.item():.4f} | " + " ".join([f"{k}:{loss_acc[k]/T_chunk:.2f}" for k in ["Obj", "Box", "Mask", "Depth", "Ego", "Flow", "Anom"]]))
+                if wandb: wandb.log({**{f"Loss/{k}": loss_acc[k]/T_chunk for k in loss_acc}, "Loss/Total": loss.item(), "Step": self.global_step}, step=self.global_step)
 
         return total_loss
 
@@ -871,7 +936,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--img_size", type=int, default=256)
     parser.add_argument("--seq_len", type=int, default=12)
-    parser.add_argument("--batch_size", type=int, default=6)
+    parser.add_argument("--batch_size", type=int, default=2)
     parser.add_argument("--max_buffer_size", type=int, default=64)
     parser.add_argument("--vis_interval", type=int, default=100)
     parser.add_argument("--compile_model", action="store_true", default=False)
