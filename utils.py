@@ -265,44 +265,35 @@ def compute_instance_loss_single_scale(preds, targets, step=0):
         ) * 0.5
 
     pos_mask = targets["obj_dense"][:, 0] > 0.5
-    if pos_mask.sum() == 0:
-        dummy_loss = torch.tensor(0.0, device=device)
-        if preds.get("boxes") is not None:
-            dummy_loss = dummy_loss + preds["boxes"].sum() * 0.0
-        if preds.get("dense_box_dist") is not None:
-            dummy_loss = dummy_loss + preds["dense_box_dist"].sum() * 0.0
-        if preds.get("mask_coefficients") is not None:
-            dummy_loss = dummy_loss + preds["mask_coefficients"].sum() * 0.0
-        if preds.get("dense_mask_coefficients") is not None:
-            dummy_loss = dummy_loss + preds["dense_mask_coefficients"].sum() * 0.0
-        if preds.get("dense_classification") is not None:
-            dummy_loss = dummy_loss + preds["dense_classification"].sum() * 0.0
-        return loss_obj, dummy_loss, dummy_loss, dummy_loss
+
 
     loss_box = torch.tensor(0.0, device=device)
     loss_mask = torch.tensor(0.0, device=device)
     w = get_loss_weights(step)
 
     if w["box"] > 0:
-        pred_boxes_pos = preds["boxes"].permute(0, 2, 3, 1)[pos_mask]
-        gt_boxes_pos = targets["bboxes_dense"].permute(0, 2, 3, 1)[pos_mask]
+        pred_boxes = preds["boxes"].permute(0, 2, 3, 1)
+        gt_boxes = targets["bboxes_dense"].permute(0, 2, 3, 1)
 
-        loss_giou = giou_loss_with_l1_warmup(pred_boxes_pos, gt_boxes_pos, step=step)
-        pred_dist_pos = preds["box_dist"].permute(0, 2, 3, 1)[pos_mask]
-        loss_dfl = dfl_loss(pred_dist_pos, gt_boxes_pos, reg_max=32)
+        loss_giou = giou_loss_with_l1_warmup(pred_boxes, gt_boxes, step=step)
+        pred_dist = preds["box_dist"].permute(0, 2, 3, 1)
+        loss_dfl = dfl_loss(pred_dist, gt_boxes, reg_max=32)
 
-        loss_box = loss_giou * 1.5 + loss_dfl * 0.5
+        loss_box_dense = loss_giou * 1.5 + loss_dfl * 0.5
+        loss_box = (loss_box_dense * pos_mask.float()).sum() / pos_mask.float().sum().clamp(min=1.0)
 
         if "dense_box_dist" in preds:
-            pred_boxes_dense_pos = decode_dfl_boxes(
+            pred_boxes_dense = decode_dfl_boxes(
                 preds["dense_box_dist"], reg_max=32
-            ).permute(0, 2, 3, 1)[pos_mask]
-            loss_giou_dense = giou_loss_with_l1_warmup(
-                pred_boxes_dense_pos, gt_boxes_pos, step=step
+            ).permute(0, 2, 3, 1)
+            loss_giou_dense2 = giou_loss_with_l1_warmup(
+                pred_boxes_dense, gt_boxes, step=step
             )
-            pred_dist_dense_pos = preds["dense_box_dist"].permute(0, 2, 3, 1)[pos_mask]
-            loss_dfl_dense = dfl_loss(pred_dist_dense_pos, gt_boxes_pos, reg_max=32)
-            loss_box = (loss_box + loss_giou_dense * 1.5 + loss_dfl_dense * 0.5) * 0.5
+            pred_dist_dense = preds["dense_box_dist"].permute(0, 2, 3, 1)
+            loss_dfl_dense = dfl_loss(pred_dist_dense, gt_boxes, reg_max=32)
+            
+            loss_box_dense2 = loss_giou_dense2 * 1.5 + loss_dfl_dense * 0.5
+            loss_box = (loss_box + (loss_box_dense2 * pos_mask.float()).sum() / pos_mask.float().sum().clamp(min=1.0)) * 0.5
 
     if w["mask"] > 0:
         loss_mask = compute_per_instance_mask_loss(
@@ -320,14 +311,15 @@ def compute_instance_loss_single_scale(preds, targets, step=0):
         and "dense_classification" in preds
         and "cls_dense" in targets
     ):
-        pred_cls_dense = preds["dense_classification"].permute(0, 2, 3, 1)[pos_mask]
-        pred_cls_o2o = preds["classification"].permute(0, 2, 3, 1)[pos_mask]
+        pred_cls_dense = preds["dense_classification"].permute(0, 2, 3, 1)
+        pred_cls_o2o = preds["classification"].permute(0, 2, 3, 1)
 
-        gt_cls = targets["cls_dense"][:, 0][pos_mask].long()
+        gt_cls = targets["cls_dense"][:, 0].long()
 
-        loss_cls_dense = F.cross_entropy(pred_cls_dense, gt_cls)
-        loss_cls_o2o = F.cross_entropy(pred_cls_o2o, gt_cls)
-        loss_cls = (loss_cls_dense + loss_cls_o2o) * 0.5
+        loss_cls_dense = F.cross_entropy(pred_cls_dense.flatten(0, 2), gt_cls.flatten(0, 2), reduction="none").view_as(pos_mask)
+        loss_cls_o2o = F.cross_entropy(pred_cls_o2o.flatten(0, 2), gt_cls.flatten(0, 2), reduction="none").view_as(pos_mask)
+        
+        loss_cls = ((loss_cls_dense + loss_cls_o2o) * 0.5 * pos_mask.float()).sum() / pos_mask.float().sum().clamp(min=1.0)
 
     return loss_obj, loss_box, loss_mask, loss_cls
 
@@ -338,56 +330,49 @@ def compute_per_instance_mask_loss(preds, targets, pos_mask, key="mask_coefficie
     seg_raw = targets["seg_raw"]
     H, W = seg_raw.shape[1], seg_raw.shape[2]
 
-    b_indices, y_indices, x_indices = torch.where(pos_mask)
-    num_instances = b_indices.numel()
-    if num_instances == 0:
-        return torch.tensor(0.0, device=device)
-
     stride = H // H_feat
-    center_y = torch.clamp(y_indices * stride + stride // 2, 0, H - 1)
-    center_x = torch.clamp(x_indices * stride + stride // 2, 0, W - 1)
-    inst_ids = seg_raw[b_indices, center_y, center_x].long()
+    y_grid, x_grid = torch.meshgrid(torch.arange(H_feat, device=device), torch.arange(W_feat, device=device), indexing="ij")
+    center_y = torch.clamp(y_grid * stride + stride // 2, 0, H - 1).unsqueeze(0).expand(B, -1, -1)
+    center_x = torch.clamp(x_grid * stride + stride // 2, 0, W - 1).unsqueeze(0).expand(B, -1, -1)
+    
+    inst_ids = torch.gather(
+        seg_raw.view(B, H * W), 
+        1, 
+        (center_y * W + center_x).view(B, H_feat * W_feat)
+    ).view(B, H_feat, W_feat).long()
 
-    valid_mask = inst_ids > 0
-    if not valid_mask.any():
-        return torch.tensor(0.0, device=device)
+    coeffs = preds[key] # [B, 32, H_feat, W_feat]
+    protos = preds["mask_prototypes"] # [B, 32, H_proto, W_proto]
+    
+    pred_logits = torch.einsum("bchw,bcHW->bhwHW", coeffs, protos)
+    
+    seg_batch = targets["seg_small"].unsqueeze(1).unsqueeze(2) # [B, 1, 1, H_proto, W_proto]
+    gt_masks = (seg_batch == inst_ids.view(B, H_feat, W_feat, 1, 1)).float()
 
-    b_indices = b_indices[valid_mask]
-    y_indices = y_indices[valid_mask]
-    x_indices = x_indices[valid_mask]
-    inst_ids = inst_ids[valid_mask]
-    num_instances = b_indices.numel()
-
-    coeffs = preds[key][b_indices, :, y_indices, x_indices]
-    protos = preds["mask_prototypes"][b_indices]
-    pred_logits_small = torch.einsum("np,nphw->nhw", coeffs, protos)
-
-    seg_batch = targets["seg_small"][b_indices]
-    gt_masks_small = (seg_batch == inst_ids.view(num_instances, 1, 1)).float()
-
-    if gt_masks_small.shape[-2:] != pred_logits_small.shape[-2:]:
-        gt_masks_small = F.interpolate(
-            gt_masks_small.unsqueeze(1),
-            size=pred_logits_small.shape[-2:],
+    if gt_masks.shape[-2:] != pred_logits.shape[-2:]:
+        gt_masks = F.interpolate(
+            gt_masks.flatten(0, 2).unsqueeze(1),
+            size=pred_logits.shape[-2:],
             mode="nearest",
-        ).squeeze(1)
+        ).squeeze(1).view_as(pred_logits)
 
-    preds_sig = torch.sigmoid(pred_logits_small).flatten(1)
-    targets_flat = gt_masks_small.flatten(1)
-    intersection = (preds_sig * targets_flat).sum(dim=1)
-    union = preds_sig.sum(dim=1) + targets_flat.sum(dim=1)
+    preds_sig = torch.sigmoid(pred_logits)
+    intersection = (preds_sig * gt_masks).sum(dim=(3, 4))
+    union = preds_sig.sum(dim=(3, 4)) + gt_masks.sum(dim=(3, 4))
 
-    pos_count = targets_flat.sum(dim=1).clamp(min=1.0)
+    pos_count = gt_masks.sum(dim=(3, 4)).clamp(min=1.0)
     smooth = pos_count * 0.01
-    loss_dice = (1.0 - (2.0 * intersection + smooth) / (union + smooth)).mean()
+    loss_dice = 1.0 - (2.0 * intersection + smooth) / (union + smooth)
 
-    bce = F.binary_cross_entropy_with_logits(
-        pred_logits_small, gt_masks_small, reduction="none"
-    )
+    bce = F.binary_cross_entropy_with_logits(pred_logits, gt_masks, reduction="none")
     p_t = torch.exp(-bce)
-    loss_bce = (0.25 * (1 - p_t) ** 2 * bce).mean()
+    loss_bce = (0.25 * (1 - p_t) ** 2 * bce).mean(dim=(3, 4))
 
-    return loss_dice * 2.0 + loss_bce * 1.0
+    loss_mask_dense = loss_dice * 2.0 + loss_bce * 1.0
+    
+    valid_mask = (inst_ids > 0).float() * pos_mask.float()
+    loss_mask = (loss_mask_dense * valid_mask).sum() / valid_mask.sum().clamp(min=1.0)
+    return loss_mask
 
 
 def setup_finetune_mode(model):
@@ -460,7 +445,7 @@ def dfl_loss(pred_dist, target_distances, reg_max=16):
         * weight_right
     )
 
-    return (loss_left + loss_right).mean()
+    return (loss_left + loss_right).mean(dim=-1)
 
 
 def giou_loss(preds, targets):
@@ -482,11 +467,11 @@ def giou_loss(preds, targets):
     enclose_area = enclose_w * enclose_h + 1e-6
 
     giou = iou - (enclose_area - union_area) / enclose_area
-    return (1.0 - giou).mean()
+    return 1.0 - giou
 
 
 def giou_loss_with_l1_warmup(preds, targets, step, warmup_steps=500):
-    l1 = F.smooth_l1_loss(preds, targets, beta=1.0)
+    l1 = F.smooth_l1_loss(preds, targets, beta=1.0, reduction="none").mean(dim=-1)
     if step < warmup_steps:
         return l1
     giou = giou_loss(preds, targets)
@@ -536,14 +521,16 @@ LOSS_EMA = {}
 
 
 def get_ema_loss(name, current_val, alpha=0.95):
+    global LOSS_EMA
     with torch.no_grad():
         val = current_val.detach()
-        if val > 0.0:
-            if name not in LOSS_EMA:
-                LOSS_EMA[name] = val
-            else:
-                LOSS_EMA[name] = LOSS_EMA[name] * alpha + val * (1 - alpha)
-        ema_val = torch.clamp(LOSS_EMA.get(name, torch.tensor(1e-4, device=val.device)), min=1e-4)
+        if name not in LOSS_EMA:
+            LOSS_EMA[name] = torch.tensor(1.0, device=val.device)
+            
+        update_mask = (val > 0.0).float()
+        LOSS_EMA[name] = LOSS_EMA[name] * (1.0 - update_mask * (1.0 - alpha)) + val * update_mask * (1.0 - alpha)
+        
+        ema_val = torch.clamp(LOSS_EMA[name], min=1e-4)
         return torch.where(val == 0.0, torch.tensor(1.0, device=val.device), ema_val)
 
 
