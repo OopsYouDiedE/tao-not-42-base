@@ -133,7 +133,7 @@ class TAONot42VisionModel(nn.Module):
             pred_current_feature = self.feature_predictor(gru_state, prev_ego_pose)
             feature_error_map = torch.nn.functional.smooth_l1_loss(pred_current_feature, next_gru_state, reduction='none').mean(dim=1)
         else:
-            feature_error_map = torch.zeros(b, next_gru_state.shape[2], next_gru_state.shape[3], device=peripheral.device)
+            feature_error_map = torch.zeros(b, next_gru_state.shape[2], next_gru_state.shape[3], device=f1.device)
         
         selected_feature = spatiotemporal_p3.mean(dim=[2, 3])
         gate_in = torch.cat([selected_feature, dt.view(-1, 1)], dim=-1)
