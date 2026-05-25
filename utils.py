@@ -540,11 +540,10 @@ def get_ema_loss(name, current_val, alpha=0.95):
         val = current_val.detach()
         if val > 0.0:
             if name not in LOSS_EMA:
-                LOSS_EMA[name] = val.item()
+                LOSS_EMA[name] = val
             else:
-                LOSS_EMA[name] = LOSS_EMA[name] * alpha + val.item() * (1 - alpha)
-        ema_val = torch.tensor(LOSS_EMA.get(name, 1e-4), device=val.device)
-        ema_val = torch.clamp(ema_val, min=1e-4)
+                LOSS_EMA[name] = LOSS_EMA[name] * alpha + val * (1 - alpha)
+        ema_val = torch.clamp(LOSS_EMA.get(name, torch.tensor(1e-4, device=val.device)), min=1e-4)
         return torch.where(val == 0.0, torch.tensor(1.0, device=val.device), ema_val)
 
 
