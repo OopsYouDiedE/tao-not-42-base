@@ -1,6 +1,7 @@
 import argparse
 import os
 import time
+import contextlib
 
 import torch
 import torch.nn.functional as F
@@ -133,7 +134,8 @@ def train_model(args):
                 with torch.autocast(
                     device_type=device.type, enabled=(scaler is not None)
                 ):
-                    with torch.no_grad():
+                    ctx = contextlib.nullcontext() if (mode == "supervised" and global_step >= args.unfreeze_step_1) else torch.no_grad()
+                    with ctx:
                         f1_f, f2_f, p3_f, p4_f, p5_f = model.extract_features(
                             flat_videos
                         )
@@ -157,8 +159,8 @@ def train_model(args):
                         (b,), 1.0 / 24.0 if step > 0 else 0.0, device=device
                     )
                     target_t = {k: v[:, step] for k, v in batch.items() if k != "video"}
-                    if step > 0:
-                        target_t["flow_target"] = batch["flow"][:, step - 1]
+                    if step + 1 < t:
+                        target_t["flow_target"] = batch["flow"][:, step]
 
                     if step + 1 < t:
                         target_t["cam_pos_next"] = batch["cam_pos"][:, step + 1]
@@ -168,6 +170,15 @@ def train_model(args):
                         target_t["cam_quat_next"] = batch["cam_quat"][:, step]
                     target_t["cam_pos_t"] = batch["cam_pos"][:, step]
                     target_t["cam_quat_t"] = batch["cam_quat"][:, step]
+                    
+                    target_t["has_next"] = (step + 1 < t)
+                    
+                    if "cls_dense" in target_t:
+                        if global_step < 1000:
+                            target_t["cls_dense"] = torch.zeros_like(target_t["cls_dense"])
+                        else:
+                            if step < 2:
+                                target_t["cls_dense"] = torch.full_like(target_t["cls_dense"], -100)
 
                     with torch.autocast(
                         device_type=device.type, enabled=(scaler is not None)

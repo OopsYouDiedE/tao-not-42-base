@@ -163,8 +163,7 @@ class TAONot42VisionModel(nn.Module):
         )
 
         if lw["flow"] > 0:
-            raw_flow = self.flow_head(spatiotemporal_p3)
-            pred_flow = 1.5 * torch.tanh(raw_flow)
+            pred_flow = self.flow_head(f1, f2, spatiotemporal_p3) * 1.5
             preds["flow"] = pred_flow
         else:
             pred_flow = None

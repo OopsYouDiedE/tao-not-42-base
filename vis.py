@@ -58,10 +58,9 @@ def save_visualization(
     inst = instances[0]
     if inst is not None and len(inst["scores"]) > 0:
         for k in range(len(inst["scores"])):
-            # classes: 0 -> Active (Red), 1 -> Passive (Blue)
-            # fallback to Red if classification is missing
-            cls_idx = inst["classes"][k].item() if inst["classes"] is not None else 0
-            color = (0, 0, 255) if cls_idx == 0 else (255, 0, 0)
+            # classes: 1 -> Active (Red), 0 -> Passive (Blue)
+            cls_idx = inst["classes"][k].item() if inst["classes"] is not None else 1
+            color = (0, 0, 255) if cls_idx == 1 else (255, 0, 0)
 
             if inst["masks"] is not None:
                 m = inst["masks"][k].cpu().numpy()
@@ -72,17 +71,6 @@ def save_visualization(
                 pred_canvas,
                 (int(b[0] * W), int(b[1] * H)),
                 (int(b[2] * W), int(b[3] * H)),
-                color,
-                2,
-            )
-            # Add text label for class
-            label = "Active" if cls_idx == 0 else "Passive"
-            cv2.putText(
-                pred_canvas,
-                label,
-                (int(b[0] * W), max(10, int(b[1] * H) - 5)),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.5,
                 color,
                 2,
             )
@@ -109,14 +97,10 @@ def save_visualization(
         for uid in range(1, max_uid + 1):
             m = seg == uid
             if np.any(m):
-                # is_dynamic mapping: True -> Active (Red), False -> Passive (Blue)
-                # is_dyn index is uid - 1
                 if (uid - 1) < len(is_dyn) and is_dyn[uid - 1]:
                     color = (0, 0, 255)  # Red (BGR)
-                    label = "Active"
                 else:
                     color = (255, 0, 0)  # Blue (BGR)
-                    label = "Passive"
 
                 gt_canvas[m] = gt_canvas[m] * 0.5 + np.array(color) * 0.5
 
@@ -125,15 +109,6 @@ def save_visualization(
                 ymin, ymax = y_idx.min(), y_idx.max()
                 xmin, xmax = x_idx.min(), x_idx.max()
                 cv2.rectangle(gt_canvas, (xmin, ymin), (xmax, ymax), color, 2)
-                cv2.putText(
-                    gt_canvas,
-                    label,
-                    (xmin, max(10, ymin - 5)),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.5,
-                    color,
-                    2,
-                )
 
     elif "bboxes_dense" in target_t and "obj_dense" in target_t:
         # Fallback if seg_raw is missing
@@ -167,7 +142,7 @@ def save_visualization(
     half_h, half_w = H // 2, W // 2
 
     # 1. Anomaly Heatmap
-    anom_map = pred_t["anomaly_map"][0].cpu().detach().numpy()
+    anom_map = pred_t["anomaly_map"][0].cpu().detach().numpy().squeeze()
     anom_max = max(float(np.max(anom_map)), 0.001)
     anom_norm = np.clip(anom_map / anom_max, 0, 1)
     anom_img = cv2.applyColorMap((anom_norm * 255).astype(np.uint8), cv2.COLORMAP_HOT)

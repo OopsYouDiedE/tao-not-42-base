@@ -230,25 +230,34 @@ class TimeAwareConvGRUCell(nn.Module):
 
 
 class FlowDecoder(nn.Module):
-    def __init__(self, in_channels=256, hidden=128):
+    def __init__(self, ch_p3=256, ch_f2=96, ch_f1=48):
         super().__init__()
         self.up1 = nn.Sequential(
-            nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
-            YOLOConv(in_channels, hidden, kernel_size=3),
+            nn.Upsample(scale_factor=2.0, mode="bilinear", align_corners=False),
+            YOLOConv(ch_p3, ch_f2, kernel_size=3),
         )
+        self.conv1 = YOLOConv(ch_f2 * 2, ch_f2, kernel_size=3)
         self.up2 = nn.Sequential(
-            nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
-            YOLOConv(hidden, hidden // 2, kernel_size=3),
+            nn.Upsample(scale_factor=2.0, mode="bilinear", align_corners=False),
+            YOLOConv(ch_f2, ch_f1, kernel_size=3),
         )
+        self.conv2 = YOLOConv(ch_f1 * 2, ch_f1, kernel_size=3)
         self.up3 = nn.Sequential(
-            nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
-            YOLOConv(hidden // 2, hidden // 4, kernel_size=3),
+            nn.Upsample(scale_factor=2.0, mode="bilinear", align_corners=False),
+            YOLOConv(ch_f1, ch_f1, kernel_size=3),
         )
-        self.head = nn.Conv2d(hidden // 4, 2, kernel_size=3, padding=1)
+        self.head = nn.Sequential(
+            YOLOConv(ch_f1, ch_f1 // 2, kernel_size=3),
+            nn.Conv2d(ch_f1 // 2, 2, kernel_size=3, padding=1)
+        )
 
-    def forward(self, x):
-        x = self.up1(x)
+    def forward(self, f1, f2, p3):
+        x = self.up1(p3)
+        x = torch.cat([x, f2], dim=1)
+        x = self.conv1(x)
         x = self.up2(x)
+        x = torch.cat([x, f1], dim=1)
+        x = self.conv2(x)
         x = self.up3(x)
         return self.head(x)
 
@@ -374,38 +383,16 @@ class YOLOESegment26(nn.Module):
         self.proto = Proto26(ch, npr, nm, nc)
 
         c5 = max(ch[0] // 4, nm)
-        self.cv5 = nn.ModuleList(
-            nn.Sequential(Conv(x, c5, 3), Conv(c5, c5, 3), nn.Conv2d(c5, nm, 1))
-            for x in ch
-        )
-        self.one2one_cv5 = nn.ModuleList(
-            nn.Sequential(Conv(x, c5, 3), Conv(c5, c5, 3), nn.Conv2d(c5, nm, 1))
-            for x in ch
-        )
+        self.cv5 = nn.Sequential(Conv(ch[0], c5, 3), Conv(c5, c5, 3), nn.Conv2d(c5, nm, 1))
+        self.one2one_cv5 = nn.Sequential(Conv(ch[0], c5, 3), Conv(c5, c5, 3), nn.Conv2d(c5, nm, 1))
 
         c2 = max(ch[0] // 4, 16)
-        self.cv2 = nn.ModuleList(
-            nn.Sequential(
-                Conv(x, c2, 3), Conv(c2, c2, 3), nn.Conv2d(c2, 4 * reg_max, 1)
-            )
-            for x in ch
-        )
-        self.one2one_cv2 = nn.ModuleList(
-            nn.Sequential(
-                Conv(x, c2, 3), Conv(c2, c2, 3), nn.Conv2d(c2, 4 * reg_max, 1)
-            )
-            for x in ch
-        )
+        self.cv2 = nn.Sequential(Conv(ch[0], c2, 3), Conv(c2, c2, 3), nn.Conv2d(c2, 4 * reg_max, 1))
+        self.one2one_cv2 = nn.Sequential(Conv(ch[0], c2, 3), Conv(c2, c2, 3), nn.Conv2d(c2, 4 * reg_max, 1))
 
         c3 = max(ch[0], min(nc, 100))
-        self.cv3 = nn.ModuleList(
-            nn.Sequential(Conv(x, c3, 3), Conv(c3, c3, 3), nn.Conv2d(c3, embed, 1))
-            for x in ch
-        )
-        self.one2one_cv3 = nn.ModuleList(
-            nn.Sequential(Conv(x, c3, 3), Conv(c3, c3, 3), nn.Conv2d(c3, embed, 1))
-            for x in ch
-        )
+        self.cv3 = nn.Sequential(Conv(ch[0], c3, 3), Conv(c3, c3, 3), nn.Conv2d(c3, embed, 1))
+        self.one2one_cv3 = nn.Sequential(Conv(ch[0], c3, 3), Conv(c3, c3, 3), nn.Conv2d(c3, embed, 1))
 
         self.obj_proj = nn.Conv2d(embed, 1, 1)
         self.one2one_obj_proj = nn.Conv2d(embed, 1, 1)
@@ -416,13 +403,13 @@ class YOLOESegment26(nn.Module):
 
     def forward(self, x):
         proto_out = self.proto(x)
-        boxes = [self.cv2[i](x[i]) for i in range(len(x))]
-        scores = [self.cv3[i](x[i]) for i in range(len(x))]
-        mc = [self.cv5[i](x[i]) for i in range(len(x))]
+        boxes = [self.cv2(x[0])]
+        scores = [self.cv3(x[0])]
+        mc = [self.cv5(x[0])]
 
-        boxes_o2o = [self.one2one_cv2[i](x[i]) for i in range(len(x))]
-        scores_o2o = [self.one2one_cv3[i](x[i]) for i in range(len(x))]
-        mc_o2o = [self.one2one_cv5[i](x[i]) for i in range(len(x))]
+        boxes_o2o = [self.one2one_cv2(x[0])]
+        scores_o2o = [self.one2one_cv3(x[0])]
+        mc_o2o = [self.one2one_cv5(x[0])]
 
         features = x[0]
         obj_foreground = self.obj_proj(scores[0])

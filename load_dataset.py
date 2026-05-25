@@ -135,9 +135,17 @@ def process_batch_on_gpu(batch, device, target_size=256):
 
     B, T = video_raw.shape[:2]
 
+    is_dyn_out = None
+    if "is_dynamic" in batch and batch["is_dynamic"][0] is not None:
+        dyn_list = [x.to(device, non_blocking=True) for x in batch["is_dynamic"]]
+        max_len = max(len(x) for x in dyn_list)
+        padded_dyn = [F.pad(x, (0, max_len - len(x))) for x in dyn_list]
+        is_dyn_out = torch.stack(padded_dyn)
+
     depth_raw_m = depth_raw_uint16 / 1000.0
-    depth_raw_m[depth_raw_uint16 == 0] = 1096.0
-    depth_raw_m = torch.clamp(depth_raw_m, 0.01, 1096.0)
+    sky_mask_raw = (depth_raw_uint16 == 0)
+    depth_raw_m[sky_mask_raw] = 100.0
+    depth_raw_m = torch.clamp(depth_raw_m, 0.01, 100.0)
 
     video = video_raw.permute(0, 1, 4, 2, 3).float() / 255.0
 
@@ -163,9 +171,15 @@ def process_batch_on_gpu(batch, device, target_size=256):
             .squeeze(1)
             .view(B, T, target_size, target_size)
         )
+        sky_mask = F.interpolate(
+            sky_mask_raw.float().flatten(0, 1).unsqueeze(1),
+            size=(target_size, target_size),
+            mode="nearest"
+        ).squeeze(1).view(B, T, target_size, target_size).bool()
     else:
         seg = seg_raw.float()
         depth_m = depth_raw_m
+        sky_mask = sky_mask_raw
     H, W = target_size, target_size
     seg_long = seg.long()
 
@@ -254,32 +268,16 @@ def process_batch_on_gpu(batch, device, target_size=256):
             )
             obj_dense[b_idx, t_idx, 0, cy, cx] = 1.0
 
-            # Map Active(True) to Class 0, Passive(False) to Class 1
-            if "is_dynamic" in batch and batch["is_dynamic"][0] is not None:
-                # 🌟 修复 3.0：处理每个视频目标数量不一致的问题 (动态 Padding) 🌟
-                dyn_list = [
-                    x.to(device, non_blocking=True) for x in batch["is_dynamic"]
-                ]
-
-                # 1. 找出当前 batch 中最多的实例数 (比如 19)
-                max_len = max(len(x) for x in dyn_list)
-
-                # 2. 将不够长的 tensor 在末尾补齐 (F.pad 默认用 False/0 填充末尾)
-                padded_dyn = [F.pad(x, (0, max_len - len(x))) for x in dyn_list]
-
-                # 3. 现在它们一样长了，可以安全 stack 成 [B, max_len] 的矩阵了！
-                is_dyn_tensor = torch.stack(padded_dyn)
-
+            # Map Static(False) to Class 0, Dynamic(True) to Class 1
+            if is_dyn_out is not None:
                 # 4. 取出对应数据
-                is_dyn_batch = is_dyn_tensor[b_idx]
+                is_dyn_batch = is_dyn_out[b_idx]
                 is_dyn_val = is_dyn_batch[
                     torch.arange(len(n_idx), device=device), n_idx.long()
                 ]
-                cls_dense[b_idx, t_idx, 0, cy, cx] = (
-                    ~is_dyn_val
-                ).float()  # True -> 0.0, False -> 1.0
+                cls_dense[b_idx, t_idx, 0, cy, cx] = is_dyn_val.float()  # True -> 1.0, False -> 0.0
             else:
-                cls_dense[b_idx, t_idx, 0, cy, cx] = 0.0  # fallback Active
+                cls_dense[b_idx, t_idx, 0, cy, cx] = 1.0  # fallback Dynamic
 
             grid_x = cx.float() * 8.0 + 4.0
             grid_y = cy.float() * 8.0 + 4.0
@@ -333,6 +331,8 @@ def process_batch_on_gpu(batch, device, target_size=256):
         "obj_dense": obj_dense,
         "cls_dense": cls_dense,
         "bboxes_global": bboxes_global,
+        "is_dynamic": is_dyn_out,
+        "sky_mask": sky_mask,
     }
 
 

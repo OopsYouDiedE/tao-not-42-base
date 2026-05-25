@@ -478,13 +478,13 @@ def get_loss_weights(step):
 
     return {
         "obj": 1.0,
-        "box": ramp(300, 800, 2.0),
-        "mask": ramp(1500, 2500, 1.0),
-        "depth": 3.0 if step < 2000 else 1.5,
-        "photo": ramp(3000, 5000, 1.0),
-        "ego": 3.0,
-        "flow": ramp(0, 500, 1.0),
-        "cls": ramp(500, 1500, 1.0),
+        "box": 1.5,
+        "mask": 1.0,
+        "depth": 3.0 if step < 3000 else 1.5,
+        "photo": ramp(1000, 3000, 1.0),
+        "ego": ramp(100, 600, 3.0),
+        "flow": ramp(300, 1000, 1.0),
+        "cls": 1.0,
         "anom": ramp(4000, 6000, 1.0),
         "smooth": 0.05,
         "gate": 0.05,
@@ -540,11 +540,23 @@ def compute_physics_loss(
         raw_loss_depth = F.smooth_l1_loss(
             preds["log_depth"], targets["log_depth"], reduction="none"
         )
-        # Sky was clamped to 100.0, so anything >= 99.0 is sky
-        valid_depth_mask = (targets["depth"] < 99.0).float()
+        valid_depth_mask = (~targets["sky_mask"]).float()
         loss_depth = (
             raw_loss_depth * valid_depth_mask
         ).sum() / valid_depth_mask.sum().clamp(min=1)
+        
+        # Depth Edge-Gradient Loss for sharpness
+        grad_pred_x = preds["depth"][:, :, 1:] - preds["depth"][:, :, :-1]
+        grad_gt_x = targets["depth"][:, :, 1:] - targets["depth"][:, :, :-1]
+        grad_pred_y = preds["depth"][:, 1:, :] - preds["depth"][:, :-1, :]
+        grad_gt_y = targets["depth"][:, 1:, :] - targets["depth"][:, :-1, :]
+        
+        mask_x = valid_depth_mask[:, :, 1:] * valid_depth_mask[:, :, :-1]
+        mask_y = valid_depth_mask[:, 1:, :] * valid_depth_mask[:, :-1, :]
+        
+        loss_grad_x = F.smooth_l1_loss(grad_pred_x * mask_x, grad_gt_x * mask_x, reduction="sum")
+        loss_grad_y = F.smooth_l1_loss(grad_pred_y * mask_y, grad_gt_y * mask_y, reduction="sum")
+        loss_depth += 0.5 * (loss_grad_x + loss_grad_y) / valid_depth_mask.sum().clamp(min=1)
 
     loss_flow = torch.tensor(0.0, device=device)
     if w["flow"] > 0 and preds.get("flow") is not None and "flow_target" in targets:
@@ -554,27 +566,28 @@ def compute_physics_loss(
     loss_photo = torch.tensor(0.0, device=device)
     loss_smooth = torch.tensor(0.0, device=device)
 
-    if img_t is not None and img_next is not None and w["photo"] > 0:
+    if img_t is not None and img_next is not None and targets.get("has_next", True):
         K, K_inv = generate_intrinsics(H, W, device)
         warped_img, valid_warp_mask = inverse_warp(
             img_next, preds["depth"].unsqueeze(1), preds["ego_pose"], K, K_inv
         )
+        
+        if w["photo"] > 0:
+            # Photo loss uses L1 + SSIM
+            def photo_loss_fn(pred, tgt):
+                l1 = F.l1_loss(pred, tgt, reduction="none").mean(dim=1, keepdim=True)
+                ssim = ssim_loss(pred, tgt).mean(dim=1, keepdim=True)
+                return 0.15 * l1 + 0.85 * ssim
 
-        # Photo loss uses L1 + SSIM
-        def photo_loss_fn(pred, tgt):
-            l1 = F.l1_loss(pred, tgt, reduction="none").mean(dim=1, keepdim=True)
-            ssim = ssim_loss(pred, tgt).mean(dim=1, keepdim=True)
-            return 0.15 * l1 + 0.85 * ssim
+            warp_loss = photo_loss_fn(warped_img, img_t)
+            identity_loss = photo_loss_fn(img_next, img_t)
 
-        warp_loss = photo_loss_fn(warped_img, img_t)
-        identity_loss = photo_loss_fn(img_next, img_t)
+            auto_mask = (warp_loss < identity_loss).float()
+            sky_mask_1 = (targets["seg_raw"] == 0).float().unsqueeze(1)
 
-        auto_mask = (warp_loss < identity_loss).float()
-        sky_mask_1 = (targets["seg_raw"] == 0).float().unsqueeze(1)
-
-        mask = valid_warp_mask * (1 - sky_mask_1) * auto_mask
-        loss_photo = (warp_loss * mask).sum() / mask.sum().clamp(min=1)
-        loss_smooth = edge_aware_smoothness_loss(preds["depth"].unsqueeze(1), img_t)
+            mask = valid_warp_mask * (1 - sky_mask_1) * auto_mask
+            loss_photo = (warp_loss * mask).sum() / mask.sum().clamp(min=1)
+            loss_smooth = edge_aware_smoothness_loss(preds["depth"].unsqueeze(1), img_t)
 
     loss_anom = preds["feature_error"].mean()
     loss_gate = F.smooth_l1_loss(
