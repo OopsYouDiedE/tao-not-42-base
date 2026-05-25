@@ -946,7 +946,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--img_size", type=int, default=256)
     parser.add_argument("--seq_len", type=int, default=12)
-    parser.add_argument("--batch_size", type=int, default=6)
+    parser.add_argument("--batch_size", type=int, default=2)
     parser.add_argument("--max_buffer_size", type=int, default=64)
     parser.add_argument("--vis_interval", type=int, default=100)
     parser.add_argument("--compile_model", action="store_true", default=False)
