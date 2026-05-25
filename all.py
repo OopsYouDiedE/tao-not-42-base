@@ -708,7 +708,7 @@ def get_ema_loss(name, current_val, alpha=0.95):
 
 def compute_instance_loss(preds, targets, step):
     B, device, num_scales = preds["objectness"][0].shape[0], preds["objectness"][0].device, len(preds["objectness"])
-    loss_obj = loss_box = loss_mask = loss_cls = torch.tensor(0.0, device=device)
+    loss_obj, loss_box, loss_mask, loss_cls = [torch.tensor(0.0, device=device) for _ in range(4)]
     w = get_loss_weights(step)
 
     for i in range(num_scales):
@@ -877,17 +877,22 @@ class TAOTrainer:
         tgt["cam_quat_next"] = cam_quat_next.flatten(0, 1)
         tgt["has_next"] = has_next.flatten(0, 1)
         
-        if "cls_dense" in tgt and self.global_step < 1000:
-            pass
+        if "cls_dense" in tgt:
+            for i, step in enumerate(range(c_start, c_end)):
+                if self.global_step < 1000 or step < 2:
+                    if isinstance(tgt["cls_dense"], list):
+                        for x in tgt["cls_dense"]: x.view(B, T, *x.shape[1:])[:, i] = -100
+                    else:
+                        tgt["cls_dense"].view(B, T, *tgt["cls_dense"].shape[1:])[:, i] = -100
             
         return tgt
 
     def _train_chunk(self, batch):
         v_seq, t_max = batch["video"], batch["video"].shape[1]
-        loss_acc = {k: 0.0 for k in ["Obj", "Box", "Mask", "Depth", "Photo", "Ego", "Flow", "Anom", "Gate", "Cls"]}
         total_loss = 0.0
 
         for c_start in range(0, t_max, self.args.seq_len):
+            loss_acc = {k: 0.0 for k in ["Obj", "Box", "Mask", "Depth", "Photo", "Ego", "Flow", "Anom", "Gate", "Cls"]}
             c_end = min(c_start + self.args.seq_len, t_max)
             c_vids = v_seq[:, c_start:c_end]
             T_chunk = c_end - c_start
@@ -918,7 +923,10 @@ class TAOTrainer:
             for k in loss_acc: loss_acc[k] += l_dict[k] * T_chunk
 
             if (self.global_step + 1) % self.args.vis_interval == 0:
-                def slice_b(v): return v[-v_seq.shape[0]:] if v is not None and not isinstance(v, list) else ([x[-v_seq.shape[0]:] for x in v] if v is not None else None)
+                def slice_b(v):
+                    if v is None: return None
+                    if isinstance(v, list): return [x[-v_seq.shape[0]:] if x.dim() > 0 else x for x in v]
+                    return v[-v_seq.shape[0]:] if v.dim() > 0 else v
                 fp = save_visualization(c_vids[:, -1], {k: slice_b(v) for k, v in tgts.items()}, {k: slice_b(v) for k, v in preds.items()}, self.global_step + 1, w_img[-v_seq.shape[0]:] if w_img is not None else None)
                 if wandb and fp: wandb.log({"Vis": wandb.Image(fp)}, step=self.global_step)
             
@@ -936,7 +944,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--img_size", type=int, default=256)
     parser.add_argument("--seq_len", type=int, default=12)
-    parser.add_argument("--batch_size", type=int, default=2)
+    parser.add_argument("--batch_size", type=int, default=12)
     parser.add_argument("--max_buffer_size", type=int, default=64)
     parser.add_argument("--vis_interval", type=int, default=100)
     parser.add_argument("--compile_model", action="store_true", default=False)
