@@ -80,12 +80,17 @@ class TAONot42VisionModel(nn.Module):
         self.feature_predictor = FeaturePredictorHead(128)
         self.state_update_gate_head = nn.Sequential(nn.Linear(128 + 1, 64), nn.SiLU(), nn.Linear(64, 1))
         
-
-    def forward(self, peripheral, dt, step, state=None, get_loss_weights_fn=None):
-        b, _, h, w = peripheral.shape
-        state = state or {}
-        
+    def extract_features(self, peripheral):
         f1, f2, p3_fused, p4, p5 = self.segmenter(peripheral)
+        return f1, f2, p3_fused, p4, p5
+        
+    def forward_physics(self, f1, f2, p3_fused, p4, p5, dt, step, state=None, get_loss_weights_fn=None, original_shape=None):
+        b = f1.shape[0]
+        if original_shape:
+            h, w = original_shape
+        else:
+            h, w = f1.shape[2] * 2, f1.shape[3] * 2
+        state = state or {}
         
         # Step 2: GRU 时空融合
         p3_down = torch.nn.functional.avg_pool2d(p3_fused, kernel_size=2, stride=2)
@@ -95,7 +100,13 @@ class TAONot42VisionModel(nn.Module):
         spatiotemporal_p3 = p3_fused + next_gru_state_up
         
         # Step 3: 直接调用检测头 (YOLOESegment26 是 segmenter.model 的最后一层)
-        preds = self.segmenter.model[-1]([spatiotemporal_p3, p4, p5])
+        # 使用 Gradient Checkpointing 极大地节省这部分庞大图结构的显存占用！
+        import torch.utils.checkpoint as checkpoint
+        
+        def run_yolo_head(p3, p4, p5):
+            return self.segmenter.model[-1]([p3, p4, p5])
+            
+        preds = checkpoint.checkpoint(run_yolo_head, spatiotemporal_p3, p4, p5, use_reentrant=False)
         
         # The rest of the physics pipeline runs on the temporally tracked spatiotemporal_p3
         depth_logits = self.depth_decoder(f1, f2, spatiotemporal_p3, None)
@@ -158,3 +169,8 @@ class TAONot42VisionModel(nn.Module):
             'dense_box_dist': preds['boxes'],
             'dense_mask_coefficients': preds['mask_coefficients']
         }
+
+    def forward(self, peripheral, dt, step, state=None, get_loss_weights_fn=None):
+        b, _, h, w = peripheral.shape
+        f1, f2, p3_fused, p4, p5 = self.extract_features(peripheral)
+        return self.forward_physics(f1, f2, p3_fused, p4, p5, dt, step, state, get_loss_weights_fn, original_shape=(h, w))

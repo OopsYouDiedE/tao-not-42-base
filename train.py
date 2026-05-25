@@ -100,8 +100,24 @@ def train_model(args):
                 chunk_x_t = []
                 chunk_x_next = []
                 
-                for step in range(chunk_start, chunk_end):
-                    x_t = videos[:, step]
+                chunk_steps = chunk_end - chunk_start
+                chunk_videos = videos[:, chunk_start:chunk_end] # [b, chunk_steps, c, h, w]
+                flat_videos = chunk_videos.reshape(b * chunk_steps, c, h, w)
+                
+                with torch.autocast(device_type=device.type, enabled=(scaler is not None)):
+                    with torch.no_grad():
+                        f1_f, f2_f, p3_f, p4_f, p5_f = model.extract_features(flat_videos)
+                
+                # Reshape back to sequence
+                def unflat(feat): return feat.view(b, chunk_steps, *feat.shape[1:])
+                f1_seq = unflat(f1_f)
+                f2_seq = unflat(f2_f)
+                p3_seq = unflat(p3_f)
+                p4_seq = unflat(p4_f)
+                p5_seq = unflat(p5_f)
+                
+                for i_step, step in enumerate(range(chunk_start, chunk_end)):
+                    x_t = chunk_videos[:, i_step]
                     x_next = videos[:, step+1] if step+1 < t else x_t
                     
                     time_t = torch.full((b,), step * 0.1, device=device)
@@ -120,7 +136,12 @@ def train_model(args):
                     target_t["cam_quat_t"] = batch["cam_quat"][:, step]
                     
                     with torch.autocast(device_type=device.type, enabled=(scaler is not None)):
-                        out = model(x_t, dt_t, global_step, state, get_loss_weights_fn=get_loss_weights)
+                        out = model.forward_physics(
+                            f1_seq[:, i_step], f2_seq[:, i_step], p3_seq[:, i_step], 
+                            p4_seq[:, i_step], p5_seq[:, i_step],
+                            dt_t, global_step, state, get_loss_weights_fn=get_loss_weights,
+                            original_shape=(h, w)
+                        )
                         state = out["next_state"]
                         
                     chunk_preds.append({k: v for k, v in out.items() if k != "next_state"})

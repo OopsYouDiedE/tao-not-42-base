@@ -71,7 +71,7 @@ def load_yolo_backbone_weights(model, checkpoint_path):
         if src_key.startswith("model.model."):
             tgt_key = src_key.replace("model.model.", "segmenter.model.")
         elif src_key.startswith("model."):
-            tgt_key = src_key.replace("model.", "segmenter.")
+            tgt_key = src_key.replace("model.", "segmenter.model.")
         else:
             tgt_key = src_key
             
