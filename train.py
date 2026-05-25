@@ -158,7 +158,7 @@ def train_model(args):
                     dt_t = torch.full(
                         (b,), 1.0 / 24.0 if step > 0 else 0.0, device=device
                     )
-                    target_t = {k: v[:, step] for k, v in batch.items() if k != "video"}
+                    target_t = {k: v[:, step] for k, v in batch.items() if k not in ("video", "flow")}
                     if step + 1 < t:
                         target_t["flow_target"] = batch["flow"][:, step]
 
