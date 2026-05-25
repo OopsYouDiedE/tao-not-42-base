@@ -889,6 +889,11 @@ if __name__ == "__main__":
     parser.add_argument("--finetune_after_epoch", type=int, default=0)
     args = parser.parse_args()
 
+    if args.use_wandb and wandb:
+        wandb.init(project="tao_not_42", config=vars(args))
+    elif not args.use_wandb:
+        wandb = None
+
     try:
         TAOTrainer(args, TAONot42VisionModel(), AsyncDataBuffer(max_buffer_size=args.max_buffer_size, batch_size=args.batch_size), CUDAPrefetcher(AsyncDataBuffer(max_buffer_size=args.max_buffer_size, batch_size=args.batch_size), torch.device(args.device), args.img_size)).train()
     except KeyboardInterrupt:
