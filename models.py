@@ -9,12 +9,10 @@ from blocks import (
     Conv,
     DepthDecoder,
     EgoPoseHead,
-    FastSAMStyleSegmenter,
     FeaturePredictorHead,
     FlowDecoder,
     TimeAwareConvGRUCell,
     YOLOESegment26,
-    _FastSAMPredictionHead,
 )
 from utils import decode_dfl_boxes
 
