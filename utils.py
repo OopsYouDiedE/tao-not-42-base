@@ -435,13 +435,13 @@ def dfl_loss(pred_dist, target_distances, reg_max=16):
     loss_left = (
         F.cross_entropy(
             pred_dist.reshape(-1, reg_max), target_left.reshape(-1), reduction="none"
-        ).reshape(-1, 4)
+        ).reshape(weight_left.shape)
         * weight_left
     )
     loss_right = (
         F.cross_entropy(
             pred_dist.reshape(-1, reg_max), target_right.reshape(-1), reduction="none"
-        ).reshape(-1, 4)
+        ).reshape(weight_right.shape)
         * weight_right
     )
 
