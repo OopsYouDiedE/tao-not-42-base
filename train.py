@@ -320,8 +320,6 @@ def train_model(args):
                     for name, param in model.segmenter.named_parameters():
                         if any(f"model.{i}." in name for i in range(20, 23)):
                             param.requires_grad = True
-                        else:
-                            param.requires_grad = False
                 elif global_step == args.unfreeze_step_2 and mode == "supervised":
                     print(
                         f"\n🔓 [Step {args.unfreeze_step_2}] 解冻 P4 中层特征 (Stage 4)..."
