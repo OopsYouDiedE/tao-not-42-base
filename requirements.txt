@@ -6,3 +6,4 @@ tensorflow
 tensorflow-datasets
 h5py
 wandb
+ultralytics
