@@ -464,7 +464,7 @@ def compute_physics_loss(preds, targets, img_t=None, img_next=None, mode="superv
         loss_photo = (warp_loss * mask).sum() / mask.sum().clamp(min=1)
         loss_smooth = edge_aware_smoothness_loss(preds["depth"].unsqueeze(1), img_t)
     
-    loss_anom = preds["feature_error"]
+    loss_anom = preds["feature_error"].mean()
     loss_gate = F.smooth_l1_loss(preds["state_update_gate"], torch.zeros_like(preds["state_update_gate"]))
     
     norm_obj = loss_obj / get_ema_loss("Obj", loss_obj)
