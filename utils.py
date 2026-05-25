@@ -336,10 +336,10 @@ def compute_per_instance_mask_loss(preds, targets, pos_mask, key="mask_coefficie
     center_x = torch.clamp(x_grid * stride + stride // 2, 0, W - 1).unsqueeze(0).expand(B, -1, -1)
     
     inst_ids = torch.gather(
-        seg_raw.view(B, H * W), 
+        seg_raw.reshape(B, H * W), 
         1, 
-        (center_y * W + center_x).view(B, H_feat * W_feat)
-    ).view(B, H_feat, W_feat).long()
+        (center_y * W + center_x).reshape(B, H_feat * W_feat)
+    ).reshape(B, H_feat, W_feat).long()
 
     coeffs = preds[key] # [B, 32, H_feat, W_feat]
     protos = preds["mask_prototypes"] # [B, 32, H_proto, W_proto]
@@ -431,17 +431,17 @@ def dfl_loss(pred_dist, target_distances, reg_max=16):
     target_left = torch.clamp(target_left, 0, reg_max - 1)
     target_right = torch.clamp(target_right, 0, reg_max - 1)
 
-    pred_dist = pred_dist.view(-1, 4, reg_max)
+    pred_dist = pred_dist.reshape(-1, 4, reg_max)
     loss_left = (
         F.cross_entropy(
-            pred_dist.view(-1, reg_max), target_left.view(-1), reduction="none"
-        ).view(-1, 4)
+            pred_dist.reshape(-1, reg_max), target_left.reshape(-1), reduction="none"
+        ).reshape(-1, 4)
         * weight_left
     )
     loss_right = (
         F.cross_entropy(
-            pred_dist.view(-1, reg_max), target_right.view(-1), reduction="none"
-        ).view(-1, 4)
+            pred_dist.reshape(-1, reg_max), target_right.reshape(-1), reduction="none"
+        ).reshape(-1, 4)
         * weight_right
     )
 
