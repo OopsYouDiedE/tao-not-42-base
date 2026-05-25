@@ -14,7 +14,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchvision
-
+from mamba_ssm import Mamba
+import tensorflow as tf
+import tensorflow_datasets as tfds
+try:
+    import wandb
+except ImportError:
+    wandb = None
 # =====================================================================
 # 0. 环境与可选依赖配置
 # =====================================================================
@@ -24,14 +30,6 @@ try:
 except ImportError:
     IN_COLAB = False
 
-if IN_COLAB:
-    import tensorflow as tf
-    import tensorflow_datasets as tfds
-
-try:
-    import wandb
-except ImportError:
-    wandb = None
 
 # =====================================================================
 # 1. 基础工具与可视化函数
@@ -289,14 +287,14 @@ class C3k2(nn.Module):
 # =====================================================================
 # 3. 物理与时间模块 (Time & Physics Modules)
 # =====================================================================
-class SpatioTemporalAttentionBlock(nn.Module):
-    def __init__(self, channels, num_heads=4, num_frequencies=16):
+class SpatioTemporalMambaBlock(nn.Module):
+    def __init__(self, channels, num_frequencies=16):
         super().__init__()
         self.channels = channels
         self.conv3d = nn.Conv3d(channels, channels, kernel_size=3, padding=1, bias=False)
         self.bn3d = nn.BatchNorm3d(channels)
         self.act = nn.SiLU(inplace=True)
-        self.attn = nn.MultiheadAttention(embed_dim=channels, num_heads=num_heads, batch_first=True)
+        self.mamba = Mamba(d_model=channels, d_state=16, d_conv=4, expand=2)
         self.norm = nn.LayerNorm(channels)
         
         self.register_buffer("frequencies", torch.exp(torch.linspace(-5, 3, num_frequencies)))
@@ -315,8 +313,8 @@ class SpatioTemporalAttentionBlock(nn.Module):
         x3d = x3d + time_embed.view(B, T, C, 1, 1)
         
         x_flat = x3d.permute(0, 3, 4, 1, 2).reshape(B * H * W, T, C)
-        attn_out, _ = self.attn(x_flat, x_flat, x_flat)
-        x_flat = self.norm(x_flat + attn_out)
+        mamba_out = self.mamba(x_flat)
+        x_flat = self.norm(x_flat + mamba_out)
         
         out = x_flat.view(B, H, W, T, C).permute(0, 3, 4, 1, 2).contiguous()
         return out
@@ -433,9 +431,9 @@ class TAONot42VisionModel(nn.Module):
         super().__init__()
         self.segmenter = MyYOLOE()
         self.depth_decoder, self.flow_head = DepthDecoder(128, 64, 32), FlowDecoder(128, 64, 32)
-        self.st_block = SpatioTemporalAttentionBlock(128)
-        self.st_block_p4 = SpatioTemporalAttentionBlock(256)
-        self.st_block_p5 = SpatioTemporalAttentionBlock(512)
+        self.st_block = SpatioTemporalMambaBlock(128)
+        self.st_block_p4 = SpatioTemporalMambaBlock(256)
+        self.st_block_p5 = SpatioTemporalMambaBlock(512)
         self.pose_head, self.feature_predictor = EgoPoseHead(128), FeaturePredictorHead(128)
         self.state_update_gate_head = nn.Sequential(nn.Linear(128, 64), nn.SiLU(), nn.Linear(64, 1))
 
