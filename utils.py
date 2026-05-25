@@ -47,6 +47,8 @@ def six_d_to_matrix(d6):
 # 1. 物理特征网络架构
 # =====================================================================
 def decode_dfl_boxes(pred_dist, reg_max=16):
+    if isinstance(pred_dist, list):
+        return [decode_dfl_boxes(x, reg_max) for x in pred_dist]
     # pred_dist: (B, 4*reg_max, H, W)
     B, C, H, W = pred_dist.shape
     prob = F.softmax(pred_dist.view(B, 4, reg_max, H, W), dim=2)
@@ -115,6 +117,10 @@ def freeze_backbone(model):
 # 3. 经验回放池 (Replay Buffer) 与 GPU 数据流水线
 # =====================================================================
 def extract_instances(preds, score_thresh=0.3, nms_thresh=0.5, max_det=20):
+    if isinstance(preds["objectness"], list):
+        # Simplify extraction by using the highest resolution scale (P3)
+        preds = {k: (v[0] if isinstance(v, list) else v) for k, v in preds.items()}
+
     B = preds["objectness"].shape[0]
     H_feat, W_feat = preds["objectness"].shape[2:]
     device = preds["objectness"].device
@@ -216,6 +222,39 @@ def extract_instances(preds, score_thresh=0.3, nms_thresh=0.5, max_det=20):
 
 
 def compute_instance_loss(preds, targets, step=0):
+    if isinstance(preds["objectness"], list):
+        loss_obj_total = 0.0
+        loss_box_total = 0.0
+        loss_mask_total = 0.0
+        loss_cls_total = 0.0
+        num_scales = len(preds["objectness"])
+
+        for i in range(num_scales):
+            p_i = {}
+            for k, v in preds.items():
+                if isinstance(v, list) and len(v) == num_scales:
+                    p_i[k] = v[i]
+                else:
+                    p_i[k] = v
+            t_i = {}
+            for k, v in targets.items():
+                if isinstance(v, list) and len(v) == num_scales:
+                    t_i[k] = v[i]
+                else:
+                    t_i[k] = v
+            
+            o, b, m, c = compute_instance_loss_single_scale(p_i, t_i, step)
+            loss_obj_total += o
+            loss_box_total += b
+            loss_mask_total += m
+            loss_cls_total += c
+            
+        return loss_obj_total, loss_box_total, loss_mask_total, loss_cls_total
+
+    return compute_instance_loss_single_scale(preds, targets, step)
+
+
+def compute_instance_loss_single_scale(preds, targets, step=0):
     device = preds["objectness"].device
 
     loss_obj = focal_loss(preds["objectness"], targets["obj_dense"])
@@ -303,8 +342,9 @@ def compute_per_instance_mask_loss(preds, targets, pos_mask, key="mask_coefficie
     if num_instances == 0:
         return torch.tensor(0.0, device=device)
 
-    center_y = torch.clamp(y_indices * 8 + 4, 0, H - 1)
-    center_x = torch.clamp(x_indices * 8 + 4, 0, W - 1)
+    stride = H // H_feat
+    center_y = torch.clamp(y_indices * stride + stride // 2, 0, H - 1)
+    center_x = torch.clamp(x_indices * stride + stride // 2, 0, W - 1)
     inst_ids = seg_raw[b_indices, center_y, center_x].long()
 
     valid_mask = inst_ids > 0
@@ -484,7 +524,7 @@ def get_loss_weights(step):
         "photo": ramp(1000, 3000, 1.0),
         "ego": ramp(100, 600, 3.0),
         "flow": ramp(300, 1000, 1.0),
-        "cls": 1.0,
+        "cls": ramp(1000, 1001, 1.0),
         "anom": ramp(4000, 6000, 1.0),
         "smooth": 0.05,
         "gate": 0.05,
@@ -497,11 +537,12 @@ LOSS_EMA = {}
 def get_ema_loss(name, current_val, alpha=0.95):
     with torch.no_grad():
         val = current_val.detach()
-        if name not in LOSS_EMA:
-            LOSS_EMA[name] = val
-        else:
-            LOSS_EMA[name] = LOSS_EMA[name] * alpha + val * (1 - alpha)
-        ema_val = torch.clamp(LOSS_EMA[name], min=1e-4)
+        if val > 0.0:
+            if name not in LOSS_EMA:
+                LOSS_EMA[name] = val
+            else:
+                LOSS_EMA[name] = LOSS_EMA[name] * alpha + val * (1 - alpha)
+        ema_val = torch.clamp(LOSS_EMA.get(name, torch.tensor(1e-4, device=val.device)), min=1e-4)
         return torch.where(val == 0.0, torch.tensor(1.0, device=val.device), ema_val)
 
 
@@ -572,6 +613,9 @@ def compute_physics_loss(
     loss_photo = torch.tensor(0.0, device=device)
     loss_smooth = torch.tensor(0.0, device=device)
 
+    if img_t is not None:
+        loss_smooth = edge_aware_smoothness_loss(preds["depth"].unsqueeze(1), img_t)
+
     if img_t is not None and img_next is not None:
         K, K_inv = generate_intrinsics(H, W, device)
         warped_img, valid_warp_mask = inverse_warp(
@@ -597,7 +641,6 @@ def compute_physics_loss(
                 mask = mask * has_next_mask
                 
             loss_photo = (warp_loss * mask).sum() / mask.sum().clamp(min=1)
-            loss_smooth = edge_aware_smoothness_loss(preds["depth"].unsqueeze(1), img_t)
 
     loss_anom = preds["feature_error"].mean()
     loss_gate = F.smooth_l1_loss(

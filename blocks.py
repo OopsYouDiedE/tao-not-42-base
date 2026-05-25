@@ -383,19 +383,19 @@ class YOLOESegment26(nn.Module):
         self.proto = Proto26(ch, npr, nm, nc)
 
         c5 = max(ch[0] // 4, nm)
-        self.cv5 = nn.Sequential(Conv(ch[0], c5, 3), Conv(c5, c5, 3), nn.Conv2d(c5, nm, 1))
-        self.one2one_cv5 = nn.Sequential(Conv(ch[0], c5, 3), Conv(c5, c5, 3), nn.Conv2d(c5, nm, 1))
+        self.cv5 = nn.ModuleList(nn.Sequential(Conv(x, c5, 3), Conv(c5, c5, 3), nn.Conv2d(c5, nm, 1)) for x in ch)
+        self.one2one_cv5 = nn.ModuleList(nn.Sequential(Conv(x, c5, 3), Conv(c5, c5, 3), nn.Conv2d(c5, nm, 1)) for x in ch)
 
         c2 = max(ch[0] // 4, 16)
-        self.cv2 = nn.Sequential(Conv(ch[0], c2, 3), Conv(c2, c2, 3), nn.Conv2d(c2, 4 * reg_max, 1))
-        self.one2one_cv2 = nn.Sequential(Conv(ch[0], c2, 3), Conv(c2, c2, 3), nn.Conv2d(c2, 4 * reg_max, 1))
+        self.cv2 = nn.ModuleList(nn.Sequential(Conv(x, c2, 3), Conv(c2, c2, 3), nn.Conv2d(c2, 4 * reg_max, 1)) for x in ch)
+        self.one2one_cv2 = nn.ModuleList(nn.Sequential(Conv(x, c2, 3), Conv(c2, c2, 3), nn.Conv2d(c2, 4 * reg_max, 1)) for x in ch)
 
         c3 = max(ch[0], min(nc, 100))
-        self.cv3 = nn.Sequential(Conv(ch[0], c3, 3), Conv(c3, c3, 3), nn.Conv2d(c3, embed, 1))
-        self.one2one_cv3 = nn.Sequential(Conv(ch[0], c3, 3), Conv(c3, c3, 3), nn.Conv2d(c3, embed, 1))
+        self.cv3 = nn.ModuleList(nn.Sequential(Conv(x, c3, 3), Conv(c3, c3, 3), nn.Conv2d(c3, embed, 1)) for x in ch)
+        self.one2one_cv3 = nn.ModuleList(nn.Sequential(Conv(x, c3, 3), Conv(c3, c3, 3), nn.Conv2d(c3, embed, 1)) for x in ch)
 
-        self.obj_proj = nn.Conv2d(embed, 1, 1)
-        self.one2one_obj_proj = nn.Conv2d(embed, 1, 1)
+        self.obj_proj = nn.ModuleList(nn.Conv2d(embed, 1, 1) for _ in ch)
+        self.one2one_obj_proj = nn.ModuleList(nn.Conv2d(embed, 1, 1) for _ in ch)
 
         # Open-Vocabulary Semantic Prompts: Active (Class 0) and Passive (Class 1)
         # Replacing the traditional classification conv with explicit prompt embeddings
@@ -403,44 +403,49 @@ class YOLOESegment26(nn.Module):
 
     def forward(self, x):
         proto_out = self.proto(x)
-        boxes = [self.cv2(x[0])]
-        scores = [self.cv3(x[0])]
-        mc = [self.cv5(x[0])]
+        
+        boxes = []
+        scores = []
+        mc = []
+        boxes_o2o = []
+        scores_o2o = []
+        mc_o2o = []
+        obj_foreground = []
+        obj_foreground_o2o = []
+        cls_scores = []
+        cls_scores_o2o = []
 
-        boxes_o2o = [self.one2one_cv2(x[0])]
-        scores_o2o = [self.one2one_cv3(x[0])]
-        mc_o2o = [self.one2one_cv5(x[0])]
-
-        features = x[0]
-        obj_foreground = self.obj_proj(scores[0])
-        obj_foreground_o2o = self.one2one_obj_proj(scores_o2o[0])
-
-        # Explicit Dot Product Matching: Object Embeddings * Prompt Embeddings
-        # scores[0] is (B, embed, H, W)
-        # class_prompts is (2, embed)
-        norm_scores = F.normalize(scores[0], p=2, dim=1)
         norm_prompts = F.normalize(self.class_prompts, p=2, dim=1)
 
-        # 计算余弦相似度并乘以缩放温度系数 (如 10.0，使 sigmoid 激活具有更好的区分度)
-        cls_scores = (
-            torch.einsum("b c h w, k c -> b k h w", norm_scores, norm_prompts) * 10.0
-        )
-        norm_scores_o2o = F.normalize(scores_o2o[0], p=2, dim=1)
-        cls_scores_o2o = (
-            torch.einsum("b c h w, k c -> b k h w", norm_scores_o2o, norm_prompts)
-            * 10.0
-        )
+        for i in range(len(x)):
+            boxes.append(self.cv2[i](x[i]))
+            scores.append(self.cv3[i](x[i]))
+            mc.append(self.cv5[i](x[i]))
 
+            boxes_o2o.append(self.one2one_cv2[i](x[i]))
+            scores_o2o.append(self.one2one_cv3[i](x[i]))
+            mc_o2o.append(self.one2one_cv5[i](x[i]))
+
+            obj_foreground.append(self.obj_proj[i](scores[i]))
+            obj_foreground_o2o.append(self.one2one_obj_proj[i](scores_o2o[i]))
+
+            norm_scores = F.normalize(scores[i], p=2, dim=1)
+            cls_scores.append(torch.einsum("b c h w, k c -> b k h w", norm_scores, norm_prompts) * 10.0)
+
+            norm_scores_o2o = F.normalize(scores_o2o[i], p=2, dim=1)
+            cls_scores_o2o.append(torch.einsum("b c h w, k c -> b k h w", norm_scores_o2o, norm_prompts) * 10.0)
+
+        # features is just the list of spatial features
         return {
-            "features": features,
+            "features": x,
             "objectness": obj_foreground,
             "classification": cls_scores,
-            "boxes": boxes[0],
-            "mask_coefficients": mc[0],
+            "boxes": boxes,
+            "mask_coefficients": mc,
             "o2o_objectness": obj_foreground_o2o,
             "o2o_classification": cls_scores_o2o,
-            "o2o_boxes": boxes_o2o[0],
-            "o2o_mask_coefficients": mc_o2o[0],
+            "o2o_boxes": boxes_o2o,
+            "o2o_mask_coefficients": mc_o2o,
             "mask_prototypes": proto_out,
         }
 

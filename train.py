@@ -165,7 +165,10 @@ def train_model(args):
                         elif k == "is_dynamic":
                             target_t[k] = v
                         else:
-                            target_t[k] = v[:, step] if v is not None else None
+                            if isinstance(v, list):
+                                target_t[k] = [x[:, step] for x in v]
+                            else:
+                                target_t[k] = v[:, step] if v is not None else None
                     if step + 1 < t:
                         target_t["flow_target"] = batch["flow"][:, step]
                     else:
@@ -180,14 +183,20 @@ def train_model(args):
                     target_t["cam_pos_t"] = batch["cam_pos"][:, step]
                     target_t["cam_quat_t"] = batch["cam_quat"][:, step]
                     
-                    target_t["has_next"] = torch.tensor(step + 1 < t, device=device)
+                    target_t["has_next"] = torch.full((b,), step + 1 < t, device=device, dtype=torch.bool)
                     
                     if "cls_dense" in target_t:
                         if global_step < 1000:
-                            target_t["cls_dense"] = torch.zeros_like(target_t["cls_dense"])
+                            if isinstance(target_t["cls_dense"], list):
+                                target_t["cls_dense"] = [torch.zeros_like(x) for x in target_t["cls_dense"]]
+                            else:
+                                target_t["cls_dense"] = torch.zeros_like(target_t["cls_dense"])
                         else:
                             if step < 2:
-                                target_t["cls_dense"] = torch.full_like(target_t["cls_dense"], -100)
+                                if isinstance(target_t["cls_dense"], list):
+                                    target_t["cls_dense"] = [torch.full_like(x, -100) for x in target_t["cls_dense"]]
+                                else:
+                                    target_t["cls_dense"] = torch.full_like(target_t["cls_dense"], -100)
 
                     with torch.autocast(
                         device_type=device.type, enabled=(scaler is not None)
@@ -220,9 +229,15 @@ def train_model(args):
                 ):
                     batched_preds = {}
                     for k in chunk_preds[0].keys():
-                        if chunk_preds[0][k] is None:
+                        val = chunk_preds[0][k]
+                        if val is None:
                             batched_preds[k] = None
-                        elif chunk_preds[0][k].dim() == 0:
+                        elif isinstance(val, list):
+                            batched_preds[k] = [
+                                torch.cat([p[k][i] for p in chunk_preds], dim=0)
+                                for i in range(len(val))
+                            ]
+                        elif val.dim() == 0:
                             batched_preds[k] = torch.stack([p[k] for p in chunk_preds])
                         else:
                             batched_preds[k] = torch.cat(
@@ -231,9 +246,15 @@ def train_model(args):
 
                     batched_targets = {}
                     for k in chunk_targets[0].keys():
-                        if chunk_targets[0][k] is None:
+                        val = chunk_targets[0][k]
+                        if val is None:
                             batched_targets[k] = None
-                        elif chunk_targets[0][k].dim() == 0:
+                        elif isinstance(val, list):
+                            batched_targets[k] = [
+                                torch.cat([t_dict[k][i] for t_dict in chunk_targets], dim=0)
+                                for i in range(len(val))
+                            ]
+                        elif val.dim() == 0:
                             batched_targets[k] = torch.stack(
                                 [t_dict[k] for t_dict in chunk_targets]
                             )
@@ -245,8 +266,6 @@ def train_model(args):
                     batched_x_t = torch.cat(chunk_x_t, dim=0)
                     batched_x_next = torch.cat(chunk_x_next, dim=0)
                     
-                    if "has_next" not in batched_targets:
-                        batched_targets["has_next"] = torch.stack([t["has_next"] for t in chunk_targets])
 
                     total_seq_loss, loss_dict, warped_img = compute_physics_loss(
                         batched_preds,

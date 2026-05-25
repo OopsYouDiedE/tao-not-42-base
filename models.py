@@ -90,8 +90,10 @@ class TAONot42VisionModel(nn.Module):
         self.segmenter = MyYOLOE()
         self.depth_decoder = DepthDecoder(128, 64, 32, ch_gru=128)
         self.conv_gru = TimeAwareConvGRUCell(128, 128)
+        self.conv_gru_p4 = TimeAwareConvGRUCell(256, 256)
+        self.conv_gru_p5 = TimeAwareConvGRUCell(512, 512)
         self.pose_head = EgoPoseHead(128)
-        self.flow_head = FlowDecoder(128)
+        self.flow_head = FlowDecoder(128, 64, 32)
         self.feature_predictor = FeaturePredictorHead(128)
         self.state_update_gate_head = nn.Sequential(
             nn.Linear(128 + 1, 64), nn.SiLU(), nn.Linear(64, 1)
@@ -126,12 +128,25 @@ class TAONot42VisionModel(nn.Module):
         gru_state = state.get("gru", None)
         next_gru_state = self.conv_gru(p3_down, dt, gru_state)
         next_gru_state_up = torch.nn.functional.interpolate(
-            next_gru_state,
-            size=p3_fused.shape[-2:],
-            mode="bilinear",
-            align_corners=False,
+            next_gru_state, size=p3_fused.shape[-2:], mode="bilinear", align_corners=False
         )
         spatiotemporal_p3 = p3_fused + next_gru_state_up
+
+        p4_down = torch.nn.functional.avg_pool2d(p4, kernel_size=2, stride=2)
+        gru_state_p4 = state.get("gru_p4", None)
+        next_gru_state_p4 = self.conv_gru_p4(p4_down, dt, gru_state_p4)
+        next_gru_state_up_p4 = torch.nn.functional.interpolate(
+            next_gru_state_p4, size=p4.shape[-2:], mode="bilinear", align_corners=False
+        )
+        spatiotemporal_p4 = p4 + next_gru_state_up_p4
+
+        p5_down = torch.nn.functional.avg_pool2d(p5, kernel_size=2, stride=2)
+        gru_state_p5 = state.get("gru_p5", None)
+        next_gru_state_p5 = self.conv_gru_p5(p5_down, dt, gru_state_p5)
+        next_gru_state_up_p5 = torch.nn.functional.interpolate(
+            next_gru_state_p5, size=p5.shape[-2:], mode="bilinear", align_corners=False
+        )
+        spatiotemporal_p5 = p5 + next_gru_state_up_p5
 
         # Step 3: 直接调用检测头 (YOLOESegment26 是 segmenter.model 的最后一层)
         # 使用 Gradient Checkpointing 极大地节省这部分庞大图结构的显存占用！
@@ -141,7 +156,7 @@ class TAONot42VisionModel(nn.Module):
             return self.segmenter.model[-1]([p3, p4, p5])
 
         preds = checkpoint.checkpoint(
-            run_yolo_head, spatiotemporal_p3, p4, p5, use_reentrant=False
+            run_yolo_head, spatiotemporal_p3, spatiotemporal_p4, spatiotemporal_p5, use_reentrant=False
         )
 
         # The rest of the physics pipeline runs on the temporally tracked spatiotemporal_p3
@@ -179,6 +194,16 @@ class TAONot42VisionModel(nn.Module):
             if gru_state is not None
             else next_gru_state
         )
+        final_gru_state_p4 = (
+            gru_state_p4 * (1.0 - gate) + next_gru_state_p4 * gate
+            if gru_state_p4 is not None
+            else next_gru_state_p4
+        )
+        final_gru_state_p5 = (
+            gru_state_p5 * (1.0 - gate) + next_gru_state_p5 * gate
+            if gru_state_p5 is not None
+            else next_gru_state_p5
+        )
 
         prev_ego_pose = state.get("prev_ego", torch.zeros_like(ego_pose))
         if gru_state is not None and lw["anom"] > 0:
@@ -213,7 +238,7 @@ class TAONot42VisionModel(nn.Module):
             "anomaly_map": feature_error_map,
             "feature_error": feature_error_map.mean(),
             "state_update_gate": gate.view(b),
-            "next_state": {"gru": final_gru_state, "prev_ego": ego_pose},
+            "next_state": {"gru": final_gru_state, "gru_p4": final_gru_state_p4, "gru_p5": final_gru_state_p5, "prev_ego": ego_pose},
             # We also attach dense supervision targets for computing gradients
             "dense_objectness": preds["objectness"],
             "dense_classification": preds["classification"],

@@ -201,105 +201,91 @@ def process_batch_on_gpu(batch, device, target_size=256):
     active_mask = seg_long > 0
     active_mask_float = active_mask.float()
 
-    H_feat, W_feat = H // 8, W // 8
-    seg_small = (
-        F.interpolate(
-            seg.flatten(0, 1).unsqueeze(1), size=(H_feat, W_feat), mode="nearest"
-        )
-        .squeeze(1)
-        .view(B, T, H_feat, W_feat)
-    )
+    # Build multi-scale targets for P3 (stride 8), P4 (stride 16), P5 (stride 32)
+    bboxes_dense = []
+    obj_dense = []
+    cls_dense = []
 
-    bboxes_dense = torch.zeros(B, T, 4, H_feat, W_feat, device=device)
-    obj_dense = torch.zeros(B, T, 1, H_feat, W_feat, device=device)
-    cls_dense = torch.zeros(B, T, 1, H_feat, W_feat, device=device)
-    y_grid = torch.arange(H, device=device, dtype=torch.int16).view(1, 1, 1, H, 1)
-    x_grid = torch.arange(W, device=device, dtype=torch.int16).view(1, 1, 1, 1, W)
+    for stride in [8, 16, 32]:
+        H_feat, W_feat = H // stride, W // stride
+        
+        b_d = torch.zeros(B, T, 4, H_feat, W_feat, device=device)
+        o_d = torch.zeros(B, T, 1, H_feat, W_feat, device=device)
+        c_d = torch.zeros(B, T, 1, H_feat, W_feat, device=device)
+        
+        y_grid = torch.arange(H, device=device, dtype=torch.int16).view(1, 1, 1, H, 1)
+        x_grid = torch.arange(W, device=device, dtype=torch.int16).view(1, 1, 1, 1, W)
 
-    max_uid = int(seg_long.max().item())
-    if max_uid > 0:
-        uids = torch.arange(1, max_uid + 1, device=device, dtype=torch.int16).view(
-            -1, 1, 1, 1, 1
-        )
-        masks = seg_long.to(torch.int16).unsqueeze(0) == uids
-        valid_bt = masks.any(dim=-1).any(dim=-1)
-
-        val_H = torch.tensor(H, dtype=torch.int16, device=device)
-        val_W = torch.tensor(W, dtype=torch.int16, device=device)
-        val_neg1 = torch.tensor(-1, dtype=torch.int16, device=device)
-
-        ymin = torch.where(masks, y_grid, val_H).amin(dim=(3, 4))
-        ymax = torch.where(masks, y_grid, val_neg1).amax(dim=(3, 4))
-
-        xmin = torch.where(masks, x_grid, val_W).amin(dim=(3, 4))
-        xmax = torch.where(masks, x_grid, val_neg1).amax(dim=(3, 4))
-
-        true_area = masks.sum(dim=(3, 4), dtype=torch.int32)
-        box_area = torch.clamp((xmax - xmin) * (ymax - ymin), min=1)
-
-        valid_mask = (true_area >= 10) & (box_area <= 4 * true_area) & valid_bt
-
-        n_idx, b_idx, t_idx = torch.where(valid_mask)
-
-        if len(n_idx) > 0:
-            # 1. 提取这些有效目标的面积
-            areas = box_area[n_idx, b_idx, t_idx]
-
-            # 2. 按照面积降序获取排序后的索引 (大目标在前，小目标在后)
-            sort_idx = torch.argsort(areas, descending=True)
-
-            # 3. 对 batch, time, instance 的索引重新排序
-            n_idx = n_idx[sort_idx]
-            b_idx = b_idx[sort_idx]
-            t_idx = t_idx[sort_idx]
-            cy = torch.clamp(
-                (
-                    (ymin[n_idx, b_idx, t_idx] + ymax[n_idx, b_idx, t_idx]) / 2 / 8
-                ).long(),
-                0,
-                H_feat - 1,
+        max_uid = int(seg_long.max().item())
+        if max_uid > 0:
+            uids = torch.arange(1, max_uid + 1, device=device, dtype=torch.int16).view(
+                -1, 1, 1, 1, 1
             )
-            cx = torch.clamp(
-                (
-                    (xmin[n_idx, b_idx, t_idx] + xmax[n_idx, b_idx, t_idx]) / 2 / 8
-                ).long(),
-                0,
-                W_feat - 1,
-            )
-            obj_dense[b_idx, t_idx, 0, cy, cx] = 1.0
+            masks = seg_long.to(torch.int16).unsqueeze(0) == uids
+            valid_bt = masks.any(dim=-1).any(dim=-1)
 
-            # Map Static(False) to Class 0, Dynamic(True) to Class 1
-            if is_dyn_out is not None:
-                # 4. 取出对应数据
-                is_dyn_batch = is_dyn_out[b_idx]
-                is_dyn_val = is_dyn_batch[
-                    torch.arange(len(n_idx), device=device), n_idx.long()
-                ]
-                cls_dense[b_idx, t_idx, 0, cy, cx] = is_dyn_val.float()  # True -> 1.0, False -> 0.0
+            val_H = torch.tensor(H, dtype=torch.int16, device=device)
+            val_W = torch.tensor(W, dtype=torch.int16, device=device)
+            val_neg1 = torch.tensor(-1, dtype=torch.int16, device=device)
+
+            ymin = torch.where(masks, y_grid, val_H).amin(dim=(3, 4))
+            ymax = torch.where(masks, y_grid, val_neg1).amax(dim=(3, 4))
+
+            xmin = torch.where(masks, x_grid, val_W).amin(dim=(3, 4))
+            xmax = torch.where(masks, x_grid, val_neg1).amax(dim=(3, 4))
+
+            true_area = masks.sum(dim=(3, 4), dtype=torch.int32)
+            box_area = torch.clamp((xmax - xmin) * (ymax - ymin), min=1)
+
+            # Valid area conditions based on FPN stride
+            if stride == 8:
+                stride_mask = box_area < (32 ** 2)
+            elif stride == 16:
+                stride_mask = (box_area >= (32 ** 2)) & (box_area < (96 ** 2))
             else:
-                cls_dense[b_idx, t_idx, 0, cy, cx] = 1.0  # fallback Dynamic
+                stride_mask = box_area >= (96 ** 2)
 
-            grid_x = cx.float() * 8.0 + 4.0
-            grid_y = cy.float() * 8.0 + 4.0
+            valid_mask = (true_area >= 10) & (box_area <= 4 * true_area) & valid_bt & stride_mask
 
-            valid_boxes = torch.stack(
-                [
-                    torch.clamp(
-                        (grid_x - xmin[n_idx, b_idx, t_idx].float()) / 8.0, min=1e-4
-                    ),
-                    torch.clamp(
-                        (grid_y - ymin[n_idx, b_idx, t_idx].float()) / 8.0, min=1e-4
-                    ),
-                    torch.clamp(
-                        (xmax[n_idx, b_idx, t_idx].float() - grid_x) / 8.0, min=1e-4
-                    ),
-                    torch.clamp(
-                        (ymax[n_idx, b_idx, t_idx].float() - grid_y) / 8.0, min=1e-4
-                    ),
-                ],
-                dim=-1,
-            )
-            bboxes_dense[b_idx, t_idx, :, cy, cx] = valid_boxes
+            n_idx, b_idx, t_idx = torch.where(valid_mask)
+
+            if len(n_idx) > 0:
+                areas = box_area[n_idx, b_idx, t_idx]
+                sort_idx = torch.argsort(areas, descending=True)
+                
+                n_idx = n_idx[sort_idx]
+                b_idx = b_idx[sort_idx]
+                t_idx = t_idx[sort_idx]
+                
+                cy = torch.clamp(((ymin[n_idx, b_idx, t_idx] + ymax[n_idx, b_idx, t_idx]) / 2 / stride).long(), 0, H_feat - 1)
+                cx = torch.clamp(((xmin[n_idx, b_idx, t_idx] + xmax[n_idx, b_idx, t_idx]) / 2 / stride).long(), 0, W_feat - 1)
+                
+                o_d[b_idx, t_idx, 0, cy, cx] = 1.0
+
+                if is_dyn_out is not None:
+                    is_dyn_batch = is_dyn_out[b_idx]
+                    is_dyn_val = is_dyn_batch[torch.arange(len(n_idx), device=device), n_idx.long()]
+                    c_d[b_idx, t_idx, 0, cy, cx] = is_dyn_val.float()
+                else:
+                    c_d[b_idx, t_idx, 0, cy, cx] = 1.0
+
+                grid_x = cx.float() * stride + (stride / 2.0)
+                grid_y = cy.float() * stride + (stride / 2.0)
+
+                valid_boxes = torch.stack(
+                    [
+                        torch.clamp((grid_x - xmin[n_idx, b_idx, t_idx].float()) / float(stride), min=1e-4),
+                        torch.clamp((grid_y - ymin[n_idx, b_idx, t_idx].float()) / float(stride), min=1e-4),
+                        torch.clamp((xmax[n_idx, b_idx, t_idx].float() - grid_x) / float(stride), min=1e-4),
+                        torch.clamp((ymax[n_idx, b_idx, t_idx].float() - grid_y) / float(stride), min=1e-4),
+                    ],
+                    dim=-1,
+                )
+                b_d[b_idx, t_idx, :, cy, cx] = valid_boxes
+                
+        bboxes_dense.append(b_d)
+        obj_dense.append(o_d)
+        cls_dense.append(c_d)
 
     h_val = torch.arange(H, device=device).view(1, 1, H, 1)
     w_val = torch.arange(W, device=device).view(1, 1, 1, W)
