@@ -93,8 +93,12 @@ def train_model(args):
             for chunk_start in range(0, t, args.seq_len):
                 chunk_end = min(chunk_start + args.seq_len, t)
                 optimizer.zero_grad(set_to_none=True)
-                total_seq_loss = 0
                 loss_dict_acc = {k: 0.0 for k in ["Obj", "Box", "Mask", "Depth", "Photo", "Ego", "Flow", "Anom", "Gate", "Cls"]}
+                
+                chunk_preds = []
+                chunk_targets = []
+                chunk_x_t = []
+                chunk_x_next = []
                 
                 for step in range(chunk_start, chunk_end):
                     x_t = videos[:, step]
@@ -118,18 +122,48 @@ def train_model(args):
                     with torch.autocast(device_type=device.type, enabled=(scaler is not None)):
                         out = model(x_t, dt_t, global_step, state, get_loss_weights_fn=get_loss_weights)
                         state = out["next_state"]
-                        loss, loss_dict, warped_img = compute_physics_loss(out, target_t, x_t, x_next, mode=mode, step=global_step)
                         
-                    total_seq_loss += loss
-                    for k in loss_dict_acc: loss_dict_acc[k] = loss_dict_acc[k] + loss_dict[k]
+                    chunk_preds.append({k: v for k, v in out.items() if k != "next_state"})
+                    chunk_targets.append(target_t)
+                    chunk_x_t.append(x_t)
+                    chunk_x_next.append(x_next)
                     
-                    if (global_step + 1) % args.vis_interval == 0 and step == chunk_end - 1:
-                        filepath = save_visualization(x_t, target_t, out, global_step + 1, warped_img)
-                        if args.use_wandb and filepath:
-                            wandb.log({"Visualization": wandb.Image(filepath)}, step=global_step)
-                            
                 chunk_steps = chunk_end - chunk_start
-                total_seq_loss = total_seq_loss / chunk_steps
+                
+                with torch.autocast(device_type=device.type, enabled=(scaler is not None)):
+                    batched_preds = {}
+                    for k in chunk_preds[0].keys():
+                        if chunk_preds[0][k] is None:
+                            batched_preds[k] = None
+                        elif chunk_preds[0][k].dim() == 0:
+                            batched_preds[k] = torch.stack([p[k] for p in chunk_preds])
+                        else:
+                            batched_preds[k] = torch.cat([p[k] for p in chunk_preds], dim=0)
+                            
+                    batched_targets = {}
+                    for k in chunk_targets[0].keys():
+                        if chunk_targets[0][k] is None:
+                            batched_targets[k] = None
+                        elif chunk_targets[0][k].dim() == 0:
+                            batched_targets[k] = torch.stack([t_dict[k] for t_dict in chunk_targets])
+                        else:
+                            batched_targets[k] = torch.cat([t_dict[k] for t_dict in chunk_targets], dim=0)
+                            
+                    batched_x_t = torch.cat(chunk_x_t, dim=0)
+                    batched_x_next = torch.cat(chunk_x_next, dim=0)
+                    
+                    total_seq_loss, loss_dict, warped_img = compute_physics_loss(batched_preds, batched_targets, batched_x_t, batched_x_next, mode=mode, step=global_step)
+                    
+                for k in loss_dict_acc: loss_dict_acc[k] = loss_dict_acc[k] + loss_dict[k] * chunk_steps
+                
+                if (global_step + 1) % args.vis_interval == 0:
+                    last_out = chunk_preds[-1]
+                    last_target = chunk_targets[-1]
+                    last_x_t = chunk_x_t[-1]
+                    last_warp = warped_img[-b:] if warped_img is not None else None
+                    filepath = save_visualization(last_x_t, last_target, last_out, global_step + 1, last_warp)
+                    if args.use_wandb and filepath:
+                        wandb.log({"Visualization": wandb.Image(filepath)}, step=global_step)
                 
                 if scaler is not None:
                     scaler.scale(total_seq_loss).backward()
@@ -151,13 +185,13 @@ def train_model(args):
                         model.segmenter.model[-1].class_prompts.requires_grad = True
 
                 if global_step == args.unfreeze_step_1 and mode == "supervised":
-                    print(f"\n🔓 [Step {args.unfreeze_step_1}] 解冻 Stage 5 高层语义...")
+                    print(f"\n🔓 [Step {args.unfreeze_step_1}] 解冻 P5 高层语义 (Stage 5)...")
                     for name, param in model.segmenter.named_parameters():
-                        if "stage5" in name: param.requires_grad = True
+                        if any(f"model.{i}." in name for i in range(20, 23)): param.requires_grad = True
                 elif global_step == args.unfreeze_step_2 and mode == "supervised":
-                    print(f"\n🔓 [Step {args.unfreeze_step_2}] 解冻 Stage 4 中层特征...")
+                    print(f"\n🔓 [Step {args.unfreeze_step_2}] 解冻 P4 中层特征 (Stage 4)...")
                     for name, param in model.segmenter.named_parameters():
-                        if "stage4" in name: param.requires_grad = True
+                        if any(f"model.{i}." in name for i in range(16, 20)): param.requires_grad = True
                         
                 global_step += 1
                 epoch_loss_sum += total_seq_loss.item()

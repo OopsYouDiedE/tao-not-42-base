@@ -178,11 +178,16 @@ def compute_instance_loss(preds, targets, step=0):
     device = preds["objectness"].device
     
     loss_obj = focal_loss(preds["objectness"], targets["obj_dense"])
+    if "dense_objectness" in preds:
+        loss_obj = (loss_obj + focal_loss(preds["dense_objectness"], targets["obj_dense"])) * 0.5
+        
     pos_mask = targets["obj_dense"][:, 0] > 0.5
     if pos_mask.sum() == 0:
         dummy_loss = torch.tensor(0.0, device=device)
         if preds.get("boxes") is not None: dummy_loss = dummy_loss + preds["boxes"].sum() * 0.0
+        if preds.get("dense_box_dist") is not None: dummy_loss = dummy_loss + preds["dense_box_dist"].sum() * 0.0
         if preds.get("mask_coefficients") is not None: dummy_loss = dummy_loss + preds["mask_coefficients"].sum() * 0.0
+        if preds.get("dense_mask_coefficients") is not None: dummy_loss = dummy_loss + preds["dense_mask_coefficients"].sum() * 0.0
         if preds.get("dense_classification") is not None: dummy_loss = dummy_loss + preds["dense_classification"].sum() * 0.0
         return loss_obj, dummy_loss, dummy_loss, dummy_loss
     
@@ -200,9 +205,19 @@ def compute_instance_loss(preds, targets, step=0):
         
         loss_box = loss_giou * 1.5 + loss_dfl * 0.5
         
+        if "dense_box_dist" in preds:
+            pred_boxes_dense_pos = decode_dfl_boxes(preds["dense_box_dist"], reg_max=32).permute(0,2,3,1)[pos_mask]
+            loss_giou_dense = giou_loss_with_l1_warmup(pred_boxes_dense_pos, gt_boxes_pos, step=step)
+            pred_dist_dense_pos = preds["dense_box_dist"].permute(0,2,3,1)[pos_mask]
+            loss_dfl_dense = dfl_loss(pred_dist_dense_pos, gt_boxes_pos, reg_max=32)
+            loss_box = (loss_box + loss_giou_dense * 1.5 + loss_dfl_dense * 0.5) * 0.5
+            
     if w["mask"] > 0:
-        loss_mask = compute_per_instance_mask_loss(preds, targets, pos_mask)
-        
+        loss_mask = compute_per_instance_mask_loss(preds, targets, pos_mask, key="mask_coefficients")
+        if "dense_mask_coefficients" in preds:
+            loss_mask_dense = compute_per_instance_mask_loss(preds, targets, pos_mask, key="dense_mask_coefficients")
+            loss_mask = (loss_mask + loss_mask_dense) * 0.5
+            
     loss_cls = torch.tensor(0.0, device=device)
     if w.get("cls", 0) > 0 and "dense_classification" in preds and "cls_dense" in targets:
         pred_cls_dense = preds["dense_classification"].permute(0,2,3,1)[pos_mask]
@@ -216,7 +231,7 @@ def compute_instance_loss(preds, targets, step=0):
     
     return loss_obj, loss_box, loss_mask, loss_cls
 
-def compute_per_instance_mask_loss(preds, targets, pos_mask):
+def compute_per_instance_mask_loss(preds, targets, pos_mask, key="mask_coefficients"):
     B, _, H_feat, W_feat = preds["objectness"].shape
     device = preds["objectness"].device
     seg_raw = targets["seg_raw"]
@@ -241,7 +256,7 @@ def compute_per_instance_mask_loss(preds, targets, pos_mask):
     inst_ids = inst_ids[valid_mask]
     num_instances = b_indices.numel()
     
-    coeffs = preds["mask_coefficients"][b_indices, :, y_indices, x_indices]
+    coeffs = preds[key][b_indices, :, y_indices, x_indices]
     protos = preds["mask_prototypes"][b_indices]
     pred_logits_small = torch.einsum("np,nphw->nhw", coeffs, protos)
     
@@ -280,9 +295,11 @@ def setup_finetune_mode(model):
     for param in model.state_update_gate_head.parameters():
         param.requires_grad = True
     
-    model.segmenter.prediction_head.objectness.requires_grad_(True)
-    model.segmenter.prediction_head.boxes.requires_grad_(False)
-    model.segmenter.prediction_head.mask_coefficients.requires_grad_(False)
+    if hasattr(model.segmenter, 'model'):
+        model.segmenter.model[-1].obj_proj.requires_grad_(True)
+        model.segmenter.model[-1].one2one_obj_proj.requires_grad_(True)
+        if hasattr(model.segmenter.model[-1], 'class_prompts'):
+            model.segmenter.model[-1].class_prompts.requires_grad_(True)
     
     for param in model.flow_head.parameters():
         param.requires_grad = True
