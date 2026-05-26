@@ -14,21 +14,26 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchvision
-from mamba_ssm import Mamba
-import tensorflow as tf
-import tensorflow_datasets as tfds
-try:
-    import wandb
-except ImportError:
-    wandb = None
-# =====================================================================
-# 0. 环境与可选依赖配置
-# =====================================================================
+
 try:
     import google.colab
     IN_COLAB = True
 except ImportError:
     IN_COLAB = False
+
+if IN_COLAB:
+    from mamba_ssm import Mamba
+    import tensorflow as tf
+    import tensorflow_datasets as tfds
+else:
+    Mamba = None
+    tf = None
+    tfds = None
+
+try:
+    import wandb
+except ImportError:
+    wandb = None
 
 
 # =====================================================================
@@ -107,9 +112,9 @@ def save_visualization(video_t, target_t, pred_t, step, warped_img=None, output_
     warp_img = np.zeros((H, W, 3), np.uint8) if warped_img is None else cv2.cvtColor((np.clip(warped_img[0].permute(1, 2, 0).cpu().detach().numpy(), 0, 1) * 255).astype(np.uint8), cv2.COLOR_RGB2BGR)
 
     grid = np.vstack([
-        np.hstack([prep_cell(anom_img, "Anomaly"), prep_cell(p_flow_img, "Pred Flow")]),
+        np.hstack([prep_cell(anom_img, "Anomaly"), prep_cell(warp_img, "Warped (Photo Error)")]),
         np.hstack([prep_cell(depth_to_color(g_dep, d_min, d_max), "GT Depth"), prep_cell(depth_to_color(p_dep, d_min, d_max), "Pred Depth")]),
-        np.hstack([prep_cell(flow_to_color(g_flow_np), "GT Flow"), prep_cell(warp_img, "Warped (Photo Error)")]),
+        np.hstack([prep_cell(flow_to_color(g_flow_np), "GT Flow"), prep_cell(p_flow_img, "Pred Flow")]),
     ])
 
     final_img = np.hstack([pred_canvas, gt_canvas, cv2.resize(grid, (int(grid.shape[1] * H / grid.shape[0]), H))])
@@ -319,7 +324,7 @@ class SpatioTemporalMambaBlock(nn.Module):
         out = x_flat.view(B, H, W, T, C).permute(0, 3, 4, 1, 2).contiguous()
         return out
 
-class FlowDecoder(nn.Module):
+class UnifiedGeometryDecoder(nn.Module):
     def __init__(self, ch_p3=256, ch_f2=96, ch_f1=48):
         super().__init__()
         self.up1 = nn.Sequential(nn.Upsample(scale_factor=2.0, mode="bilinear", align_corners=False), YOLOConv(ch_p3, ch_f2, 3))
@@ -327,10 +332,22 @@ class FlowDecoder(nn.Module):
         self.up2 = nn.Sequential(nn.Upsample(scale_factor=2.0, mode="bilinear", align_corners=False), YOLOConv(ch_f2, ch_f1, 3))
         self.conv2 = YOLOConv(ch_f1 * 2, ch_f1, 3)
         self.up3 = nn.Sequential(nn.Upsample(scale_factor=2.0, mode="bilinear", align_corners=False), YOLOConv(ch_f1, ch_f1, 3))
-        self.head = nn.Sequential(YOLOConv(ch_f1, ch_f1 // 2, 3), nn.Conv2d(ch_f1 // 2, 2, 3, padding=1))
+        self.depth_out = nn.Sequential(YOLOConv(ch_f1, ch_f1 // 2, 3), nn.Conv2d(ch_f1 // 2, 1, 3, padding=1))
+        self.flow_out = nn.Sequential(YOLOConv(ch_f1, ch_f1 // 2, 3), nn.Conv2d(ch_f1 // 2, 2, 3, padding=1))
 
-    def forward(self, f1, f2, p3):
-        return self.head(self.up3(self.conv2(torch.cat([self.up2(self.conv1(torch.cat([self.up1(p3), f2], dim=1))), f1], dim=1))))
+    def forward(self, f1, f2, p3, need_flow=True):
+        # 共享的多尺度融合主干
+        x1 = torch.cat([self.up1(p3), f2], dim=1)
+        x2 = self.conv1(x1)
+        x3 = torch.cat([self.up2(x2), f1], dim=1)
+        x4 = self.conv2(x3)
+        
+        # 共享的 256x256 上采样与高清卷积
+        shared_up = self.up3(x4)
+        
+        depth = self.depth_out(shared_up)
+        flow = self.flow_out(shared_up) if need_flow else None
+        return depth, flow
 
 class EgoPoseHead(nn.Module):
     def __init__(self, in_channels):
@@ -351,19 +368,6 @@ class FeaturePredictorHead(nn.Module):
 
     def forward(self, state, action):
         return self.net(self.stem(torch.cat([state, action.view(*action.shape, 1, 1).expand(-1, -1, state.shape[2], state.shape[3])], dim=1)))
-
-class DepthDecoder(nn.Module):
-    def __init__(self, ch_p3=256, ch_f2=96, ch_f1=48):
-        super().__init__()
-        self.up1 = nn.Sequential(nn.Upsample(scale_factor=2.0, mode="bilinear", align_corners=False), YOLOConv(ch_p3, ch_f2, 3))
-        self.conv1 = YOLOConv(ch_f2 * 2, ch_f2, 3)
-        self.up2 = nn.Sequential(nn.Upsample(scale_factor=2.0, mode="bilinear", align_corners=False), YOLOConv(ch_f2, ch_f1, 3))
-        self.conv2 = YOLOConv(ch_f1 * 2, ch_f1, 3)
-        self.up3 = nn.Sequential(nn.Upsample(scale_factor=2.0, mode="bilinear", align_corners=False), YOLOConv(ch_f1, ch_f1, 3))
-        self.depth_out = nn.Sequential(YOLOConv(ch_f1, ch_f1 // 2, 3), nn.Conv2d(ch_f1 // 2, 1, 3, padding=1))
-
-    def forward(self, f1, f2, p3):
-        return self.depth_out(self.up3(self.conv2(torch.cat([self.up2(self.conv1(torch.cat([self.up1(p3), f2], dim=1))), f1], dim=1))))
 
 class YOLOESegment26(nn.Module):
     def __init__(self, nc=80, nm=32, npr=256, embed=512, reg_max=1, ch=()):
@@ -430,7 +434,7 @@ class TAONot42VisionModel(nn.Module):
     def __init__(self, base_channels=48, hidden_channels=768):
         super().__init__()
         self.segmenter = MyYOLOE()
-        self.depth_decoder, self.flow_head = DepthDecoder(128, 64, 32), FlowDecoder(128, 64, 32)
+        self.geom_decoder = UnifiedGeometryDecoder(128, 64, 32)
         self.st_block = SpatioTemporalMambaBlock(128)
         self.st_block_p4 = SpatioTemporalMambaBlock(256)
         self.st_block_p5 = SpatioTemporalMambaBlock(512)
@@ -461,16 +465,16 @@ class TAONot42VisionModel(nn.Module):
             spatiotemporal_p3.flatten(0, 1), spatiotemporal_p4.flatten(0, 1), spatiotemporal_p5.flatten(0, 1)
         ])
 
-        depth_raw = self.depth_decoder(f1.flatten(0, 1), f2.flatten(0, 1), spatiotemporal_p3.flatten(0, 1))
+        lw = get_loss_weights_fn(step) if get_loss_weights_fn else {"flow": 1, "box": 1, "mask": 1, "anom": 1}
+
+        # 一次性调用 UnifiedGeometryDecoder，共用特征提取和上采样通路
+        depth_raw, flow_raw = self.geom_decoder(f1.flatten(0, 1), f2.flatten(0, 1), spatiotemporal_p3.flatten(0, 1), need_flow=(lw["flow"] > 0))
+        
         depth_pred = torch.exp(torch.clamp(F.interpolate(depth_raw, size=(h, w), mode="bilinear", align_corners=False).squeeze(1), min=-4.6, max=4.6)).view(B*T, h, w)
         
         ego_pose = self.pose_head(spatiotemporal_p3.flatten(0, 1))
         
-        lw = get_loss_weights_fn(step) if get_loss_weights_fn else {"flow": 1, "box": 1, "mask": 1, "anom": 1}
-        
-        flow_pred = None
-        if lw["flow"] > 0:
-            flow_pred = self.flow_head(f1.flatten(0, 1), f2.flatten(0, 1), spatiotemporal_p3.flatten(0, 1)) * 1.5
+        flow_pred = flow_raw * 1.5 if flow_raw is not None else None
             
         gate = torch.sigmoid(self.state_update_gate_head(spatiotemporal_p3.mean(dim=[3, 4]).flatten(0, 1))).view(B*T)
 
@@ -667,8 +671,8 @@ def dfl_loss(pred_dist, target_distances, reg_max=16):
             F.cross_entropy(pred_dist.reshape(-1, reg_max), tr.reshape(-1), reduction="none").reshape(wr.shape) * wr).mean(dim=-1)
 
 def giou_loss(preds, targets):
-    pl, pt, pr, pb = preds[:, 0], preds[:, 1], preds[:, 2], preds[:, 3]
-    tl, tt, tr, tb = targets[:, 0], targets[:, 1], targets[:, 2], targets[:, 3]
+    pl, pt, pr, pb = preds[..., 0], preds[..., 1], preds[..., 2], preds[..., 3]
+    tl, tt, tr, tb = targets[..., 0], targets[..., 1], targets[..., 2], targets[..., 3]
     inter_area = (torch.min(pl, tl) + torch.min(pr, tr)) * (torch.min(pt, tt) + torch.min(pb, tb))
     union_area = (pl + pr) * (pt + pb) + (tl + tr) * (tt + tb) - inter_area + 1e-6
     return 1.0 - (inter_area / union_area - ((torch.max(pl, tl) + torch.max(pr, tr)) * (torch.max(pt, tt) + torch.max(pb, tb)) + 1e-6 - union_area) / ((torch.max(pl, tl) + torch.max(pr, tr)) * (torch.max(pt, tt) + torch.max(pb, tb)) + 1e-6))
@@ -802,7 +806,7 @@ class TAOTrainer:
 
     def _setup_finetune(self):
         for param in self.model.segmenter.parameters(): param.requires_grad = False
-        for m in [self.model.depth_decoder, self.model.pose_head, self.model.st_block, self.model.st_block_p4, self.model.st_block_p5, self.model.feature_predictor, self.model.state_update_gate_head, self.model.flow_head]:
+        for m in [self.model.geom_decoder, self.model.pose_head, self.model.st_block, self.model.st_block_p4, self.model.st_block_p5, self.model.feature_predictor, self.model.state_update_gate_head]:
             for p in m.parameters(): p.requires_grad = True
         self.model.segmenter.model[-1].obj_proj.requires_grad_(True); self.model.segmenter.model[-1].one2one_obj_proj.requires_grad_(True)
         if hasattr(self.model.segmenter.model[-1], "class_prompts"): self.model.segmenter.model[-1].class_prompts.requires_grad_(True)
@@ -922,11 +926,24 @@ class TAOTrainer:
             for k in loss_acc: loss_acc[k] += l_dict[k] * T_chunk
 
             if (self.global_step + 1) % self.args.vis_interval == 0:
-                def slice_b(v):
+                def slice_second_frame(v):
                     if v is None: return None
-                    if isinstance(v, list): return [x[-v_seq.shape[0]:] if x.dim() > 0 else x for x in v]
-                    return v[-v_seq.shape[0]:] if v.dim() > 0 else v
-                fp = save_visualization(c_vids[:, -1], {k: slice_b(v) for k, v in tgts.items()}, {k: slice_b(v) for k, v in preds.items()}, self.global_step + 1, w_img[-v_seq.shape[0]:] if w_img is not None else None)
+                    if isinstance(v, list):
+                        res = []
+                        for x in v:
+                            if x.dim() == 0:
+                                res.append(x)
+                            elif x.shape[0] == v_seq.shape[0] * T_chunk:
+                                res.append(x[(v_seq.shape[0] - 1) * T_chunk + 1 : (v_seq.shape[0] - 1) * T_chunk + 2])
+                            else:
+                                res.append(x[-v_seq.shape[0]:])
+                        return res
+                    if v.dim() == 0:
+                        return v
+                    if v.shape[0] == v_seq.shape[0] * T_chunk:
+                        return v[(v_seq.shape[0] - 1) * T_chunk + 1 : (v_seq.shape[0] - 1) * T_chunk + 2]
+                    return v[-v_seq.shape[0]:]
+                fp = save_visualization(c_vids[:, 1], {k: slice_second_frame(v) for k, v in tgts.items()}, {k: slice_second_frame(v) for k, v in preds.items()}, self.global_step + 1, slice_second_frame(w_img) if w_img is not None else None)
                 if wandb and fp: wandb.log({"Vis": wandb.Image(fp)}, step=self.global_step)
             
             self.global_step += 1
