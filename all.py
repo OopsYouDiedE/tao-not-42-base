@@ -457,12 +457,11 @@ class TAONot42VisionModel(nn.Module):
         next_st_p4, spatiotemporal_p4 = update_st(self.st_block_p4, p4)
         next_st_p5, spatiotemporal_p5 = update_st(self.st_block_p5, p5)
 
-        preds = torch.utils.checkpoint.checkpoint(
-            lambda p3, p4, p5: self.segmenter.model[-1]([p3, p4, p5]),
-            spatiotemporal_p3.flatten(0, 1), spatiotemporal_p4.flatten(0, 1), spatiotemporal_p5.flatten(0, 1), use_reentrant=False
-        )
+        preds = self.segmenter.model[-1]([
+            spatiotemporal_p3.flatten(0, 1), spatiotemporal_p4.flatten(0, 1), spatiotemporal_p5.flatten(0, 1)
+        ])
 
-        depth_raw = torch.utils.checkpoint.checkpoint(self.depth_decoder, f1.flatten(0, 1), f2.flatten(0, 1), spatiotemporal_p3.flatten(0, 1), use_reentrant=False)
+        depth_raw = self.depth_decoder(f1.flatten(0, 1), f2.flatten(0, 1), spatiotemporal_p3.flatten(0, 1))
         depth_pred = torch.exp(torch.clamp(F.interpolate(depth_raw, size=(h, w), mode="bilinear", align_corners=False).squeeze(1), min=-4.6, max=4.6)).view(B*T, h, w)
         
         ego_pose = self.pose_head(spatiotemporal_p3.flatten(0, 1))
@@ -471,7 +470,7 @@ class TAONot42VisionModel(nn.Module):
         
         flow_pred = None
         if lw["flow"] > 0:
-            flow_pred = torch.utils.checkpoint.checkpoint(self.flow_head, f1.flatten(0, 1), f2.flatten(0, 1), spatiotemporal_p3.flatten(0, 1), use_reentrant=False) * 1.5
+            flow_pred = self.flow_head(f1.flatten(0, 1), f2.flatten(0, 1), spatiotemporal_p3.flatten(0, 1)) * 1.5
             
         gate = torch.sigmoid(self.state_update_gate_head(spatiotemporal_p3.mean(dim=[3, 4]).flatten(0, 1))).view(B*T)
 

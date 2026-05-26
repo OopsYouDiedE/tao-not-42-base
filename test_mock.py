@@ -1,4 +1,18 @@
+import sys
+import types
 import torch
+
+# Inject mock mamba_ssm module for Windows environments where compilation fails
+mamba_mock = types.ModuleType("mamba_ssm")
+class MockMamba(torch.nn.Module):
+    def __init__(self, d_model, *args, **kwargs):
+        super().__init__()
+        self.proj = torch.nn.Linear(d_model, d_model)
+    def forward(self, x, *args, **kwargs):
+        return self.proj(x)
+mamba_mock.Mamba = MockMamba
+sys.modules["mamba_ssm"] = mamba_mock
+
 import time
 from all import TAONot42VisionModel, get_loss_weights, compute_physics_loss
 

@@ -149,15 +149,7 @@ class TAONot42VisionModel(nn.Module):
         spatiotemporal_p5 = p5 + next_gru_state_up_p5
 
         # Step 3: 直接调用检测头 (YOLOESegment26 是 segmenter.model 的最后一层)
-        # 使用 Gradient Checkpointing 极大地节省这部分庞大图结构的显存占用！
-        import torch.utils.checkpoint as checkpoint
-
-        def run_yolo_head(p3, p4, p5):
-            return self.segmenter.model[-1]([p3, p4, p5])
-
-        preds = checkpoint.checkpoint(
-            run_yolo_head, spatiotemporal_p3, spatiotemporal_p4, spatiotemporal_p5, use_reentrant=False
-        )
+        preds = self.segmenter.model[-1]([spatiotemporal_p3, spatiotemporal_p4, spatiotemporal_p5])
 
         # The rest of the physics pipeline runs on the temporally tracked spatiotemporal_p3
         depth_logits = self.depth_decoder(f1, f2, spatiotemporal_p3)
