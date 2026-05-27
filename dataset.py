@@ -1,24 +1,12 @@
-import os
 import time
 import queue
 import random
-import argparse
 import threading
-import contextlib
-import urllib.request
 from collections import deque
 
-try:
-    from scipy.optimize import linear_sum_assignment as _lsa
-except ImportError:
-    _lsa = None
-
-import cv2
 import numpy as np
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
-import torchvision
 
 try:
     import google.colab
@@ -26,19 +14,18 @@ try:
 except ImportError:
     IN_COLAB = False
 
-if IN_COLAB:
-    from mamba_ssm import Mamba
+try:
     import tensorflow as tf
     import tensorflow_datasets as tfds
-else:
-    Mamba = None
+except ImportError:
     tf = None
     tfds = None
 
-try:
-    import wandb
-except ImportError:
-    wandb = None
+
+def decode_uint16_range(encoded, value_range):
+    encoded = encoded.astype(np.float32)
+    minv, maxv = np.asarray(value_range, dtype=np.float32)
+    return encoded / 65535.0 * (maxv - minv) + minv
 
 # =====================================================================
 
@@ -57,12 +44,12 @@ class AsyncDataBuffer:
         threading.Thread(target=self._fetch_loop, daemon=True).start()
 
     def _fetch_loop(self):
-        if not IN_COLAB:
+        if tfds is None or tf is None:
             while True:
                 item = {
                     "video": torch.randint(0, 256, (12, 256, 256, 3), dtype=torch.uint8),
                     "segmentation": torch.randint(0, 3, (12, 256, 256), dtype=torch.int32),
-                    "depth": torch.rand(12, 256, 256, dtype=torch.float32) * 1000,
+                    "depth": torch.rand(12, 256, 256, dtype=torch.float32) * 15.0 + 3.0,
                     "forward_flow": torch.zeros(12, 256, 256, 2, dtype=torch.float32),
                     "cam_pos": torch.zeros(12, 3, dtype=torch.float32),
                     "cam_quat": torch.tensor([1., 0., 0., 0.], dtype=torch.float32).expand(12, 4).clone(),
@@ -82,6 +69,10 @@ class AsyncDataBuffer:
                 "video": x["video"], "segmentations": x["segmentations"], "depth": x["depth"],
                 "forward_flow": x["forward_flow"], "cam_pos": x["camera"]["positions"],
                 "cam_quat": x["camera"]["quaternions"],
+                "depth_range": x["metadata"]["depth_range"],
+                "forward_flow_range": x["metadata"]["forward_flow_range"],
+                "camera_focal_length": x["camera"]["focal_length"],
+                "camera_sensor_width": x["camera"]["sensor_width"],
                 **({"is_dynamic": x["instances"]["is_dynamic"]} if "instances" in x and "is_dynamic" in x["instances"] else {})
             }
 
@@ -89,22 +80,27 @@ class AsyncDataBuffer:
             tf.data.AUTOTUNE)
 
         for item in tfds.as_numpy(ds):
-            p_item = {k: torch.from_numpy(item[k_i]).pin_memory() for k, k_i in [(
-                "video", "video"), ("cam_pos", "cam_pos"), ("cam_quat", "cam_quat")]}
-            p_item.update({k: torch.from_numpy(item[k_i][..., 0]).pin_memory() for k, k_i in [
-                          ("segmentation", "segmentations"), ("depth", "depth")]})
+            p_item = {k: torch.from_numpy(item[k_i]).pin_memory() for k, k_i in [
+                ("video", "video"), ("cam_pos", "cam_pos"), ("cam_quat", "cam_quat")]}
+            p_item["segmentation"] = torch.from_numpy(
+                item["segmentations"][..., 0]).pin_memory()
+            p_item["depth"] = torch.from_numpy(decode_uint16_range(
+                item["depth"][..., 0], item["depth_range"])).pin_memory()
+            p_item["depth_range"] = torch.from_numpy(
+                item["depth_range"]).pin_memory()
+            p_item["forward_flow_range"] = torch.from_numpy(
+                item["forward_flow_range"]).pin_memory()
+            p_item["camera_focal_length"] = torch.as_tensor(
+                item["camera_focal_length"]).pin_memory()
+            p_item["camera_sensor_width"] = torch.as_tensor(
+                item["camera_sensor_width"]).pin_memory()
 
             if "is_dynamic" in item:
                 p_item["is_dynamic"] = torch.from_numpy(
                     item["is_dynamic"]).pin_memory()
 
-            f_np = item["forward_flow"].astype(np.float32)
-            if "metadata" in item and "forward_flow_range" in item["metadata"]:
-                minv, maxv = item["metadata"]["forward_flow_range"]
-                f_np = f_np / 65535.0 * (maxv - minv) + minv
-            else:
-                f_np = (f_np - 32768.0) / 64.0
-
+            f_np = decode_uint16_range(
+                item["forward_flow"], item["forward_flow_range"])
             p_item["forward_flow"] = torch.from_numpy(f_np).pin_memory()
 
             with self.lock:
@@ -119,7 +115,12 @@ class AsyncDataBuffer:
                     return None
             batch = random.sample(self.buffer, self.batch_size)
 
-        return {k: [i.get(k) for i in batch] for k in ["video", "segmentation", "depth", "forward_flow", "cam_pos", "cam_quat", "is_dynamic"]}
+        keys = [
+            "video", "segmentation", "depth", "forward_flow", "cam_pos",
+            "cam_quat", "is_dynamic", "depth_range", "forward_flow_range",
+            "camera_focal_length", "camera_sensor_width",
+        ]
+        return {k: [i.get(k) for i in batch] for k in keys}
 
 
 def process_batch_on_gpu(batch, device, target_size=256):
@@ -143,7 +144,7 @@ def process_batch_on_gpu(batch, device, target_size=256):
         is_dyn_out = torch.stack(
             [F.pad(x.to(device), (0, max_dyn_len - len(x))) for x in batch["is_dynamic"]])
 
-    depth_m = torch.clamp(depth_raw / 1000.0, 0.01, 100.0)
+    depth_m = torch.clamp(depth_raw, 0.01, 100.0)
     depth_m[depth_raw == 0] = 100.0
     video_p = video.permute(0, 1, 4, 2, 3).float() / 255.0
 

@@ -1,55 +1,22 @@
 import os
 import time
-import queue
-import random
-import argparse
-import threading
 import contextlib
 import urllib.request
-from collections import deque
 
-try:
-    from scipy.optimize import linear_sum_assignment as _lsa
-except ImportError:
-    _lsa = None
-
-import cv2
-import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-import torchvision
-
-try:
-    import google.colab
-    IN_COLAB = True
-except ImportError:
-    IN_COLAB = False
-
-if IN_COLAB:
-    from mamba_ssm import Mamba
-    import tensorflow as tf
-    import tensorflow_datasets as tfds
-else:
-    Mamba = None
-    tf = None
-    tfds = None
 
 try:
     import wandb
 except ImportError:
     wandb = None
 
-# =====================================================================
 from models.tao_core import *
-from dataset import *
 from utils.losses import *
 from utils.visualization import *
-from utils.geometry import *
 
 # 7. TAO 训练器 (OOP Refactoring)
 # =====================================================================
-
 
 class TAOTrainer:
     def __init__(self, args, model, buffer, prefetcher):

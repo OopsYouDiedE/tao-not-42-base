@@ -162,7 +162,7 @@ def get_movi_e_or_fallback(npz_path="movi_e_sample.npz", B=1, T=12, H=256, W=256
             v_np = data["video"]                  # Expected: [T, H, W, 3] or [B, T, H, W, 3]
             d_np = data["depth"]                  # Expected: [T, H, W] or [B, T, H, W]
             s_np = data["segmentation"]           # Expected: [T, H, W] or [B, T, H, W]
-            f_np = (data["forward_flow"].astype(np.float32) - 32768.0) / 64.0           # Expected: [T, H, W, 2] or [B, T, H, W, 2]; same decode as all.py line 522
+            f_np = data["forward_flow"].astype(np.float32)           # Expected: [T, H, W, 2] or [B, T, H, W, 2]
             cp_np = data.get("cam_pos")           # Expected: [T, 3] or [B, T, 3]
             cq_np = data.get("cam_quat")          # Expected: [T, 4] or [B, T, 4]
             id_np = data.get("is_dynamic")        # Expected: [NumInstances] or List of them
@@ -403,7 +403,7 @@ def test_all_stages():
         if stage_id == 5:
             print("\nGenerating visual verification grid for inspection...")
             # Slice the second frame (index 1) from the flattened B*T tensors,
-            # matching all.py's slice_second_frame logic.
+            # matching TAOTrainer visualization slice logic.
             vis_frame_idx = 1  # second frame: has both t-1 and t+1 neighbours
             def slice_vis_frame(v):
                 if v is None: return None
@@ -436,8 +436,6 @@ def test_all_stages():
     print("\n----------------------------------------------------")
     print("[RUN] Stage 6: End-to-End Tracking Module Verification")
     print("----------------------------------------------------")
-
-    from all import compute_track_loss
 
     # Re-run forward at step=1000 (track loss is active: ramp(500,2000,1.0))
     track_step = 1000

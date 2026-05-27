@@ -1,49 +1,10 @@
-import os
-import time
-import queue
-import random
-import argparse
-import threading
-import contextlib
-import urllib.request
-from collections import deque
-
-try:
-    from scipy.optimize import linear_sum_assignment as _lsa
-except ImportError:
-    _lsa = None
-
-import cv2
-import numpy as np
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
-import torchvision
-
-try:
-    import google.colab
-    IN_COLAB = True
-except ImportError:
-    IN_COLAB = False
-
-if IN_COLAB:
-    from mamba_ssm import Mamba
-    import tensorflow as tf
-    import tensorflow_datasets as tfds
-else:
-    Mamba = None
-    tf = None
-    tfds = None
-
-try:
-    import wandb
-except ImportError:
-    wandb = None
 
 # =====================================================================
 
 def quaternion_to_matrix(q):
-    x, y, z, w = q[..., 0], q[..., 1], q[..., 2], q[..., 3]
+    w, x, y, z = q[..., 0], q[..., 1], q[..., 2], q[..., 3]
     x2, y2, z2, w2 = x * x, y * y, z * z, w * w
     xy, zw, xz, yw, yz, xw = x * y, z * w, x * z, y * w, y * z, x * w
     return torch.stack([
@@ -108,5 +69,3 @@ def inverse_warp(img_next, depth, pose, K, K_inv):
         pixels_next[:, 2:3, :].view(B, 1, H, W) > 0.01)).float()
 
     return warped, valid_mask * depth_mask
-
-
