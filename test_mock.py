@@ -18,12 +18,70 @@ mamba_mock = types.ModuleType("mamba_ssm")
 mamba_mock.Mamba = MockMamba
 sys.modules["mamba_ssm"] = mamba_mock
 
+# 2b. Inject scipy mock (for test_mock; Colab has real scipy for training)
+scipy_mock = types.ModuleType("scipy")
+scipy_opt_mock = types.ModuleType("scipy.optimize")
+scipy_opt_mock.linear_sum_assignment = lambda cost: (
+    np.arange(min(cost.shape)), np.arange(min(cost.shape)))
+scipy_mock.optimize = scipy_opt_mock
+sys.modules["scipy"] = scipy_mock
+sys.modules["scipy.optimize"] = scipy_opt_mock
+
 # 3. Import all.py and perform dynamic monkey patching injection of Mamba before any block initializes
 import all
 all.Mamba = MockMamba
 
 # Import other components safely now
 from all import TAONot42VisionModel, get_loss_weights, compute_physics_loss, save_visualization, process_batch_on_gpu, TAOTrainer
+
+def load_yoloe_weights(model, path="yoloe-26s-seg-pf.pt"):
+    import torch
+    import torch.nn as nn
+    import os
+    import urllib.request
+    
+    if not os.path.exists(path):
+        weights_url = f"https://github.com/ultralytics/assets/releases/download/v8.4.0/{path}"
+        print(f"Downloading weights from {weights_url} ...")
+        urllib.request.urlretrieve(weights_url, path)
+        print("Download complete.")
+
+    for name, module in model.named_modules():
+        if module.__class__.__name__ == 'Conv':
+            c1 = module.conv.in_channels
+            c2 = module.conv.out_channels
+            k = module.conv.kernel_size
+            s = module.conv.stride
+            p = module.conv.padding
+            g = module.conv.groups
+            d = module.conv.dilation
+            
+            new_conv = nn.Conv2d(c1, c2, k, s, p, groups=g, dilation=d, bias=True)
+            new_conv.to(module.conv.weight.device)
+            module.conv = new_conv
+            module.bn = nn.Identity()
+        elif module.__class__.__name__ == 'PSABlock':
+            if hasattr(module, 'add_norm1'): module.add_norm1 = torch.nn.Identity()
+            if hasattr(module, 'add_norm2'): module.add_norm2 = torch.nn.Identity()
+
+    try:
+        from ultralytics import YOLO
+        ul_model = YOLO(path)
+        sd = ul_model.model.state_dict()
+    except ImportError:
+        ckpt = torch.load(path, map_location="cpu", weights_only=False)
+        sd = ckpt["model"].state_dict() if isinstance(ckpt, dict) and "model" in ckpt else (ckpt.state_dict() if hasattr(ckpt, "state_dict") else ckpt)
+
+    
+    # 2. (REMOVED) 以前会把 4585 截断成 nc，现在不再截断，保留零样本能力
+
+    tgt = model.state_dict()
+    loaded_keys = {k for k, v in sd.items() if (k.replace("model.model.", "segmenter.model.").replace("model.", "segmenter.model.") if k.startswith("model.") else k) in tgt and tgt[(k.replace("model.model.", "segmenter.model.").replace("model.", "segmenter.model.") if k.startswith("model.") else k)].shape == v.shape}
+    print(f"====================================================")
+    print(f"[YOLO] Successfully loaded {len(loaded_keys)}/{len(sd)} keys from '{path}'!")
+    print(f"====================================================")
+    tgt.update({k.replace("model.model.", "segmenter.model.").replace("model.", "segmenter.model.") if k.startswith("model.") else k: v for k, v in sd.items() if k in loaded_keys})
+    model.load_state_dict(tgt)
 
 class DummyTrainer:
     """Minimal self substitute to call TAOTrainer helper methods directly."""
@@ -245,6 +303,7 @@ def test_all_stages():
     
     # 1. Instantiate vision model
     model = TAONot42VisionModel().to(device)
+    load_yoloe_weights(model, 'yoloe-26s-seg-pf.pt')
     model.train()
     
     # Model Parameter Summary
@@ -367,6 +426,76 @@ def test_all_stages():
             
     print("\n====================================================")
     print("[SUCCESS] SUCCESS: All 5 curriculum stages verified!")
+    print("====================================================")
+
+    # -----------------------------------------------------------------
+    # Stage 6: End-to-End Tracking Verification
+    # -----------------------------------------------------------------
+    print("\n----------------------------------------------------")
+    print("[RUN] Stage 6: End-to-End Tracking Module Verification")
+    print("----------------------------------------------------")
+
+    from all import compute_track_loss
+
+    # Re-run forward at step=1000 (track loss is active: ramp(500,2000,1.0))
+    track_step = 1000
+    with torch.no_grad():
+        feats6 = [f.view(B, T, *f.shape[1:]) for f in model.extract_features(v_seq.flatten(0, 1))]
+    for f in feats6:
+        f.requires_grad = True
+
+    dt6 = torch.full((B, T), 1.0 / 24.0, device=device)
+    preds6 = model.forward_physics(
+        *feats6, dt6, step=track_step,
+        get_loss_weights_fn=get_loss_weights,
+        original_shape=(img_size, img_size)
+    )
+
+    # --- Shape verification ---
+    N = 16
+    assert "track_boxes"   in preds6, "track_boxes missing from preds"
+    assert "track_classes" in preds6, "track_classes missing from preds"
+    assert "track_alive"   in preds6, "track_alive missing from preds"
+    assert "track_masks"   in preds6, "track_masks missing from preds"
+
+    tb = preds6["track_boxes"]
+    tc = preds6["track_classes"]
+    ta = preds6["track_alive"]
+    tm = preds6["track_masks"]
+
+    assert tb.shape == (B, T, N, 4),   f"track_boxes shape mismatch: {tb.shape}"
+    assert tc.shape == (B, T, N, 4585),  f"track_classes shape mismatch: {tc.shape}"
+    assert ta.shape == (B, T, N, 1),   f"track_alive shape mismatch: {ta.shape}"
+    assert tm.shape == (B, T, N, 32),  f"track_masks shape mismatch: {tm.shape}"
+    print(f"  track_boxes:   {list(tb.shape)}  OK")
+    print(f"  track_classes: {list(tc.shape)}  OK")
+    print(f"  track_alive:   {list(ta.shape)}  OK")
+    print(f"  track_masks:   {list(tm.shape)}  OK")
+
+    # --- Value verification ---
+    alive_prob = ta.sigmoid()
+    print(f"  track_alive sigmoid mean (expect <0.5 initially): {alive_prob.mean().item():.4f}")
+    assert alive_prob.mean().item() < 0.5, "Initial alive probability too high (bias init failed?)"
+
+    assert tb.min().item() >= 0.0 and tb.max().item() <= 1.0, \
+        f"track_boxes out of [0,1]: min={tb.min().item():.4f}, max={tb.max().item():.4f}"
+    print(f"  track_boxes range: [{tb.min().item():.4f}, {tb.max().item():.4f}]  (expected [0,1])  OK")
+
+    # --- Loss and gradient verification ---
+    dummy_trainer6 = DummyTrainer(device, track_step)
+    tgts6 = TAOTrainer._extract_target_chunk(dummy_trainer6, gpu_batch, c_start=0, c_end=T, max_t=t_max)
+
+    track_loss_val = compute_track_loss(preds6, tgts6, track_step)
+    assert torch.isfinite(track_loss_val), f"compute_track_loss returned non-finite: {track_loss_val}"
+    print(f"  compute_track_loss: {track_loss_val.item():.4f}  (finite)  OK")
+
+    track_loss_val.backward()
+    grad_norms = [f.grad.norm().item() for f in feats6 if f.grad is not None]
+    assert len(grad_norms) > 0, "No gradients flowed back through tracking loss!"
+    print(f"  Gradient norms through feats: {[f'{g:.4f}' for g in grad_norms]}  OK")
+
+    print("\n====================================================")
+    print("[SUCCESS] SUCCESS: Stage 6 Tracking Verification PASSED!")
     print("====================================================")
 
 if __name__ == "__main__":

@@ -31,7 +31,7 @@ env.bak/
 venv.bak/
 
 # Project specifics
-*.pth
+*.ts
 *.pt
 vis_outputs/
 wandb/
