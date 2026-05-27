@@ -37,3 +37,10 @@ This log tracks architectural changes, critical bug fixes, performance optimizat
   - Reverted `dataset.py` to a clean, production-grade streaming dataloader with zero references to local NPZ files (`movi_e_sample_0000.npz`) or environment-dependent mock flags (`FORCE_MOCK`).
   - Refactored `test_mock.py` to load and parse the local 32MB genuine Kubric sample `"movi_e_sample_0000.npz"` directly, adding support for the dataset's native high-fidelity properties (`depth_m` and `forward_flow_px`).
   - Verified that running `python test_mock.py` completes successfully fully offline, performing exact curriculum physical and tracking loss validations.
+
+### 3. 可视化模块 Grad 运行时异常修复 (Save Visualization RuntimeError Fix)
+- **问题**：在可视化保存阶段，`utils/visualization.py` 在执行第 62 行 `b_np = t_boxes[i].cpu().numpy()` 时触发了 `RuntimeError: Can't call numpy() on Tensor that requires grad. Use tensor.detach().numpy() instead.` 报错，导致训练中断。
+- **根本原因**：`t_boxes` 和 `t_alive` 提取自模型的预测输出 `pred_t`（在反向传播计算图中），这些张量本身带有梯度信息 (`requires_grad=True`)。由于未在 `with torch.no_grad():` 块中处理，且直接在未分离（detach）的情况下调用了 `.cpu().numpy()`，导致 PyTorch 的 Autograd 引擎拦截并报错。
+- **修复方案**：
+  - 在 `utils/visualization.py` 中，对 `pred_t["track_boxes"]` 和 `pred_t["track_alive"]` 分别在切片/变形前调用 `.detach()`，使其从当前计算图中断开，从而彻底解决 numpy 转换时的 autograd 报错问题。
+  - 通过运行本地测试脚本 `python test_mock.py` 进行了全阶段多课程训练和跟踪组件的高保真仿真闭环测试，确认 5 阶段可视化结果保存顺利（成功保存至 `vis_outputs/vis_step_05000.jpg`），Stage 6 跟踪网络验证全部通过，无任何异常。
