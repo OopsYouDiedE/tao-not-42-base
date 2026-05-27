@@ -47,18 +47,22 @@ class AsyncDataBuffer:
         if tfds is None or tf is None:
             while True:
                 item = {
-                    "video": torch.randint(0, 256, (12, 256, 256, 3), dtype=torch.uint8),
-                    "segmentation": torch.randint(0, 3, (12, 256, 256), dtype=torch.int32),
-                    "depth": torch.rand(12, 256, 256, dtype=torch.float32) * 15.0 + 3.0,
-                    "forward_flow": torch.zeros(12, 256, 256, 2, dtype=torch.float32),
-                    "cam_pos": torch.zeros(12, 3, dtype=torch.float32),
-                    "cam_quat": torch.tensor([1., 0., 0., 0.], dtype=torch.float32).expand(12, 4).clone(),
-                    "is_dynamic": torch.zeros(5, dtype=torch.bool)
+                    "video": torch.randint(0, 256, (12, 256, 256, 3), dtype=torch.uint8).pin_memory(),
+                    "segmentation": torch.randint(0, 3, (12, 256, 256), dtype=torch.int32).pin_memory(),
+                    "depth": (torch.rand(12, 256, 256, dtype=torch.float32) * 15.0 + 3.0).pin_memory(),
+                    "forward_flow": torch.zeros(12, 256, 256, 2, dtype=torch.float32).pin_memory(),
+                    "cam_pos": torch.zeros(12, 3, dtype=torch.float32).pin_memory(),
+                    "cam_quat": torch.tensor([1., 0., 0., 0.], dtype=torch.float32).expand(12, 4).clone().pin_memory(),
+                    "is_dynamic": torch.zeros(5, dtype=torch.bool).pin_memory(),
+                    "depth_range": torch.tensor([0.0, 100.0], dtype=torch.float32).pin_memory(),
+                    "forward_flow_range": torch.tensor([0.0, 10.0], dtype=torch.float32).pin_memory(),
+                    "camera_focal_length": torch.tensor(0.7, dtype=torch.float32).pin_memory(),
+                    "camera_sensor_width": torch.tensor(36.0, dtype=torch.float32).pin_memory()
                 }
                 with self.lock:
                     self.buffer.append(item)
                     self.has_data.notify_all()
-                time.sleep(0.5)
+                time.sleep(0.01)
             return
 
         ds = tfds.load("movi_e", data_dir="gs://kubric-public/tfds", split=self.split,

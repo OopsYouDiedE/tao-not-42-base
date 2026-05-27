@@ -256,8 +256,7 @@ class TAOTrainer:
 
             total_loss_tensor = total_loss_tensor + loss.detach()
             for k in loss_acc:
-                if k in l_dict:
-                    loss_acc[k] += l_dict[k] * T_chunk
+                loss_acc[k] += l_dict.get(k, 0.0) * T_chunk
 
             if (self.global_step + 1) % self.args.vis_interval == 0:
                 def slice_second_frame(v):

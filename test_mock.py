@@ -31,6 +31,7 @@ sys.modules["scipy.optimize"] = scipy_opt_mock
 import models.custom_heads
 models.custom_heads.Mamba = MockMamba
 
+import train
 from models import TAONot42VisionModel
 from utils import get_loss_weights, compute_physics_loss, save_visualization, compute_track_loss
 from dataset import process_batch_on_gpu
@@ -147,12 +148,17 @@ def generate_synthetic_physical_video(B=1, T=12, H=256, W=256):
             
     return video, depth, seg, flow
 
-def get_movi_e_or_fallback(npz_path="movi_e_sample.npz", B=1, T=12, H=256, W=256):
+def get_movi_e_or_fallback(npz_path="movi_e_sample_0000.npz", B=1, T=12, H=256, W=256):
     """
     Dynamically loads a genuine Kubric MOVi-E dataset sample exported from Colab,
     extracting all 7 physical elements: video, depth, segmentation, flow, camera positions,
     camera quaternions, and is_dynamic parameters.
     """
+    if not os.path.exists(npz_path) and npz_path == "movi_e_sample_0000.npz" and os.path.exists("movi_e_sample.npz"):
+        npz_path = "movi_e_sample.npz"
+    elif not os.path.exists(npz_path) and npz_path == "movi_e_sample.npz" and os.path.exists("movi_e_sample_0000.npz"):
+        npz_path = "movi_e_sample_0000.npz"
+
     if os.path.exists(npz_path):
         print(f"====================================================")
         print(f"[INFO] Genuine MOVi-E Dataset sample detected: '{npz_path}'!")
@@ -160,9 +166,9 @@ def get_movi_e_or_fallback(npz_path="movi_e_sample.npz", B=1, T=12, H=256, W=256
         try:
             data = np.load(npz_path, allow_pickle=True)
             v_np = data["video"]                  # Expected: [T, H, W, 3] or [B, T, H, W, 3]
-            d_np = data["depth"]                  # Expected: [T, H, W] or [B, T, H, W]
+            d_np = data["depth_m"] if "depth_m" in data else data["depth"]
             s_np = data["segmentation"]           # Expected: [T, H, W] or [B, T, H, W]
-            f_np = data["forward_flow"].astype(np.float32)           # Expected: [T, H, W, 2] or [B, T, H, W, 2]
+            f_np = data["forward_flow_px"].astype(np.float32) if "forward_flow_px" in data else data["forward_flow"].astype(np.float32)
             cp_np = data.get("cam_pos")           # Expected: [T, 3] or [B, T, 3]
             cq_np = data.get("cam_quat")          # Expected: [T, 4] or [B, T, 4]
             id_np = data.get("is_dynamic")        # Expected: [NumInstances] or List of them
@@ -315,7 +321,7 @@ def test_all_stages():
     
     # 2. Get real MOVi-E genuine sample or fallback
     B, T, img_size = 1, 12, 256
-    v_np, d_np, s_np, f_np, cp_np, cq_np, id_np = get_movi_e_or_fallback("movi_e_sample.npz", B, T, img_size, img_size)
+    v_np, d_np, s_np, f_np, cp_np, cq_np, id_np = get_movi_e_or_fallback("movi_e_sample_0000.npz", B, T, img_size, img_size)
     
     # Prepare batch dictionary matching the dataset output format
     batch = {
