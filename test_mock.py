@@ -264,7 +264,12 @@ def get_movi_e_or_fallback(npz_path="movi_e_sample_0000.npz", B=1, T=12, H=256, 
             cq_np = np.zeros((B, T, 4), dtype=np.float32)
             cq_np[..., 0] = 1.0
             id_np = [np.array([True], dtype=bool) for _ in range(B)]
-            return v_np, d_np, s_np, f_np, cp_np, cq_np, id_np
+            cat_np = [np.array([0], dtype=np.int32) for _ in range(B)]
+            vel_np = [np.zeros((1, T, 3), dtype=np.float32) for _ in range(B)]
+            avel_np = [np.zeros((1, T, 3), dtype=np.float32) for _ in range(B)]
+            vis_np = [np.ones((1, T), dtype=np.float32) for _ in range(B)]
+            col_np = [np.zeros((0, 2), dtype=np.int32) for _ in range(B)]
+            return v_np, d_np, s_np, f_np, cp_np, cq_np, id_np, cat_np, vel_np, avel_np, vis_np, col_np
             
     try:
         cap = cv2.VideoCapture(video_path)
@@ -305,8 +310,13 @@ def get_movi_e_or_fallback(npz_path="movi_e_sample_0000.npz", B=1, T=12, H=256, 
         cq_np = np.zeros((B, T, 4), dtype=np.float32)
         cq_np[..., 0] = 1.0
         id_np = [np.array([True], dtype=bool) for _ in range(B)]
+        cat_np = [np.array([0], dtype=np.int32) for _ in range(B)]
+        vel_np = [np.zeros((1, T, 3), dtype=np.float32) for _ in range(B)]
+        avel_np = [np.zeros((1, T, 3), dtype=np.float32) for _ in range(B)]
+        vis_np = [np.ones((1, T), dtype=np.float32) for _ in range(B)]
+        col_np = [np.zeros((0, 2), dtype=np.int32) for _ in range(B)]
         
-        return video_np, depth, seg, flow, cp_np, cq_np, id_np
+        return video_np, depth, seg, flow, cp_np, cq_np, id_np, cat_np, vel_np, avel_np, vis_np, col_np
     except Exception as e:
         print(f"Error reading backup video: {e}")
         print("Falling back to high-fidelity local 3D physical simulator...")
@@ -355,7 +365,6 @@ def test_all_stages():
         "velocities": [torch.from_numpy(x) for x in vel_np],
         "angular_velocities": [torch.from_numpy(x) for x in avel_np],
         "visibility": [torch.from_numpy(x) for x in vis_np],
-        "collisions": [torch.from_numpy(x) for x in col_np]
     }
     
     # Run GPU preprocessing pipeline

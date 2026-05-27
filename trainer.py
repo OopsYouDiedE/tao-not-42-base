@@ -25,6 +25,7 @@ class TAOTrainer:
         self.model = model.to(self.device)
         self.buffer = buffer
         self.prefetcher = prefetcher
+        self.wandb = wandb if (wandb is not None and getattr(wandb, "run", None) is not None) else None
 
         if self.args.yolo_weights:
             self._load_yolo_weights()
@@ -305,19 +306,19 @@ class TAOTrainer:
                     self.global_step + 1,
                     slice_second_frame(w_img) if w_img is not None else None
                 )
-                if wandb and fp:
-                    wandb.log({"Vis": wandb.Image(fp)}, step=self.global_step)
+                if self.wandb and fp:
+                    self.wandb.log({"Vis": self.wandb.Image(fp)}, step=self.global_step)
 
             self.global_step += 1
             if self.global_step % 10 == 0:
                 print(f"[{time.time()-self.start_time:.1f}s] S{self.global_step} | Tot:{loss.item():.4f} | " + " ".join(
                     [f"{k}:{loss_acc[k]/total_frames:.2f}" for k in ["Obj", "Box", "Mask", "Depth", "Ego", "Flow", "Anom", "Attr", "Track", "FlowEPEpx", "DepthAbsRel"]]))
-                if wandb:
+                if self.wandb:
                     log_dict = {
                         f"Loss/{k}": loss_acc[k]/total_frames for k in loss_acc}
                     log_dict.update(
                         {"Loss/Total": loss.item(), "Step": self.global_step})
-                    wandb.log(log_dict, step=self.global_step)
+                    self.wandb.log(log_dict, step=self.global_step)
 
         return total_loss_tensor
 

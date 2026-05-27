@@ -2,6 +2,7 @@ import time
 import queue
 import random
 import threading
+import atexit
 from collections import deque
 
 import numpy as np
@@ -27,6 +28,40 @@ def decode_uint16_range(encoded, value_range):
     minv, maxv = np.asarray(value_range, dtype=np.float32)
     return encoded / 65535.0 * (maxv - minv) + minv
 
+
+def maybe_pin_memory(tensor):
+    """Pin tensors only when CUDA is available.
+
+    PyTorch raises on CPU-only builds/environments when calling pin_memory().
+    Keeping this helper here lets the same code run in Colab GPU training and
+    in local/CI smoke tests without changing the data pipeline logic.
+    """
+    if isinstance(tensor, torch.Tensor) and torch.cuda.is_available():
+        try:
+            return tensor.pin_memory()
+        except RuntimeError:
+            return tensor
+    return tensor
+
+
+def numpy_to_pinned_tensor(value):
+    """Convert numpy/scalar values to tensors and pin them when useful.
+
+    TFDS nested features such as events/collisions can arrive as dicts rather
+    than arrays.  Those are intentionally not converted here because they are
+    not consumed by the current training targets and trying to torch.from_numpy
+    a dict was the crash reported from Colab.
+    """
+    if value is None or isinstance(value, dict):
+        return None
+    if isinstance(value, torch.Tensor):
+        return maybe_pin_memory(value)
+    if isinstance(value, np.ndarray):
+        return maybe_pin_memory(torch.from_numpy(value))
+    if np.isscalar(value):
+        return maybe_pin_memory(torch.as_tensor(value))
+    return None
+
 # =====================================================================
 
 # 5. 数据流加载 (Data Loader & Pipeline)
@@ -34,37 +69,63 @@ def decode_uint16_range(encoded, value_range):
 
 
 class AsyncDataBuffer:
-    def __init__(self, split="train", max_buffer_size=64, batch_size=16):
+    def __init__(self, split="train", max_buffer_size=64, batch_size=16, wait_timeout_sec=180):
         self.split = split
         self.max_buffer_size = max_buffer_size
         self.batch_size = batch_size
+        self.wait_timeout_sec = wait_timeout_sec
         self.buffer = deque(maxlen=max_buffer_size)
         self.lock = threading.Lock()
         self.has_data = threading.Condition(self.lock)
-        threading.Thread(target=self._fetch_loop, daemon=True).start()
+        self.error = None
+        self.num_fetched = 0
+        self._last_wait_log = 0.0
+        self.stop_event = threading.Event()
+        self.thread = threading.Thread(target=self._fetch_loop, daemon=True)
+        self.thread.start()
+        atexit.register(self.stop)
+
+    def stop(self):
+        self.stop_event.set()
+        with self.lock:
+            self.has_data.notify_all()
+        thread = getattr(self, "thread", None)
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=1.0)
 
     def _fetch_loop(self):
+        try:
+            self._fetch_loop_impl()
+        except Exception as e:
+            with self.lock:
+                self.error = e
+                self.has_data.notify_all()
+            print(f"[DataBuffer] fetch thread failed: {type(e).__name__}: {e}", flush=True)
+
+    def _fetch_loop_impl(self):
         if tfds is None or tf is None:
-            while True:
+            while not self.stop_event.is_set():
                 item = {
-                    "video": torch.randint(0, 256, (12, 256, 256, 3), dtype=torch.uint8).pin_memory(),
-                    "segmentation": torch.randint(0, 3, (12, 256, 256), dtype=torch.int32).pin_memory(),
-                    "depth": (torch.rand(12, 256, 256, dtype=torch.float32) * 15.0 + 3.0).pin_memory(),
-                    "forward_flow": torch.zeros(12, 256, 256, 2, dtype=torch.float32).pin_memory(),
-                    "cam_pos": torch.zeros(12, 3, dtype=torch.float32).pin_memory(),
-                    "cam_quat": torch.tensor([1., 0., 0., 0.], dtype=torch.float32).expand(12, 4).clone().pin_memory(),
-                    "is_dynamic": torch.zeros(5, dtype=torch.bool).pin_memory(),
-                    "depth_range": torch.tensor([0.0, 100.0], dtype=torch.float32).pin_memory(),
-                    "forward_flow_range": torch.tensor([0.0, 10.0], dtype=torch.float32).pin_memory(),
-                    "camera_focal_length": torch.tensor(0.7, dtype=torch.float32).pin_memory(),
-                    "camera_sensor_width": torch.tensor(36.0, dtype=torch.float32).pin_memory()
+                    "video": maybe_pin_memory(torch.randint(0, 256, (12, 256, 256, 3), dtype=torch.uint8)),
+                    "segmentation": maybe_pin_memory(torch.randint(0, 3, (12, 256, 256), dtype=torch.int32)),
+                    "depth": maybe_pin_memory(torch.rand(12, 256, 256, dtype=torch.float32) * 15.0 + 3.0),
+                    "forward_flow": maybe_pin_memory(torch.zeros(12, 256, 256, 2, dtype=torch.float32)),
+                    "cam_pos": maybe_pin_memory(torch.zeros(12, 3, dtype=torch.float32)),
+                    "cam_quat": maybe_pin_memory(torch.tensor([1., 0., 0., 0.], dtype=torch.float32).expand(12, 4).clone()),
+                    "is_dynamic": maybe_pin_memory(torch.zeros(5, dtype=torch.bool)),
+                    "depth_range": maybe_pin_memory(torch.tensor([0.0, 100.0], dtype=torch.float32)),
+                    "forward_flow_range": maybe_pin_memory(torch.tensor([0.0, 10.0], dtype=torch.float32)),
+                    "camera_focal_length": maybe_pin_memory(torch.tensor(0.7, dtype=torch.float32)),
+                    "camera_sensor_width": maybe_pin_memory(torch.tensor(36.0, dtype=torch.float32))
                 }
                 with self.lock:
                     self.buffer.append(item)
+                    self.num_fetched += 1
                     self.has_data.notify_all()
                 time.sleep(0.01)
             return
 
+        print(f"[DataBuffer] Loading TFDS movi_e split='{self.split}' from gs://kubric-public/tfds ...", flush=True)
         ds = tfds.load("movi_e", data_dir="gs://kubric-public/tfds", split=self.split,
                        read_config=tfds.ReadConfig(interleave_cycle_length=16)).repeat()
 
@@ -83,52 +144,67 @@ class AsyncDataBuffer:
                 **({"velocities": insts["velocities"]} if "velocities" in insts else {}),
                 **({"angular_velocities": insts["angular_velocities"]} if "angular_velocities" in insts else {}),
                 **({"visibility": insts["visibility"]} if "visibility" in insts else {}),
-                **({"collisions": x["events"]["collisions"]} if "events" in x and "collisions" in x["events"] else {})
+                # Do not materialize events/collisions in the hot training path.
+                # TFDS returns this feature as a nested dict, not an ndarray, and
+                # it is not consumed by the current loss.  Loading it here caused
+                # the prefetch thread to crash before training began.
             }
 
         ds = ds.map(map_fn, num_parallel_calls=tf.data.AUTOTUNE).prefetch(
             tf.data.AUTOTUNE)
+        print("[DataBuffer] TFDS pipeline ready; filling async buffer ...", flush=True)
 
         for item in tfds.as_numpy(ds):
-            p_item = {k: torch.from_numpy(item[k_i]).pin_memory() for k, k_i in [
+            if self.stop_event.is_set():
+                break
+            p_item = {k: numpy_to_pinned_tensor(item[k_i]) for k, k_i in [
                 ("video", "video"), ("cam_pos", "cam_pos"), ("cam_quat", "cam_quat")]}
-            p_item["segmentation"] = torch.from_numpy(
-                item["segmentations"][..., 0]).pin_memory()
-            p_item["depth"] = torch.from_numpy(
-                item["depth"][..., 0]).pin_memory()
-            p_item["depth_range"] = torch.from_numpy(
-                item["depth_range"]).pin_memory()
-            p_item["forward_flow_range"] = torch.from_numpy(
-                item["forward_flow_range"]).pin_memory()
-            p_item["camera_focal_length"] = torch.as_tensor(
-                item["camera_focal_length"]).pin_memory()
-            p_item["camera_sensor_width"] = torch.as_tensor(
-                item["camera_sensor_width"]).pin_memory()
+            p_item["segmentation"] = numpy_to_pinned_tensor(item["segmentations"][..., 0])
+            p_item["depth"] = numpy_to_pinned_tensor(item["depth"][..., 0])
+            p_item["depth_range"] = numpy_to_pinned_tensor(item["depth_range"])
+            p_item["forward_flow_range"] = numpy_to_pinned_tensor(item["forward_flow_range"])
+            p_item["camera_focal_length"] = numpy_to_pinned_tensor(item["camera_focal_length"])
+            p_item["camera_sensor_width"] = numpy_to_pinned_tensor(item["camera_sensor_width"])
 
             if "is_dynamic" in item:
-                p_item["is_dynamic"] = torch.from_numpy(item["is_dynamic"]).pin_memory()
+                p_item["is_dynamic"] = numpy_to_pinned_tensor(item["is_dynamic"])
             if "category" in item:
-                p_item["category"] = torch.from_numpy(item["category"]).pin_memory()
+                p_item["category"] = numpy_to_pinned_tensor(item["category"])
             if "velocities" in item:
-                p_item["velocities"] = torch.from_numpy(item["velocities"]).pin_memory()
+                p_item["velocities"] = numpy_to_pinned_tensor(item["velocities"])
             if "angular_velocities" in item:
-                p_item["angular_velocities"] = torch.from_numpy(item["angular_velocities"]).pin_memory()
+                p_item["angular_velocities"] = numpy_to_pinned_tensor(item["angular_velocities"])
             if "visibility" in item:
-                p_item["visibility"] = torch.from_numpy(item["visibility"]).pin_memory()
-            if "collisions" in item:
-                p_item["collisions"] = torch.from_numpy(item["collisions"]).pin_memory()
+                p_item["visibility"] = numpy_to_pinned_tensor(item["visibility"])
 
-            p_item["forward_flow"] = torch.from_numpy(
-                item["forward_flow"]).pin_memory()
+            p_item["forward_flow"] = numpy_to_pinned_tensor(item["forward_flow"])
 
             with self.lock:
                 self.buffer.append(p_item)
+                self.num_fetched += 1
+                if self.num_fetched == 1 or self.num_fetched % 16 == 0:
+                    print(f"[DataBuffer] buffered {min(len(self.buffer), self.max_buffer_size)}/{self.batch_size} samples; total fetched={self.num_fetched}", flush=True)
                 self.has_data.notify_all()
 
     def get_batch(self):
+        start_wait = time.time()
         with self.lock:
             while len(self.buffer) < self.batch_size:
-                self.has_data.wait(timeout=5.0)
+                if self.error is not None:
+                    raise RuntimeError("AsyncDataBuffer fetch thread failed") from self.error
+
+                now = time.time()
+                if now - self._last_wait_log >= 10.0:
+                    print(f"[DataBuffer] waiting for samples: {len(self.buffer)}/{self.batch_size}", flush=True)
+                    self._last_wait_log = now
+
+                if now - start_wait > self.wait_timeout_sec:
+                    raise TimeoutError(
+                        f"Timed out waiting for data buffer after {self.wait_timeout_sec}s "
+                        f"({len(self.buffer)}/{self.batch_size} samples ready)."
+                    )
+
+                self.has_data.wait(timeout=2.0)
                 if len(self.buffer) == 0 and not IN_COLAB:
                     return None
             batch = random.sample(self.buffer, self.batch_size)
@@ -136,7 +212,7 @@ class AsyncDataBuffer:
         keys = [
             "video", "segmentation", "depth", "forward_flow", "cam_pos",
             "cam_quat", "is_dynamic", "category", "velocities", "angular_velocities",
-            "visibility", "collisions", "depth_range", "forward_flow_range",
+            "visibility", "depth_range", "forward_flow_range",
             "camera_focal_length", "camera_sensor_width",
         ]
         return {k: [i.get(k) for i in batch] for k in keys}
@@ -274,34 +350,36 @@ def process_batch_on_gpu(batch, device, target_size=256):
     initial_dynamic_valid_dense = []
     current_moving_dense = []
     current_moving_valid_dense = []
-    MAX_INSTANCES = 24
+    MAX_INSTANCES = 32
 
     # 1. 准备展平的一维网格坐标
     y_coords = torch.arange(target_size, dtype=torch.float32, device=device).view(target_size, 1).expand(target_size, target_size).flatten().view(1, 1, -1).expand(B, T, -1)
     x_coords = torch.arange(target_size, dtype=torch.float32, device=device).view(1, target_size).expand(target_size, target_size).flatten().view(1, 1, -1).expand(B, T, -1)
-    flat_seg = seg.view(B, T, -1)
+    flat_seg = seg.view(B, T, -1).long()
+    valid_seg_for_scatter = (flat_seg >= 0) & (flat_seg <= MAX_INSTANCES)
+    scatter_seg = torch.where(valid_seg_for_scatter, flat_seg, torch.zeros_like(flat_seg))
 
     # 2. 利用 scatter_reduce_ 直接求出边界坐标
     ymin_target = torch.full((B, T, MAX_INSTANCES + 1), float(target_size), dtype=torch.float32, device=device)
-    ymin_target.scatter_reduce_(dim=2, index=flat_seg.long(), src=y_coords, reduce="amin", include_self=False)
+    ymin_target.scatter_reduce_(dim=2, index=scatter_seg, src=y_coords, reduce="amin", include_self=False)
     ymin = ymin_target[:, :, 1:].permute(2, 0, 1)
 
     ymax_target = torch.full((B, T, MAX_INSTANCES + 1), -1.0, dtype=torch.float32, device=device)
-    ymax_target.scatter_reduce_(dim=2, index=flat_seg.long(), src=y_coords, reduce="amax", include_self=False)
+    ymax_target.scatter_reduce_(dim=2, index=scatter_seg, src=y_coords, reduce="amax", include_self=False)
     ymax = ymax_target[:, :, 1:].permute(2, 0, 1)
 
     xmin_target = torch.full((B, T, MAX_INSTANCES + 1), float(target_size), dtype=torch.float32, device=device)
-    xmin_target.scatter_reduce_(dim=2, index=flat_seg.long(), src=x_coords, reduce="amin", include_self=False)
+    xmin_target.scatter_reduce_(dim=2, index=scatter_seg, src=x_coords, reduce="amin", include_self=False)
     xmin = xmin_target[:, :, 1:].permute(2, 0, 1)
 
     xmax_target = torch.full((B, T, MAX_INSTANCES + 1), -1.0, dtype=torch.float32, device=device)
-    xmax_target.scatter_reduce_(dim=2, index=flat_seg.long(), src=x_coords, reduce="amax", include_self=False)
+    xmax_target.scatter_reduce_(dim=2, index=scatter_seg, src=x_coords, reduce="amax", include_self=False)
     xmax = xmax_target[:, :, 1:].permute(2, 0, 1)
 
     # 3. 利用 scatter_add_ 直接统计实例真实面积
     true_area_target = torch.zeros((B, T, MAX_INSTANCES + 1), dtype=torch.int32, device=device)
-    ones = torch.ones_like(flat_seg, dtype=torch.int32)
-    true_area_target.scatter_add_(dim=2, index=flat_seg.long(), src=ones)
+    ones = torch.where(valid_seg_for_scatter, torch.ones_like(flat_seg, dtype=torch.int32), torch.zeros_like(flat_seg, dtype=torch.int32))
+    true_area_target.scatter_add_(dim=2, index=scatter_seg, src=ones)
     true_area = true_area_target[:, :, 1:].permute(2, 0, 1)
 
     valid_bt = (true_area > 0)
@@ -461,17 +539,29 @@ def process_batch_on_gpu(batch, device, target_size=256):
     }
 
 class CUDAPrefetcher:
-    def __init__(self, buffer, device, target_size=256):
+    def __init__(self, buffer, device, target_size=256, wait_timeout_sec=180):
         self.buffer = buffer
         self.device = device
         self.target_size = target_size
+        self.wait_timeout_sec = wait_timeout_sec
         self.queue = queue.Queue(maxsize=4)
+        self.error = None
+        self._last_wait_log = 0.0
+        self.stop_event = threading.Event()
         self.stream = torch.cuda.Stream(
             device=device) if device.type == "cuda" else None
-        threading.Thread(target=self._worker, daemon=True).start()
+        self.thread = threading.Thread(target=self._worker, daemon=True)
+        self.thread.start()
+        atexit.register(self.stop)
+
+    def stop(self):
+        self.stop_event.set()
+        thread = getattr(self, "thread", None)
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=1.0)
 
     def _worker(self):
-        while True:
+        while not self.stop_event.is_set():
             batch = self.buffer.get_batch()
             if batch is None:
                 time.sleep(1)
@@ -484,13 +574,42 @@ class CUDAPrefetcher:
                 else:
                     batch_gpu = process_batch_on_gpu(
                         batch, self.device, self.target_size)
-                self.queue.put(batch_gpu)
+                while not self.stop_event.is_set():
+                    try:
+                        self.queue.put(batch_gpu, timeout=1.0)
+                        break
+                    except queue.Full:
+                        continue
             except Exception as e:
-                print(f"Prefetcher err: {e}")
-                time.sleep(1)
+                self.error = e
+                try:
+                    self.queue.put_nowait(e)
+                except queue.Full:
+                    pass
+                print(f"[Prefetcher] worker failed: {type(e).__name__}: {e}", flush=True)
+                return
 
     def next(self):
-        batch = self.queue.get()
+        start_wait = time.time()
+        while True:
+            if self.error is not None and self.queue.empty():
+                raise RuntimeError("CUDAPrefetcher worker failed") from self.error
+            try:
+                batch = self.queue.get(timeout=2.0)
+                break
+            except queue.Empty:
+                now = time.time()
+                if now - self._last_wait_log >= 10.0:
+                    print("[Prefetcher] waiting for a processed GPU batch ...", flush=True)
+                    self._last_wait_log = now
+                if now - start_wait > self.wait_timeout_sec:
+                    raise TimeoutError(
+                        f"Timed out waiting for a processed batch after {self.wait_timeout_sec}s."
+                    )
+
+        if isinstance(batch, Exception):
+            raise RuntimeError("CUDAPrefetcher worker failed") from batch
+
         if self.stream:
             torch.cuda.current_stream().wait_stream(self.stream)
 
