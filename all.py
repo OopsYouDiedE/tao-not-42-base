@@ -89,6 +89,21 @@ def save_visualization(video_t, target_t, pred_t, step, warped_img=None, output_
             b_np = b.cpu().numpy() * [W, H, W, H]
             cv2.rectangle(pred_canvas, (int(b_np[0]), int(
                 b_np[1])), (int(b_np[2]), int(b_np[3])), color, 2)
+                
+    if "track_boxes" in pred_t and "track_alive" in pred_t:
+        t_boxes = pred_t["track_boxes"].view(-1, 16, 4)[0] if pred_t["track_boxes"].dim() >= 3 else None
+        t_alive = pred_t["track_alive"].view(-1, 16, 1)[0].sigmoid() if pred_t["track_alive"].dim() >= 3 else None
+        
+        if t_boxes is not None and t_alive is not None:
+            for i in range(16):
+                if t_alive[i, 0] > 0.5:
+                    b_np = t_boxes[i].cpu().numpy()
+                    cx, cy, bw, bh = b_np
+                    x1, y1 = (cx - bw/2) * W, (cy - bh/2) * H
+                    x2, y2 = (cx + bw/2) * W, (cy + bh/2) * H
+                    cv2.rectangle(pred_canvas, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 0), 3)
+                    cv2.putText(pred_canvas, f"ID:{i}", (int(x1), max(10, int(y1)-5)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+                    
     add_title(pred_canvas, "Prediction")
 
     # --- Ground Truth ---
@@ -424,7 +439,7 @@ class SpatioTemporalMambaBlock(nn.Module):
             torch.linspace(-5, 3, num_frequencies)))
         self.time_mlp = nn.Sequential(
             nn.Linear(num_frequencies * 2, 64), nn.SiLU(), nn.Linear(64, channels))
-        self.gamma = nn.Parameter(torch.zeros(1))
+        self.gamma = nn.Parameter(torch.tensor([0.1]))
 
     def forward(self, x, t):
         B, T, C, H, W = x.shape
@@ -1628,9 +1643,12 @@ def compute_physics_loss(preds, targets, img_t=None, img_next=None, mode="superv
     tot += w.get("smooth", 0.05) * loss_smooth + w.get("gate",
                                                        0.05) * loss_gate + w.get("track", 0) * loss_track
 
-    ret_dict = {k: v.detach() for k, v in loss_components.items()}
-    ret_dict.update({"Gate": loss_gate.detach(),
-                    "Track": loss_track.detach(), "Tot": tot.detach()})
+    ret_dict = {k: v.detach() for k, v in loss_components.items() if w.get(k.lower(), 0) > 0}
+    if w.get("gate", 0) > 0:
+        ret_dict["Gate"] = loss_gate.detach()
+    if w.get("track", 0) > 0:
+        ret_dict["Track"] = loss_track.detach()
+    ret_dict["Tot"] = tot.detach()
 
     return tot, ret_dict, warped_img
 

@@ -27,12 +27,14 @@ scipy_mock.optimize = scipy_opt_mock
 sys.modules["scipy"] = scipy_mock
 sys.modules["scipy.optimize"] = scipy_opt_mock
 
-# 3. Import all.py and perform dynamic monkey patching injection of Mamba before any block initializes
-import all
-all.Mamba = MockMamba
+# 3. Import modules and perform dynamic monkey patching injection of Mamba before any block initializes
+import models.custom_heads
+models.custom_heads.Mamba = MockMamba
 
-# Import other components safely now
-from all import TAONot42VisionModel, get_loss_weights, compute_physics_loss, save_visualization, process_batch_on_gpu, TAOTrainer
+from models import TAONot42VisionModel
+from utils import get_loss_weights, compute_physics_loss, save_visualization, compute_track_loss
+from dataset import process_batch_on_gpu
+from trainer import TAOTrainer
 
 def load_yoloe_weights(model, path="yoloe-26s-seg-pf.pt"):
     import torch
