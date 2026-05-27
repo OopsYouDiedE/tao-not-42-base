@@ -53,11 +53,15 @@ def save_visualization(video_t, target_t, pred_t, step, warped_img=None, output_
                 b_np[1])), (int(b_np[2]), int(b_np[3])), color, 2)
                 
     if "track_boxes" in pred_t and "track_alive" in pred_t:
-        t_boxes = pred_t["track_boxes"].detach().view(-1, 16, 4)[0] if pred_t["track_boxes"].dim() >= 3 else None
-        t_alive = pred_t["track_alive"].detach().view(-1, 16, 1)[0].sigmoid() if pred_t["track_alive"].dim() >= 3 else None
-        
-        if t_boxes is not None and t_alive is not None:
-            for i in range(16):
+        tb = pred_t["track_boxes"].detach()
+        ta = pred_t["track_alive"].detach()
+
+        if tb.dim() >= 3:
+            Q = tb.shape[-2]
+            t_boxes = tb.reshape(-1, Q, 4)[0]
+            t_alive = ta.reshape(-1, Q, 1)[0].sigmoid()
+
+            for i in range(Q):
                 if t_alive[i, 0] > 0.5:
                     b_np = t_boxes[i].cpu().numpy()
                     cx, cy, bw, bh = b_np

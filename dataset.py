@@ -88,8 +88,8 @@ class AsyncDataBuffer:
                 ("video", "video"), ("cam_pos", "cam_pos"), ("cam_quat", "cam_quat")]}
             p_item["segmentation"] = torch.from_numpy(
                 item["segmentations"][..., 0]).pin_memory()
-            p_item["depth"] = torch.from_numpy(decode_uint16_range(
-                item["depth"][..., 0], item["depth_range"])).pin_memory()
+            p_item["depth"] = torch.from_numpy(
+                item["depth"][..., 0]).pin_memory()
             p_item["depth_range"] = torch.from_numpy(
                 item["depth_range"]).pin_memory()
             p_item["forward_flow_range"] = torch.from_numpy(
@@ -103,9 +103,8 @@ class AsyncDataBuffer:
                 p_item["is_dynamic"] = torch.from_numpy(
                     item["is_dynamic"]).pin_memory()
 
-            f_np = decode_uint16_range(
-                item["forward_flow"], item["forward_flow_range"])
-            p_item["forward_flow"] = torch.from_numpy(f_np).pin_memory()
+            p_item["forward_flow"] = torch.from_numpy(
+                item["forward_flow"]).pin_memory()
 
             with self.lock:
                 self.buffer.append(p_item)
@@ -138,12 +137,28 @@ def process_batch_on_gpu(batch, device, target_size=256):
         return stacked_gpu.to(dtype) if dtype else stacked_gpu
 
     video = to_gpu("video")
-    depth_raw = to_gpu("depth", torch.float32)
+    depth_raw = to_gpu("depth")
     seg_raw = to_gpu("segmentation")
-    flow_raw = to_gpu("forward_flow", torch.float32)
+    flow_raw = to_gpu("forward_flow")
     cam_pos = to_gpu("cam_pos")
     cam_quat = to_gpu("cam_quat")
     B, T = video.shape[:2]
+
+    if depth_raw.dtype == torch.uint16 or depth_raw.dtype == torch.int16:
+        depth_range = to_gpu("depth_range")
+        min_v = depth_range[:, 0].view(B, 1, 1, 1)
+        max_v = depth_range[:, 1].view(B, 1, 1, 1)
+        depth_raw = depth_raw.float() / 65535.0 * (max_v - min_v) + min_v
+    else:
+        depth_raw = depth_raw.float()
+
+    if flow_raw.dtype == torch.uint16 or flow_raw.dtype == torch.int16:
+        flow_range = to_gpu("forward_flow_range")
+        min_f = flow_range[:, 0].view(B, 1, 1, 1, 1)
+        max_f = flow_range[:, 1].view(B, 1, 1, 1, 1)
+        flow_raw = flow_raw.float() / 65535.0 * (max_f - min_f) + min_f
+    else:
+        flow_raw = flow_raw.float()
 
     is_dyn_out = None
     if batch.get("is_dynamic") and batch["is_dynamic"][0] is not None:
@@ -170,41 +185,79 @@ def process_batch_on_gpu(batch, device, target_size=256):
         seg = seg_raw.long()
         sky_mask = (depth_raw == 0)
 
+    # MOVi forward_flow[..., 0] = delta_row = dy
+    # MOVi forward_flow[..., 1] = delta_column = dx
+    # 模型内部统一使用 flow_xy[..., 0] = dx, flow_xy[..., 1] = dy
+    src_h, src_w = flow_raw.shape[2], flow_raw.shape[3]
+
+    flow_xy = flow_raw[..., [1, 0]].contiguous()
+
+    # 如果以后训练分辨率不是原始分辨率，光流像素位移也要同步缩放
+    if src_w != target_size:
+        flow_xy[..., 0] = flow_xy[..., 0] * (float(target_size) / float(src_w))
+    if src_h != target_size:
+        flow_xy[..., 1] = flow_xy[..., 1] * (float(target_size) / float(src_h))
+
     flow_norm = torch.clamp(
-        flow_raw * 2.0 / target_size, -1.5, 1.5).permute(0, 1, 4, 2, 3)
+        flow_xy * 2.0 / float(target_size), -1.5, 1.5
+    ).permute(0, 1, 4, 2, 3)
+
     if flow_norm.shape[-1] != target_size:
-        flow_norm = F.interpolate(flow_norm.flatten(0, 1), size=(
-            target_size, target_size), mode="bilinear", align_corners=False).view(B, T, 2, target_size, target_size)
+        flow_norm = F.interpolate(
+            flow_norm.flatten(0, 1),
+            size=(target_size, target_size),
+            mode="bilinear",
+            align_corners=False,
+        ).view(B, T, 2, target_size, target_size)
 
     bboxes_dense, obj_dense, cls_dense = [], [], []
+    initial_dynamic_dense = []
     MAX_INSTANCES = 24
-    uids = torch.arange(1, MAX_INSTANCES + 1, device=device,
-                        dtype=torch.int16).view(-1, 1, 1, 1, 1)
-    masks = (seg.to(torch.int16).unsqueeze(0) == uids)
-    valid_bt = masks.any(dim=-1).any(dim=-1)
 
-    y_grid = torch.arange(target_size, device=device,
-                          dtype=torch.int16).view(1, 1, 1, target_size, 1)
-    x_grid = torch.arange(target_size, device=device,
-                          dtype=torch.int16).view(1, 1, 1, 1, target_size)
+    # 1. 准备展平的一维网格坐标
+    y_coords = torch.arange(target_size, dtype=torch.float32, device=device).view(target_size, 1).expand(target_size, target_size).flatten().view(1, 1, -1).expand(B, T, -1)
+    x_coords = torch.arange(target_size, dtype=torch.float32, device=device).view(1, target_size).expand(target_size, target_size).flatten().view(1, 1, -1).expand(B, T, -1)
+    flat_seg = seg.view(B, T, -1)
 
-    ymin = torch.where(masks, y_grid, torch.tensor(
-        target_size, dtype=torch.int16, device=device)).amin(dim=(3, 4))
-    ymax = torch.where(masks, y_grid, torch.tensor(-1,
-                       dtype=torch.int16, device=device)).amax(dim=(3, 4))
-    xmin = torch.where(masks, x_grid, torch.tensor(
-        target_size, dtype=torch.int16, device=device)).amin(dim=(3, 4))
-    xmax = torch.where(masks, x_grid, torch.tensor(-1,
-                       dtype=torch.int16, device=device)).amax(dim=(3, 4))
+    # 2. 利用 scatter_reduce_ 直接求出边界坐标
+    ymin_target = torch.full((B, T, MAX_INSTANCES + 1), float(target_size), dtype=torch.float32, device=device)
+    ymin_target.scatter_reduce_(dim=2, index=flat_seg.long(), src=y_coords, reduce="amin", include_self=False)
+    ymin = ymin_target[:, :, 1:].permute(2, 0, 1)
 
-    true_area = masks.sum(dim=(3, 4), dtype=torch.int32)
+    ymax_target = torch.full((B, T, MAX_INSTANCES + 1), -1.0, dtype=torch.float32, device=device)
+    ymax_target.scatter_reduce_(dim=2, index=flat_seg.long(), src=y_coords, reduce="amax", include_self=False)
+    ymax = ymax_target[:, :, 1:].permute(2, 0, 1)
+
+    xmin_target = torch.full((B, T, MAX_INSTANCES + 1), float(target_size), dtype=torch.float32, device=device)
+    xmin_target.scatter_reduce_(dim=2, index=flat_seg.long(), src=x_coords, reduce="amin", include_self=False)
+    xmin = xmin_target[:, :, 1:].permute(2, 0, 1)
+
+    xmax_target = torch.full((B, T, MAX_INSTANCES + 1), -1.0, dtype=torch.float32, device=device)
+    xmax_target.scatter_reduce_(dim=2, index=flat_seg.long(), src=x_coords, reduce="amax", include_self=False)
+    xmax = xmax_target[:, :, 1:].permute(2, 0, 1)
+
+    # 3. 利用 scatter_add_ 直接统计实例真实面积
+    true_area_target = torch.zeros((B, T, MAX_INSTANCES + 1), dtype=torch.int32, device=device)
+    ones = torch.ones_like(flat_seg, dtype=torch.int32)
+    true_area_target.scatter_add_(dim=2, index=flat_seg.long(), src=ones)
+    true_area = true_area_target[:, :, 1:].permute(2, 0, 1)
+
+    valid_bt = (true_area > 0)
     box_area = torch.clamp((xmax - xmin) * (ymax - ymin), min=1)
 
     for stride in [8, 16, 32]:
         H_f, W_f = target_size // stride, target_size // stride
         b_d = torch.zeros(B, T, 4, H_f, W_f, device=device)
         o_d = torch.zeros(B, T, 1, H_f, W_f, device=device)
-        c_d = torch.zeros(B, T, 1, H_f, W_f, device=device)
+        # cls_dense 暂时只作为语义类别占位，不再放 is_dynamic。
+        # -100 表示 ignore，防止未来误开 cls loss 时把背景/物理状态当类别。
+        c_d = torch.full(
+            (B, T, 1, H_f, W_f),
+            fill_value=-100,
+            dtype=torch.long,
+            device=device,
+        )
+        dyn_d = torch.zeros(B, T, 1, H_f, W_f, device=device)
 
         if stride == 8:
             s_mask = (box_area < 32**2)
@@ -227,11 +280,15 @@ def process_batch_on_gpu(batch, device, target_size=256):
                 ((xmin[n_idx, b_idx, t_idx] + xmax[n_idx, b_idx, t_idx]) / 2 / stride).long(), 0, W_f - 1)
 
             o_d[b_idx, t_idx, 0, cy, cx] = 1.0
-            if is_dyn_out is not None:
-                c_d[b_idx, t_idx, 0, cy, cx] = is_dyn_out[b_idx, n_idx.long()
-                                                          ].float()
-            else:
-                c_d[b_idx, t_idx, 0, cy, cx] = 1.0
+            if is_dyn_out is not None and is_dyn_out.numel() > 0:
+                dyn_val = torch.zeros_like(n_idx, dtype=torch.float32, device=device)
+                valid_dyn = n_idx.long() < is_dyn_out.shape[1]
+                if valid_dyn.any():
+                    dyn_val[valid_dyn] = is_dyn_out[
+                        b_idx[valid_dyn],
+                        n_idx[valid_dyn].long(),
+                    ].float()
+                dyn_d[b_idx, t_idx, 0, cy, cx] = dyn_val
 
             gx, gy = cx.float() * stride + stride / 2.0, cy.float() * stride + stride / 2.0
 
@@ -250,6 +307,7 @@ def process_batch_on_gpu(batch, device, target_size=256):
         bboxes_dense.append(b_d)
         obj_dense.append(o_d)
         cls_dense.append(c_d)
+        initial_dynamic_dense.append(dyn_d)
 
     seg_small = F.interpolate(seg.float().flatten(0, 1).unsqueeze(1), size=(
         target_size // 8, target_size // 8), mode="nearest").squeeze(1).view(B, T, target_size // 8, target_size // 8)
@@ -270,11 +328,30 @@ def process_batch_on_gpu(batch, device, target_size=256):
     # shape: [MAX_INSTANCES, B, T] -> permute to [B, T, MAX_INSTANCES]
     track_gt_valid = (true_area > 0).permute(1, 2, 0)
 
+    if "camera_focal_length" in batch and batch["camera_focal_length"] is not None and len(batch["camera_focal_length"]) > 0:
+        try:
+            camera_focal_length = to_gpu("camera_focal_length", torch.float32)
+        except Exception:
+            camera_focal_length = torch.tensor([0.7] * B, device=device, dtype=torch.float32)
+    else:
+        camera_focal_length = torch.tensor([0.7] * B, device=device, dtype=torch.float32)
+
+    if "camera_sensor_width" in batch and batch["camera_sensor_width"] is not None and len(batch["camera_sensor_width"]) > 0:
+        try:
+            camera_sensor_width = to_gpu("camera_sensor_width", torch.float32)
+        except Exception:
+            camera_sensor_width = torch.tensor([36.0] * B, device=device, dtype=torch.float32)
+    else:
+        camera_sensor_width = torch.tensor([36.0] * B, device=device, dtype=torch.float32)
+
     return {
         "video": video_p, "seg_raw": seg, "depth": depth_m, "log_depth": torch.log(depth_m),
         "flow": flow_norm, "cam_pos": cam_pos, "cam_quat": cam_quat, "is_dynamic": is_dyn_out, "sky_mask": sky_mask,
         "seg_small": seg_small, "bboxes_dense": bboxes_dense, "obj_dense": obj_dense, "cls_dense": cls_dense,
+        "initial_dynamic_dense": initial_dynamic_dense,
         "track_gt_boxes": track_gt_boxes, "track_gt_valid": track_gt_valid,
+        "camera_focal_length": camera_focal_length,
+        "camera_sensor_width": camera_sensor_width,
     }
 
 class CUDAPrefetcher:

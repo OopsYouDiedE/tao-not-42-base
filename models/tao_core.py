@@ -70,7 +70,7 @@ class TAONot42VisionModel(nn.Module):
         self.state_update_gate_head = nn.Sequential(
             nn.Linear(128, 64), nn.SiLU(), nn.Linear(64, 1))
         self.track_module = TrackQueryModule(
-            feat_channels=128, num_queries=16, num_heads=4, nc=4585, nm=32)
+            feat_channels=128, num_queries=32, num_heads=4, nc=4585, nm=32)
 
         self.f1_temporal = nn.Conv3d(32, 32, kernel_size=(
             3, 1, 1), padding=(1, 0, 0), groups=32)
@@ -158,6 +158,7 @@ class TAONot42VisionModel(nn.Module):
             "track_classes": track_out["track_classes"],
             "track_alive":   track_out["track_alive"],
             "track_masks":   track_out["track_masks"],
+            "attributes":    preds["attributes"],
         }
 
 # =====================================================================

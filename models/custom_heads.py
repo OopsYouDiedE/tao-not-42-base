@@ -9,6 +9,24 @@ except ImportError:
 
 from models.yolo_blocks import *
 
+class TemporalConvFallback(nn.Module):
+    """
+    Mamba 不可用时的安全 fallback。
+    输入/输出 shape: [B, T, C]
+    至少具备时间维度混合能力，不再退化成逐 token Linear。
+    """
+    def __init__(self, d_model):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv1d(d_model, d_model, kernel_size=3, padding=1, groups=d_model),
+            nn.SiLU(),
+            nn.Conv1d(d_model, d_model, kernel_size=1),
+        )
+
+    def forward(self, x):
+        return self.net(x.transpose(1, 2)).transpose(1, 2)
+
+
 class SpatioTemporalMambaBlock(nn.Module):
     def __init__(self, channels, num_frequencies=16):
         super().__init__()
@@ -17,8 +35,11 @@ class SpatioTemporalMambaBlock(nn.Module):
             channels, channels, kernel_size=3, padding=1, bias=False)
         self.bn3d = nn.BatchNorm3d(channels)
         self.act = nn.SiLU(inplace=True)
-        self.mamba = Mamba(d_model=channels, d_state=16,
-                           d_conv=4, expand=2) if Mamba else None
+        self.mamba = (
+            Mamba(d_model=channels, d_state=16, d_conv=4, expand=2)
+            if Mamba
+            else TemporalConvFallback(channels)
+        )
         self.norm = nn.LayerNorm(channels)
 
         self.register_buffer("frequencies", torch.exp(
@@ -41,7 +62,7 @@ class SpatioTemporalMambaBlock(nn.Module):
         x3d = x3d + time_embed.view(B, T, C, 1, 1)
         x_flat = x3d.permute(0, 3, 4, 1, 2).reshape(B * H * W, T, C)
 
-        mamba_out = self.mamba(x_flat) if self.mamba else x_flat
+        mamba_out = self.mamba(x_flat)
         x_flat = self.norm(x_flat + mamba_out)
 
         out = x_flat.view(B, H, W, T, C).permute(0, 3, 4, 1, 2).contiguous()
@@ -129,8 +150,11 @@ class TrackQueryModule(nn.Module):
         super().__init__()
         self.num_queries = num_queries
         self.query_embed = nn.Embedding(num_queries, feat_channels)
-        self.query_mamba = Mamba(d_model=feat_channels, d_state=16, d_conv=4,
-                                 expand=2) if Mamba else nn.Linear(feat_channels, feat_channels)
+        self.query_mamba = (
+            Mamba(d_model=feat_channels, d_state=16, d_conv=4, expand=2)
+            if Mamba
+            else TemporalConvFallback(feat_channels)
+        )
         self.query_norm = nn.LayerNorm(feat_channels)
 
         self.cross_attn = nn.MultiheadAttention(
@@ -248,6 +272,10 @@ class YOLOESegment26(nn.Module):
             LRPCLayer(c3, c2, nc=4585, is_linear=False)
         ])
 
+        self.attr_heads = nn.ModuleList([
+            nn.Conv2d(x, 2, kernel_size=1) for x in ch
+        ])
+
     def forward(self, x):
         proto_out, semseg = self.proto(x)
 
@@ -258,7 +286,7 @@ class YOLOESegment26(nn.Module):
                 feat_cls = cv3_list[i](f)
                 feat_mask = cv5_list[i](f)
 
-                bbox = self.lrpc[i].loc(feat_box)
+                bbox = F.softplus(self.lrpc[i].loc(feat_box)) + 1e-4
                 boxes.append(bbox)
 
                 gate_logits = self.lrpc[i].pf(feat_cls)
@@ -282,11 +310,15 @@ class YOLOESegment26(nn.Module):
         obj_o2o, cls_o2o, boxes_o2o, mc_o2o = process_branch(
             self.one2one_cv2, self.one2one_cv3, self.one2one_cv5)
 
+        attrs = []
+        for i, f in enumerate(x):
+            attrs.append(self.attr_heads[i](f))
+
         return {
             "features": x,
             "objectness": obj, "classification": cls, "boxes": boxes, "mask_coefficients": mc,
             "o2o_objectness": obj_o2o, "o2o_classification": cls_o2o, "o2o_boxes": boxes_o2o, "o2o_mask_coefficients": mc_o2o,
-            "mask_prototypes": proto_out, "semseg": semseg
+            "mask_prototypes": proto_out, "semseg": semseg, "attributes": attrs
         }
 
 # =====================================================================

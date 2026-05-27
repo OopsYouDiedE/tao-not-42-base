@@ -161,7 +161,10 @@ class TAOTrainer:
             if k in ("video", "flow"):
                 continue
 
-            if k == "is_dynamic":
+            if k in ("camera_focal_length", "camera_sensor_width"):
+                # [B] -> [B*T]
+                tgt[k] = v.view(B, 1).expand(B, T).reshape(B * T)
+            elif k == "is_dynamic":
                 tgt[k] = v.unsqueeze(
                     1).expand(-1, T, -1).flatten(0, 1) if v is not None else None
             elif isinstance(v, list):
@@ -212,7 +215,9 @@ class TAOTrainer:
         total_loss_tensor = torch.tensor(0.0, device=self.device)
 
         loss_acc = {k: 0.0 for k in [
-            "Obj", "Box", "Mask", "Depth", "Photo", "Ego", "Flow", "Anom", "Gate", "Cls"]}
+            "Obj", "Box", "Mask", "Depth", "Photo", "Ego", "Flow", "Anom", "Gate", "Cls",
+            "Attr", "Track", "FlowEPEpx", "DepthAbsRel", "DepthRMSElog", "DepthDelta1"
+        ]}
         total_frames = 0
 
         for c_start in range(0, t_max, self.args.seq_len):
@@ -275,6 +280,13 @@ class TAOTrainer:
                         return res
                     if v.dim() == 0:
                         return v
+                    if (
+                        v.dim() >= 4
+                        and v.shape[0] == v_seq.shape[0]
+                        and v.shape[1] == T_chunk
+                    ):
+                        frame_id = min(1, T_chunk - 1)
+                        return v[-1:, frame_id]
                     if v.shape[0] == v_seq.shape[0] * T_chunk:
                         return v[(v_seq.shape[0] - 1) * T_chunk + 1: (v_seq.shape[0] - 1) * T_chunk + 2]
                     return v[-v_seq.shape[0]:]
@@ -292,7 +304,7 @@ class TAOTrainer:
             self.global_step += 1
             if self.global_step % 10 == 0:
                 print(f"[{time.time()-self.start_time:.1f}s] S{self.global_step} | Tot:{loss.item():.4f} | " + " ".join(
-                    [f"{k}:{loss_acc[k]/total_frames:.2f}" for k in ["Obj", "Box", "Mask", "Depth", "Ego", "Flow", "Anom"]]))
+                    [f"{k}:{loss_acc[k]/total_frames:.2f}" for k in ["Obj", "Box", "Mask", "Depth", "Ego", "Flow", "Anom", "Attr", "Track", "FlowEPEpx", "DepthAbsRel"]]))
                 if wandb:
                     log_dict = {
                         f"Loss/{k}": loss_acc[k]/total_frames for k in loss_acc}

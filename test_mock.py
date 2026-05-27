@@ -458,7 +458,7 @@ def test_all_stages():
     )
 
     # --- Shape verification ---
-    N = 16
+    N = 32
     assert "track_boxes"   in preds6, "track_boxes missing from preds"
     assert "track_classes" in preds6, "track_classes missing from preds"
     assert "track_alive"   in preds6, "track_alive missing from preds"
