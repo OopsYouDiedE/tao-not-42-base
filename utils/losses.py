@@ -20,7 +20,7 @@ def flow_epe_px(pred_flow_norm, gt_flow_norm, valid_mask=None, img_size=256):
     epe = torch.linalg.vector_norm(pred_px - gt_px, dim=1)
 
     if valid_mask is not None:
-        valid = valid_mask.float()
+        valid = valid_mask.float().expand_as(epe)
         return (epe * valid).sum() / valid.sum().clamp(min=1.0)
 
     return epe.mean()
@@ -375,44 +375,64 @@ def compute_instance_loss(preds, targets, step):
             loss_box += box_l.sum() / pos_mask.float().sum().clamp(min=1.0)
 
         if w["mask"] > 0:
-            H_feat, W_feat = p_obj.shape[2], p_obj.shape[3]
-            H, W = targets["seg_raw"].shape[1], targets["seg_raw"].shape[2]
-
-            y_g, x_g = torch.meshgrid(torch.arange(H_feat, device=device), torch.arange(
-                W_feat, device=device), indexing="ij")
-            y_idx = torch.clamp(y_g * (H // H_feat) + (H // H_feat) //
-                                2, 0, H - 1).unsqueeze(0).expand(B, -1, -1)
-            x_idx = torch.clamp(x_g * (H // H_feat) + (H // H_feat) //
-                                2, 0, W - 1).unsqueeze(0).expand(B, -1, -1)
-            flat_idx = (y_idx * W + x_idx).reshape(B, H_feat * W_feat)
-
-            inst_ids = torch.gather(targets["seg_raw"].reshape(
-                B, H * W), 1, flat_idx).reshape(B, H_feat, W_feat).long()
-            pred_logits = torch.einsum(
-                "bchw,bcHW->bhwHW", preds["mask_coefficients"][i], preds["mask_prototypes"])
-            gt_masks = (targets["seg_small"].unsqueeze(1).unsqueeze(
-                2) == inst_ids.view(B, H_feat, W_feat, 1, 1)).float()
-
-            if gt_masks.shape[-2:] != pred_logits.shape[-2:]:
-                gt_masks = F.interpolate(gt_masks.flatten(0, 2).unsqueeze(
-                    1), size=pred_logits.shape[-2:], mode="nearest").squeeze(1).view_as(pred_logits)
-
-            intersection = (torch.sigmoid(pred_logits)
-                            * gt_masks).sum(dim=(3, 4))
-            union = torch.sigmoid(pred_logits).sum(
-                dim=(3, 4)) + gt_masks.sum(dim=(3, 4))
-
-            bce = F.binary_cross_entropy_with_logits(
-                pred_logits, gt_masks, reduction="none")
-
-            dice_loss = 1.0 - (2.0 * intersection + gt_masks.sum(dim=(3, 4)).clamp(
-                min=1.0) * 0.01) / (union + gt_masks.sum(dim=(3, 4)).clamp(min=1.0) * 0.01)
-            focal_bce = (0.25 * (1 - torch.exp(-bce))
-                         ** 2 * bce).mean(dim=(3, 4))
-
-            valid_mask_inst = (inst_ids > 0).float() * pos_mask.float()
-            loss_mask += ((dice_loss * 2.0 + focal_bce) *
-                          valid_mask_inst).sum() / valid_mask_inst.sum().clamp(min=1.0)
+            pos_mask_b = pos_mask.bool()
+            if pos_mask_b.any():
+                b_idx, y_idx, x_idx = torch.where(pos_mask_b)
+                mc = preds["mask_coefficients"][i].permute(0, 2, 3, 1)[b_idx, y_idx, x_idx]
+                
+                protos = preds["mask_prototypes"]
+                protos_n = protos[b_idx]
+                
+                pred_logits = torch.einsum("nc,nchw->nhw", mc, protos_n)
+                
+                H, W = targets["seg_raw"].shape[1], targets["seg_raw"].shape[2]
+                stride = 8 * (2 ** i)
+                
+                gy = (y_idx.float() * stride + stride / 2.0).long().clamp(0, H - 1)
+                gx = (x_idx.float() * stride + stride / 2.0).long().clamp(0, W - 1)
+                
+                inst_ids = targets["seg_raw"][b_idx, gy, gx]
+                gt_masks_full = (targets["seg_small"][b_idx] == inst_ids.view(-1, 1, 1)).float()
+                
+                if gt_masks_full.shape[-2:] != pred_logits.shape[-2:]:
+                    gt_masks_full = F.interpolate(gt_masks_full.unsqueeze(1), size=pred_logits.shape[-2:], mode="nearest").squeeze(1)
+                
+                tb = targets["bboxes_dense"][i].permute(0, 2, 3, 1)[b_idx, y_idx, x_idx]
+                
+                mask_stride = H / pred_logits.shape[-2]
+                gy_m = (y_idx.float() * stride + stride / 2.0) / mask_stride
+                gx_m = (x_idx.float() * stride + stride / 2.0) / mask_stride
+                
+                pl_m = tb[:, 0] * stride / mask_stride
+                pt_m = tb[:, 1] * stride / mask_stride
+                pr_m = tb[:, 2] * stride / mask_stride
+                pb_m = tb[:, 3] * stride / mask_stride
+                
+                x1 = (gx_m - pl_m).clamp(0, pred_logits.shape[-1] - 1)
+                y1 = (gy_m - pt_m).clamp(0, pred_logits.shape[-2] - 1)
+                x2 = (gx_m + pr_m).clamp(0, pred_logits.shape[-1] - 1)
+                y2 = (gy_m + pb_m).clamp(0, pred_logits.shape[-2] - 1)
+                
+                rows = torch.arange(pred_logits.shape[-2], device=device).view(1, -1, 1)
+                cols = torch.arange(pred_logits.shape[-1], device=device).view(1, 1, -1)
+                
+                box_mask = (cols >= x1.view(-1, 1, 1)) & (cols <= x2.view(-1, 1, 1)) & \
+                           (rows >= y1.view(-1, 1, 1)) & (rows <= y2.view(-1, 1, 1))
+                
+                pred_logits_crop = pred_logits.masked_fill(~box_mask, -10.0)
+                gt_masks_crop = gt_masks_full * box_mask.float()
+                
+                intersection = (torch.sigmoid(pred_logits_crop) * gt_masks_crop).sum(dim=(1, 2))
+                union = torch.sigmoid(pred_logits_crop).sum(dim=(1, 2)) + gt_masks_crop.sum(dim=(1, 2))
+                
+                bce = F.binary_cross_entropy_with_logits(pred_logits_crop, gt_masks_crop, reduction="none")
+                focal_bce = (0.25 * (1 - torch.exp(-bce)) ** 2 * bce).mean(dim=(1, 2))
+                
+                dice_loss = 1.0 - (2.0 * intersection + gt_masks_crop.sum(dim=(1, 2)).clamp(min=1.0) * 0.01) / \
+                                  (union + gt_masks_crop.sum(dim=(1, 2)).clamp(min=1.0) * 0.01)
+                
+                valid_mask_inst = (inst_ids > 0).float()
+                loss_mask += ((dice_loss * 2.0 + focal_bce) * valid_mask_inst).sum() / valid_mask_inst.sum().clamp(min=1.0)
 
         # [FIX] 如果 get_loss_weights 中的 cls 为 0，此处将被跳过，保护分类器字典不被错误标签淹没。
         if w.get("cls", 0) > 0 and "dense_classification" in preds and "cls_dense" in targets:
@@ -441,11 +461,15 @@ def compute_attribute_loss(preds, targets):
             continue
 
         init_dyn = targets["initial_dynamic_dense"][i][:, 0]
-        target = init_dyn.float()
+        cur_mov = targets["current_moving_dense"][i][:, 0]
 
-        loss_i = F.binary_cross_entropy_with_logits(
-            pred_attr[:, 0], target, reduction="none"
+        loss_init = F.binary_cross_entropy_with_logits(
+            pred_attr[:, 0], init_dyn.float(), reduction="none"
         )
+        loss_cur = F.binary_cross_entropy_with_logits(
+            pred_attr[:, 1], cur_mov.float(), reduction="none"
+        )
+        loss_i = loss_init + loss_cur
         loss = loss + (loss_i * pos.float()).sum() / pos.float().sum().clamp(min=1.0)
 
     return loss

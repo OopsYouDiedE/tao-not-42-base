@@ -69,6 +69,7 @@ class AsyncDataBuffer:
                        read_config=tfds.ReadConfig(interleave_cycle_length=16)).repeat()
 
         def map_fn(x):
+            insts = x.get("instances", {})
             return {
                 "video": x["video"], "segmentations": x["segmentations"], "depth": x["depth"],
                 "forward_flow": x["forward_flow"], "cam_pos": x["camera"]["positions"],
@@ -77,7 +78,12 @@ class AsyncDataBuffer:
                 "forward_flow_range": x["metadata"]["forward_flow_range"],
                 "camera_focal_length": x["camera"]["focal_length"],
                 "camera_sensor_width": x["camera"]["sensor_width"],
-                **({"is_dynamic": x["instances"]["is_dynamic"]} if "instances" in x and "is_dynamic" in x["instances"] else {})
+                **({"is_dynamic": insts["is_dynamic"]} if "is_dynamic" in insts else {}),
+                **({"category": insts["category"]} if "category" in insts else {}),
+                **({"velocities": insts["velocities"]} if "velocities" in insts else {}),
+                **({"angular_velocities": insts["angular_velocities"]} if "angular_velocities" in insts else {}),
+                **({"visibility": insts["visibility"]} if "visibility" in insts else {}),
+                **({"collisions": x["events"]["collisions"]} if "events" in x and "collisions" in x["events"] else {})
             }
 
         ds = ds.map(map_fn, num_parallel_calls=tf.data.AUTOTUNE).prefetch(
@@ -100,8 +106,17 @@ class AsyncDataBuffer:
                 item["camera_sensor_width"]).pin_memory()
 
             if "is_dynamic" in item:
-                p_item["is_dynamic"] = torch.from_numpy(
-                    item["is_dynamic"]).pin_memory()
+                p_item["is_dynamic"] = torch.from_numpy(item["is_dynamic"]).pin_memory()
+            if "category" in item:
+                p_item["category"] = torch.from_numpy(item["category"]).pin_memory()
+            if "velocities" in item:
+                p_item["velocities"] = torch.from_numpy(item["velocities"]).pin_memory()
+            if "angular_velocities" in item:
+                p_item["angular_velocities"] = torch.from_numpy(item["angular_velocities"]).pin_memory()
+            if "visibility" in item:
+                p_item["visibility"] = torch.from_numpy(item["visibility"]).pin_memory()
+            if "collisions" in item:
+                p_item["collisions"] = torch.from_numpy(item["collisions"]).pin_memory()
 
             p_item["forward_flow"] = torch.from_numpy(
                 item["forward_flow"]).pin_memory()
@@ -120,7 +135,8 @@ class AsyncDataBuffer:
 
         keys = [
             "video", "segmentation", "depth", "forward_flow", "cam_pos",
-            "cam_quat", "is_dynamic", "depth_range", "forward_flow_range",
+            "cam_quat", "is_dynamic", "category", "velocities", "angular_velocities",
+            "visibility", "collisions", "depth_range", "forward_flow_range",
             "camera_focal_length", "camera_sensor_width",
         ]
         return {k: [i.get(k) for i in batch] for k in keys}
@@ -160,13 +176,24 @@ def process_batch_on_gpu(batch, device, target_size=256):
     else:
         flow_raw = flow_raw.float()
 
-    is_dyn_out = None
-    if batch.get("is_dynamic") and batch["is_dynamic"][0] is not None:
-        max_dyn_len = max(
-            [len(d) for d in batch["is_dynamic"] if d is not None], default=0)
-        is_dyn_out = torch.stack(
-            [F.pad(x, (0, max_dyn_len - len(x))) for x in batch["is_dynamic"]]
-        ).to(device, non_blocking=True)
+    def pad_instances(key):
+        if not batch.get(key) or batch[key][0] is None:
+            return None
+        max_len = max([len(d) for d in batch[key] if d is not None], default=0)
+        padded = []
+        for x in batch[key]:
+            if x is None:
+                continue
+            pad_dims = []
+            for _ in range(x.dim() - 1):
+                pad_dims.extend([0, 0])
+            pad_dims.extend([0, max_len - len(x)])
+            padded.append(F.pad(x, tuple(pad_dims)))
+        return torch.stack(padded).to(device, non_blocking=True)
+
+    is_dyn_out = pad_instances("is_dynamic")
+    category_out = pad_instances("category")
+    velocities_out = pad_instances("velocities")
 
     depth_m = torch.clamp(depth_raw, 0.01, 100.0)
     depth_m[depth_raw == 0] = 100.0
@@ -212,6 +239,7 @@ def process_batch_on_gpu(batch, device, target_size=256):
 
     bboxes_dense, obj_dense, cls_dense = [], [], []
     initial_dynamic_dense = []
+    current_moving_dense = []
     MAX_INSTANCES = 24
 
     # 1. 准备展平的一维网格坐标
@@ -249,15 +277,9 @@ def process_batch_on_gpu(batch, device, target_size=256):
         H_f, W_f = target_size // stride, target_size // stride
         b_d = torch.zeros(B, T, 4, H_f, W_f, device=device)
         o_d = torch.zeros(B, T, 1, H_f, W_f, device=device)
-        # cls_dense 暂时只作为语义类别占位，不再放 is_dynamic。
-        # -100 表示 ignore，防止未来误开 cls loss 时把背景/物理状态当类别。
-        c_d = torch.full(
-            (B, T, 1, H_f, W_f),
-            fill_value=-100,
-            dtype=torch.long,
-            device=device,
-        )
+        c_d = torch.full((B, T, 1, H_f, W_f), fill_value=-100, dtype=torch.long, device=device)
         dyn_d = torch.zeros(B, T, 1, H_f, W_f, device=device)
+        cur_mov_d = torch.zeros(B, T, 1, H_f, W_f, device=device)
 
         if stride == 8:
             s_mask = (box_area < 32**2)
@@ -280,15 +302,30 @@ def process_batch_on_gpu(batch, device, target_size=256):
                 ((xmin[n_idx, b_idx, t_idx] + xmax[n_idx, b_idx, t_idx]) / 2 / stride).long(), 0, W_f - 1)
 
             o_d[b_idx, t_idx, 0, cy, cx] = 1.0
+            if category_out is not None and category_out.numel() > 0:
+                cat_val = torch.full_like(n_idx, -100, dtype=torch.long, device=device)
+                valid_cat = n_idx.long() < category_out.shape[1]
+                if valid_cat.any():
+                    cat_val[valid_cat] = category_out[b_idx[valid_cat], n_idx[valid_cat].long()].long()
+                c_d[b_idx, t_idx, 0, cy, cx] = cat_val
+
+            dyn_val = torch.zeros_like(n_idx, dtype=torch.float32, device=device)
             if is_dyn_out is not None and is_dyn_out.numel() > 0:
-                dyn_val = torch.zeros_like(n_idx, dtype=torch.float32, device=device)
                 valid_dyn = n_idx.long() < is_dyn_out.shape[1]
                 if valid_dyn.any():
-                    dyn_val[valid_dyn] = is_dyn_out[
-                        b_idx[valid_dyn],
-                        n_idx[valid_dyn].long(),
-                    ].float()
+                    dyn_val[valid_dyn] = is_dyn_out[b_idx[valid_dyn], n_idx[valid_dyn].long()].float()
                 dyn_d[b_idx, t_idx, 0, cy, cx] = dyn_val
+
+            if velocities_out is not None and velocities_out.numel() > 0:
+                cur_mov_val = torch.zeros_like(n_idx, dtype=torch.float32, device=device)
+                valid_vel = n_idx.long() < velocities_out.shape[1]
+                if valid_vel.any():
+                    v = velocities_out[b_idx[valid_vel], n_idx[valid_vel].long(), t_idx[valid_vel]]
+                    v_norm = torch.linalg.vector_norm(v, dim=-1)
+                    cur_mov_val[valid_vel] = (v_norm > 1e-3).float()
+                cur_mov_d[b_idx, t_idx, 0, cy, cx] = cur_mov_val
+            else:
+                cur_mov_d[b_idx, t_idx, 0, cy, cx] = dyn_val
 
             gx, gy = cx.float() * stride + stride / 2.0, cy.float() * stride + stride / 2.0
 
@@ -308,6 +345,7 @@ def process_batch_on_gpu(batch, device, target_size=256):
         obj_dense.append(o_d)
         cls_dense.append(c_d)
         initial_dynamic_dense.append(dyn_d)
+        current_moving_dense.append(cur_mov_d)
 
     seg_small = F.interpolate(seg.float().flatten(0, 1).unsqueeze(1), size=(
         target_size // 8, target_size // 8), mode="nearest").squeeze(1).view(B, T, target_size // 8, target_size // 8)
@@ -332,23 +370,23 @@ def process_batch_on_gpu(batch, device, target_size=256):
         try:
             camera_focal_length = to_gpu("camera_focal_length", torch.float32)
         except Exception:
-            camera_focal_length = torch.tensor([0.7] * B, device=device, dtype=torch.float32)
+            camera_focal_length = torch.tensor([35.0] * B, device=device, dtype=torch.float32)
     else:
-        camera_focal_length = torch.tensor([0.7] * B, device=device, dtype=torch.float32)
+        camera_focal_length = torch.tensor([35.0] * B, device=device, dtype=torch.float32)
 
     if "camera_sensor_width" in batch and batch["camera_sensor_width"] is not None and len(batch["camera_sensor_width"]) > 0:
         try:
             camera_sensor_width = to_gpu("camera_sensor_width", torch.float32)
         except Exception:
-            camera_sensor_width = torch.tensor([36.0] * B, device=device, dtype=torch.float32)
+            camera_sensor_width = torch.tensor([32.0] * B, device=device, dtype=torch.float32)
     else:
-        camera_sensor_width = torch.tensor([36.0] * B, device=device, dtype=torch.float32)
+        camera_sensor_width = torch.tensor([32.0] * B, device=device, dtype=torch.float32)
 
     return {
         "video": video_p, "seg_raw": seg, "depth": depth_m, "log_depth": torch.log(depth_m),
         "flow": flow_norm, "cam_pos": cam_pos, "cam_quat": cam_quat, "is_dynamic": is_dyn_out, "sky_mask": sky_mask,
         "seg_small": seg_small, "bboxes_dense": bboxes_dense, "obj_dense": obj_dense, "cls_dense": cls_dense,
-        "initial_dynamic_dense": initial_dynamic_dense,
+        "initial_dynamic_dense": initial_dynamic_dense, "current_moving_dense": current_moving_dense,
         "track_gt_boxes": track_gt_boxes, "track_gt_valid": track_gt_valid,
         "camera_focal_length": camera_focal_length,
         "camera_sensor_width": camera_sensor_width,

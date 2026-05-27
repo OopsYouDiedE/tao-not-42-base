@@ -80,7 +80,7 @@ class TAONot42VisionModel(nn.Module):
     def extract_features(self, peripheral):
         return self.segmenter(peripheral)
 
-    def forward_physics(self, f1, f2, p3_fused, p4, p5, dt, step, get_loss_weights_fn=None, original_shape=None):
+    def forward_physics(self, f1, f2, p3_fused, p4, p5, dt, step, get_loss_weights_fn=None, original_shape=None, tgts=None):
         B, T = f1.shape[:2]
         h, w = original_shape if original_shape else (
             f1.shape[3] * 2, f1.shape[4] * 2)
@@ -125,6 +125,22 @@ class TAONot42VisionModel(nn.Module):
         depth_pred = torch.exp(torch.clamp(F.interpolate(
             depth_raw, size=(h, w), mode="bilinear", align_corners=False).squeeze(1), min=-4.6, max=4.6)).view(B*T, h, w)
         flow_pred = flow_raw * 1.5 if flow_raw is not None else None
+
+        if flow_pred is not None:
+            from utils.geometry import quaternion_to_matrix, matrix_to_6d, compute_rigid_flow, generate_intrinsics
+            pose_for_flow = ego_pose
+            if tgts is not None and "cam_pos_t" in tgts and "cam_quat_next" in tgts:
+                R_n_inv = quaternion_to_matrix(tgts["cam_quat_next"]).transpose(1, 2)
+                trans_diff = torch.bmm(R_n_inv, (tgts["cam_pos_t"] - tgts["cam_pos_next"]).unsqueeze(-1)).squeeze(-1)
+                rot_diff = matrix_to_6d(torch.bmm(R_n_inv, quaternion_to_matrix(tgts["cam_quat_t"])))
+                pose_for_flow = torch.cat([trans_diff, rot_diff], dim=1)
+                
+            cam_f = tgts.get("camera_focal_length", None) if tgts else None
+            cam_s = tgts.get("camera_sensor_width", None) if tgts else None
+            
+            K, K_inv = generate_intrinsics(h, w, f1.device, focal_length=cam_f, sensor_width=cam_s)
+            rigid_flow = compute_rigid_flow(depth_pred.unsqueeze(1), pose_for_flow, K, K_inv, depth_is_distance=True)
+            flow_pred = rigid_flow + flow_pred
 
         gate_logits = self.state_update_gate_head(
             spatiotemporal_p3.mean(dim=[3, 4]).flatten(0, 1))

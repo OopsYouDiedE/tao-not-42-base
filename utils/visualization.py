@@ -3,7 +3,46 @@ import cv2
 import numpy as np
 import torch
 import torch.nn.functional as F
-import torchvision
+try:
+    import torchvision
+    has_torchvision = True
+except ImportError:
+    has_torchvision = False
+
+def nms_fallback(boxes, scores, iou_threshold):
+    # Sort boxes by scores in descending order
+    if boxes.numel() == 0:
+        return torch.empty((0,), dtype=torch.long, device=boxes.device)
+    
+    order = scores.argsort(descending=True)
+    keep = []
+    while order.numel() > 0:
+        if order.numel() == 1:
+            keep.append(order[0].item())
+            break
+        i = order[0].item()
+        keep.append(i)
+        
+        xx1 = boxes[order[1:], 0].clamp(min=boxes[i, 0])
+        yy1 = boxes[order[1:], 1].clamp(min=boxes[i, 1])
+        xx2 = boxes[order[1:], 2].clamp(max=boxes[i, 2])
+        yy2 = boxes[order[1:], 3].clamp(max=boxes[i, 3])
+        
+        w = (xx2 - xx1).clamp(min=0)
+        h = (yy2 - yy1).clamp(min=0)
+        inter = w * h
+        
+        area_i = (boxes[i, 2] - boxes[i, 0]) * (boxes[i, 3] - boxes[i, 1])
+        area_order = (boxes[order[1:], 2] - boxes[order[1:], 0]) * (boxes[order[1:], 3] - boxes[order[1:], 1])
+        
+        iou = inter / (area_i + area_order - inter + 1e-6)
+        inds = (iou <= iou_threshold).nonzero(as_tuple=False).squeeze()
+        if inds.dim() == 0:
+            inds = inds.unsqueeze(0)
+        if inds.numel() == 0:
+            break
+        order = order[inds + 1]
+    return torch.tensor(keep, dtype=torch.long, device=boxes.device)
 
 # =====================================================================
 
@@ -188,11 +227,18 @@ def extract_instances(preds, score_thresh=0.3, nms_thresh=0.5, max_det=20):
             if box is None:
                 continue
 
-            valid = torch.sigmoid(obj[b, 0]) > score_thresh
+            obj_score = torch.sigmoid(obj[b, 0])
+            if cls_list and i < len(cls_list) and cls_list[i] is not None:
+                cls_score = torch.sigmoid(cls_list[i][b]).max(dim=0)[0]
+                final_score = torch.sqrt(obj_score * cls_score)
+            else:
+                final_score = obj_score
+
+            valid = final_score > score_thresh
             if not valid.any():
                 continue
 
-            sel_scores = torch.sigmoid(obj[b, 0])[valid]
+            sel_scores = final_score[valid]
             decoded_boxes = box[b][:, valid].T
             cy, cx = valid.nonzero(as_tuple=True)
 
@@ -232,8 +278,11 @@ def extract_instances(preds, score_thresh=0.3, nms_thresh=0.5, max_det=20):
         all_boxes = torch.cat(all_boxes, dim=0)
         all_classes = torch.cat(all_classes, dim=0)
 
-        keep = torchvision.ops.nms(all_boxes * torch.tensor(
-            [W_img, H_img, W_img, H_img], device=device), all_scores, nms_thresh)[:max_det]
+        boxes_scaled = all_boxes * torch.tensor([W_img, H_img, W_img, H_img], device=device)
+        if has_torchvision:
+            keep = torchvision.ops.nms(boxes_scaled, all_scores, nms_thresh)[:max_det]
+        else:
+            keep = nms_fallback(boxes_scaled, all_scores, nms_thresh)[:max_det]
 
         protos = preds.get("mask_prototypes")
         protos = protos[0] if isinstance(protos, list) else protos

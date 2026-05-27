@@ -78,7 +78,7 @@ def inverse_warp(img_next, depth, pose, K, K_inv, depth_is_distance=True):
             torch.ones_like(x.flatten()).expand(B, -1),
         ],
         dim=1,
-    ).float()
+    ).to(depth.dtype)
 
     pose_rot = six_d_to_matrix(pose[:, 3:])
     pose_trans = pose[:, :3].unsqueeze(2)
@@ -117,3 +117,48 @@ def inverse_warp(img_next, depth, pose, K, K_inv, depth_is_distance=True):
         pixels_next[:, 2:3, :].view(B, 1, H, W) > 0.01)).float()
 
     return warped, valid_mask * depth_mask
+
+
+def compute_rigid_flow(depth, pose, K, K_inv, depth_is_distance=True):
+    B, _, H, W = depth.shape
+    y, x = torch.meshgrid(torch.arange(H, device=depth.device), torch.arange(
+        W, device=depth.device), indexing="ij")
+
+    if K.dim() == 2:
+        K = K.unsqueeze(0).expand(B, -1, -1)
+    if K_inv.dim() == 2:
+        K_inv = K_inv.unsqueeze(0).expand(B, -1, -1)
+
+    pixels = torch.stack(
+        [
+            x.flatten().expand(B, -1),
+            y.flatten().expand(B, -1),
+            torch.ones_like(x.flatten()).expand(B, -1),
+        ],
+        dim=1,
+    ).to(depth.dtype)
+
+    pose_rot = six_d_to_matrix(pose[:, 3:])
+    pose_trans = pose[:, :3].unsqueeze(2)
+
+    rays = torch.bmm(K_inv, pixels)
+
+    if depth_is_distance:
+        ray_norm = torch.linalg.vector_norm(rays, dim=1, keepdim=True).clamp(min=1e-6)
+        z_scale = depth.view(B, 1, H * W) / ray_norm
+    else:
+        z_scale = depth.view(B, 1, H * W)
+
+    points_3d = rays * z_scale
+    points_next = torch.bmm(pose_rot, points_3d) + pose_trans
+    pixels_next = torch.bmm(K, points_next)
+
+    depth_next = torch.clamp(pixels_next[:, 2:3, :], min=0.01).float()
+    x_n = 2.0 * (pixels_next[:, 0:1, :].float() / depth_next) / (W - 1) - 1.0
+    y_n = 2.0 * (pixels_next[:, 1:2, :].float() / depth_next) / (H - 1) - 1.0
+
+    x_n_prev = 2.0 * (pixels[:, 0:1, :] / (W - 1)) - 1.0
+    y_n_prev = 2.0 * (pixels[:, 1:2, :] / (H - 1)) - 1.0
+
+    flow_n = torch.cat([x_n - x_n_prev, y_n - y_n_prev], dim=1).view(B, 2, H, W)
+    return flow_n

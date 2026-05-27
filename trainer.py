@@ -32,7 +32,14 @@ class TAOTrainer:
                 for param in self.model.segmenter.parameters():
                     param.requires_grad = False
 
-        self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=args.lr)
+        # [FIX] Freeze vocab during initialization to protect zero-shot classification
+        if hasattr(self.model.segmenter.model[-1], "lrpc"):
+            for layer in self.model.segmenter.model[-1].lrpc:
+                if hasattr(layer, "vocab"):
+                    layer.vocab.requires_grad_(False)
+
+        self.optimizer = torch.optim.AdamW(filter(
+            lambda p: p.requires_grad, self.model.parameters()), lr=args.lr)
         self.scaler = torch.amp.GradScaler(
             self.device.type) if self.device.type == "cuda" else None
         self.global_step, self.start_time, self.best_loss, self.epochs_no_improve = 0, time.time(), float("inf"), 0
@@ -237,9 +244,9 @@ class TAOTrainer:
 
                 dt = torch.full(
                     (v_seq.shape[0], T_chunk), 1.0 / 24.0, device=self.device)
-                preds = self.model.forward_physics(
-                    *feats, dt, self.global_step, get_loss_weights, c_vids.shape[-2:])
                 tgts = self._extract_target_chunk(batch, c_start, c_end, t_max)
+                preds = self.model.forward_physics(
+                    *feats, dt, self.global_step, get_loss_weights, c_vids.shape[-2:], tgts=tgts)
 
                 img_next = torch.zeros_like(c_vids)
                 for i, step in enumerate(range(c_start, c_end)):

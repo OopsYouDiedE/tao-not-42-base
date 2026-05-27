@@ -172,6 +172,11 @@ def get_movi_e_or_fallback(npz_path="movi_e_sample_0000.npz", B=1, T=12, H=256, 
             cp_np = data.get("cam_pos")           # Expected: [T, 3] or [B, T, 3]
             cq_np = data.get("cam_quat")          # Expected: [T, 4] or [B, T, 4]
             id_np = data.get("is_dynamic")        # Expected: [NumInstances] or List of them
+            cat_np = data.get("category")
+            vel_np = data.get("velocities")
+            avel_np = data.get("angular_velocities")
+            vis_np = data.get("visibility")
+            col_np = data.get("collisions")
             
             # 1. Dimensional Alignment Helper
             def ensure_5d(arr, is_channel=False):
@@ -209,12 +214,21 @@ def get_movi_e_or_fallback(npz_path="movi_e_sample_0000.npz", B=1, T=12, H=256, 
                 cq_np = np.zeros((B, T, 4), dtype=np.float32)
                 cq_np[..., 0] = 1.0
                 
-            # Align is_dynamic flags
-            if id_np is not None:
-                if isinstance(id_np, np.ndarray) and len(id_np.shape) == 1:
-                    id_np = [id_np for _ in range(B)]
-            else:
-                id_np = [np.array([True], dtype=bool) for _ in range(B)]
+            # Align lists of instances
+            def align_list(arr, default_gen):
+                if arr is not None:
+                    if isinstance(arr, np.ndarray) and (arr.ndim == 1 or arr.ndim == 3 or arr.ndim == 2):
+                        return [arr for _ in range(B)]
+                    elif isinstance(arr, list):
+                        return arr
+                return [default_gen() for _ in range(B)]
+                
+            id_np = align_list(id_np, lambda: np.array([True], dtype=bool))
+            cat_np = align_list(cat_np, lambda: np.array([0], dtype=np.int32))
+            vel_np = align_list(vel_np, lambda: np.zeros((1, T, 3), dtype=np.float32))
+            avel_np = align_list(avel_np, lambda: np.zeros((1, T, 3), dtype=np.float32))
+            vis_np = align_list(vis_np, lambda: np.ones((1, T), dtype=np.float32))
+            col_np = align_list(col_np, lambda: np.zeros((0, 2), dtype=np.int32))
             
             # 2. Spatial Resizing Helper
             if v_np.shape[2] != H or v_np.shape[3] != W:
@@ -228,7 +242,7 @@ def get_movi_e_or_fallback(npz_path="movi_e_sample_0000.npz", B=1, T=12, H=256, 
                 v_np, d_np, s_np, f_np = np.stack(v_res), np.stack(d_res), np.stack(s_res), np.stack(f_res)
                 
             print("Successfully loaded and prepared genuine Kubric MOVi-E sample!")
-            return v_np, d_np, s_np, f_np, cp_np, cq_np, id_np
+            return v_np, d_np, s_np, f_np, cp_np, cq_np, id_np, cat_np, vel_np, avel_np, vis_np, col_np
         except Exception as e:
             print(f"Error loading MOVi-E sample from npz: {e}")
             
@@ -301,7 +315,12 @@ def get_movi_e_or_fallback(npz_path="movi_e_sample_0000.npz", B=1, T=12, H=256, 
         cq_np = np.zeros((B, T, 4), dtype=np.float32)
         cq_np[..., 0] = 1.0
         id_np = [np.array([True], dtype=bool) for _ in range(B)]
-        return v_np, d_np, s_np, f_np, cp_np, cq_np, id_np
+        cat_np = [np.array([0], dtype=np.int32) for _ in range(B)]
+        vel_np = [np.zeros((1, T, 3), dtype=np.float32) for _ in range(B)]
+        avel_np = [np.zeros((1, T, 3), dtype=np.float32) for _ in range(B)]
+        vis_np = [np.ones((1, T), dtype=np.float32) for _ in range(B)]
+        col_np = [np.zeros((0, 2), dtype=np.int32) for _ in range(B)]
+        return v_np, d_np, s_np, f_np, cp_np, cq_np, id_np, cat_np, vel_np, avel_np, vis_np, col_np
 
 def test_all_stages():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -321,7 +340,7 @@ def test_all_stages():
     
     # 2. Get real MOVi-E genuine sample or fallback
     B, T, img_size = 1, 12, 256
-    v_np, d_np, s_np, f_np, cp_np, cq_np, id_np = get_movi_e_or_fallback("movi_e_sample_0000.npz", B, T, img_size, img_size)
+    v_np, d_np, s_np, f_np, cp_np, cq_np, id_np, cat_np, vel_np, avel_np, vis_np, col_np = get_movi_e_or_fallback("movi_e_sample_0000.npz", B, T, img_size, img_size)
     
     # Prepare batch dictionary matching the dataset output format
     batch = {
@@ -331,7 +350,12 @@ def test_all_stages():
         "forward_flow": torch.from_numpy(f_np),
         "cam_pos": torch.from_numpy(cp_np),
         "cam_quat": torch.from_numpy(cq_np),
-        "is_dynamic": [torch.from_numpy(x) for x in id_np]
+        "is_dynamic": [torch.from_numpy(x) for x in id_np],
+        "category": [torch.from_numpy(x) for x in cat_np],
+        "velocities": [torch.from_numpy(x) for x in vel_np],
+        "angular_velocities": [torch.from_numpy(x) for x in avel_np],
+        "visibility": [torch.from_numpy(x) for x in vis_np],
+        "collisions": [torch.from_numpy(x) for x in col_np]
     }
     
     # Run GPU preprocessing pipeline
