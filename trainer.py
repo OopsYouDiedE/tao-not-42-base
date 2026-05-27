@@ -133,13 +133,13 @@ class TAOTrainer:
                     break
 
     def _train_epoch(self, epoch):
-        loss_sum = 0.0
+        loss_sum = torch.tensor(0.0, device=self.device)
         for _ in range(self.args.steps_per_epoch):
             batch = self.prefetcher.next()
             if batch is None:
                 continue
 
-            loss_sum += self._train_chunk(batch)
+            loss_sum = loss_sum + self._train_chunk(batch)
 
             if self.global_step == 500 and self.mode == "supervised" and hasattr(self.model.segmenter.model[-1], "class_prompts"):
                 self.model.segmenter.model[-1].class_prompts.requires_grad = True
@@ -151,7 +151,7 @@ class TAOTrainer:
                     if any(f"model.{i}." in n for i in target_range):
                         p.requires_grad = True
 
-        return loss_sum / self.args.steps_per_epoch
+        return loss_sum.item() / self.args.steps_per_epoch
 
     def _extract_target_chunk(self, batch, c_start, c_end, max_t):
         T = c_end - c_start
@@ -209,7 +209,7 @@ class TAOTrainer:
 
     def _train_chunk(self, batch):
         v_seq, t_max = batch["video"], batch["video"].shape[1]
-        total_loss = 0.0
+        total_loss_tensor = torch.tensor(0.0, device=self.device)
 
         loss_acc = {k: 0.0 for k in [
             "Obj", "Box", "Mask", "Depth", "Photo", "Ego", "Flow", "Anom", "Gate", "Cls"]}
@@ -254,7 +254,7 @@ class TAOTrainer:
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), 5.0)
                 self.optimizer.step()
 
-            total_loss += loss.item()
+            total_loss_tensor = total_loss_tensor + loss.detach()
             for k in loss_acc:
                 if k in l_dict:
                     loss_acc[k] += l_dict[k] * T_chunk
@@ -301,7 +301,6 @@ class TAOTrainer:
                         {"Loss/Total": loss.item(), "Step": self.global_step})
                     wandb.log(log_dict, step=self.global_step)
 
-        return total_loss
-
+        return total_loss_tensor
 
 # =====================================================================

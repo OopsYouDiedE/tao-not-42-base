@@ -130,12 +130,20 @@ def compute_track_loss(preds, targets, step):
     B, T, N, _ = track_boxes.shape
     device = track_boxes.device
 
-    seg_BT = targets.get("seg_raw")
-    if seg_BT is None:
+    track_gt_boxes = targets.get("track_gt_boxes")
+    track_gt_valid = targets.get("track_gt_valid")
+
+    if track_gt_boxes is None or track_gt_valid is None:
         return torch.tensor(0., device=device)
 
-    H_img, W_img = seg_BT.shape[-2:]
-    seg = seg_BT.view(B, T, H_img, W_img)
+    # track_gt_boxes initially has shape [B, T, MAX_INSTANCES, 4]
+    # track_gt_valid initially has shape [B, T, MAX_INSTANCES]
+    # But if targets was passed through _extract_target_chunk, it was flattened to [B * T, ...]
+    # Let's reconstruct the [B, T, ...] shape
+    if track_gt_boxes.dim() == 3:
+        track_gt_boxes = track_gt_boxes.view(B, T, -1, 4)
+    if track_gt_valid.dim() == 2:
+        track_gt_valid = track_gt_valid.view(B, T, -1)
 
     loss_box = torch.tensor(0., device=device)
     loss_alive = torch.tensor(0., device=device)
@@ -144,63 +152,49 @@ def compute_track_loss(preds, targets, step):
 
     prev_assignments = {}
 
+    # Batch compute cost matrix for all B and T on GPU
+    flat_pred_boxes = track_boxes.flatten(0, 1)      # [B*T, N, 4]
+    flat_gt_boxes = track_gt_boxes.flatten(0, 1)      # [B*T, M, 4]
+    cost_matrix_all = torch.cdist(flat_pred_boxes.detach(), flat_gt_boxes, p=1) # [B*T, N, M]
+
+    # Transfer cost matrix and valid masks to CPU in exactly ONE synchronization!
+    cost_matrix_cpu = cost_matrix_all.cpu().numpy()
+    flat_gt_valid_cpu = track_gt_valid.flatten(0, 1).cpu().numpy()
+
     for t in range(T):
-        boxes_t = track_boxes[:, t]
         alive_t = track_alive[:, t, :, 0]
         alive_target = torch.zeros(B, N, device=device)
         cur_assignments = {}
 
         for b in range(B):
-            seg_bt = seg[b, t]
-            inst_ids = [int(i) for i in seg_bt.unique().tolist() if i > 0]
-            if not inst_ids:
+            idx = b * T + t
+            valid_mask = flat_gt_valid_cpu[idx]
+            valid_ids = np.where(valid_mask)[0]
+
+            if len(valid_ids) == 0:
                 continue
 
-            gt_boxes_list, valid_ids = [], []
-            for iid in inst_ids:
-                m = seg_bt == iid
-                if not m.any():
-                    continue
-                ys, xs = m.nonzero(as_tuple=True)
-
-                y1, y2 = ys.float().min() / H_img, ys.float().max() / H_img
-                x1, x2 = xs.float().min() / W_img, xs.float().max() / W_img
-
-                cx, cy = (x1 + x2) * 0.5, (y1 + y2) * 0.5
-                bw = (x2 - x1).clamp(min=1.0 / W_img)
-                bh = (y2 - y1).clamp(min=1.0 / H_img)
-
-                gt_boxes_list.append(torch.stack([cx, cy, bw, bh]))
-                valid_ids.append(iid)
-
-            if not gt_boxes_list:
-                continue
-
-            gt_boxes = torch.stack(gt_boxes_list)
-
-            with torch.no_grad():
-                cost = torch.cdist(
-                    boxes_t[b].detach(), gt_boxes, p=1).cpu().numpy()
+            cost = cost_matrix_cpu[idx][:, valid_ids]
 
             if _lsa is not None:
                 q_inds, g_inds = _lsa(cost)
             else:
                 q_inds, g_inds = [], []
                 used_q = set()
-                for gi in range(min(len(valid_ids), N)):
-                    qi = int(
-                        np.argmin([cost[q, gi] if q not in used_q else 1e9 for q in range(N)]))
+                for gi in range(len(valid_ids)):
+                    qi = int(np.argmin([cost[q, gi] if q not in used_q else 1e9 for q in range(N)]))
                     q_inds.append(qi)
                     g_inds.append(gi)
                     used_q.add(qi)
 
             for qi, gi in zip(q_inds, g_inds):
-                iid = valid_ids[gi]
+                gt_idx = valid_ids[gi]
+                iid = int(gt_idx + 1)
                 cur_assignments[(b, iid)] = int(qi)
                 alive_target[b, qi] = 1.0
 
-                loss_box = loss_box + \
-                    F.smooth_l1_loss(boxes_t[b, qi], gt_boxes[gi], beta=0.1)
+                # Recompute using PyTorch tensors to keep gradients!
+                loss_box = loss_box + F.smooth_l1_loss(track_boxes[b, t, qi], track_gt_boxes[b, t, gt_idx], beta=0.1)
                 n_matched_total += 1
 
                 if (b, iid) in prev_assignments:
@@ -211,8 +205,7 @@ def compute_track_loss(preds, targets, step):
                                 1, device=device)
                         )
 
-        loss_alive = loss_alive + \
-            F.binary_cross_entropy_with_logits(alive_t, alive_target)
+        loss_alive = loss_alive +             F.binary_cross_entropy_with_logits(alive_t, alive_target)
         prev_assignments = cur_assignments
 
     n_matched_total = max(n_matched_total, 1)
@@ -221,7 +214,6 @@ def compute_track_loss(preds, targets, step):
     loss_consist = loss_consist / max(T * B, 1)
 
     return 1.5 * loss_box + 0.5 * loss_alive + 0.3 * loss_consist
-
 
 def compute_instance_loss(preds, targets, step):
     B = preds["objectness"][0].shape[0]

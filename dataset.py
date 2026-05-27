@@ -125,9 +125,13 @@ class AsyncDataBuffer:
 
 def process_batch_on_gpu(batch, device, target_size=256):
     def to_gpu(k, dtype=None):
-        stacked = torch.stack([x.to(device, non_blocking=True)
-                              for x in batch[k]])
-        return stacked.to(dtype) if dtype else stacked
+        val = batch[k]
+        if isinstance(val, (list, tuple)):
+            stacked_cpu = torch.stack(val)
+        else:
+            stacked_cpu = val
+        stacked_gpu = stacked_cpu.to(device, non_blocking=True)
+        return stacked_gpu.to(dtype) if dtype else stacked_gpu
 
     video = to_gpu("video")
     depth_raw = to_gpu("depth", torch.float32)
@@ -142,7 +146,8 @@ def process_batch_on_gpu(batch, device, target_size=256):
         max_dyn_len = max(
             [len(d) for d in batch["is_dynamic"] if d is not None], default=0)
         is_dyn_out = torch.stack(
-            [F.pad(x.to(device), (0, max_dyn_len - len(x))) for x in batch["is_dynamic"]])
+            [F.pad(x, (0, max_dyn_len - len(x))) for x in batch["is_dynamic"]]
+        ).to(device, non_blocking=True)
 
     depth_m = torch.clamp(depth_raw, 0.01, 100.0)
     depth_m[depth_raw == 0] = 100.0
@@ -245,12 +250,28 @@ def process_batch_on_gpu(batch, device, target_size=256):
     seg_small = F.interpolate(seg.float().flatten(0, 1).unsqueeze(1), size=(
         target_size // 8, target_size // 8), mode="nearest").squeeze(1).view(B, T, target_size // 8, target_size // 8)
 
+    # 预计算 Ground Truth Tracking 边界框以避免 CPU-GPU 同步瓶颈
+    ymin_f = ymin.float() / target_size
+    ymax_f = ymax.float() / target_size
+    xmin_f = xmin.float() / target_size
+    xmax_f = xmax.float() / target_size
+
+    cx = (xmin_f + xmax_f) * 0.5
+    cy = (ymin_f + ymax_f) * 0.5
+    bw = (xmax_f - xmin_f).clamp(min=1.0 / target_size)
+    bh = (ymax_f - ymin_f).clamp(min=1.0 / target_size)
+
+    # shape: [MAX_INSTANCES, B, T, 4] -> permute to [B, T, MAX_INSTANCES, 4]
+    track_gt_boxes = torch.stack([cx, cy, bw, bh], dim=-1).permute(1, 2, 0, 3)
+    # shape: [MAX_INSTANCES, B, T] -> permute to [B, T, MAX_INSTANCES]
+    track_gt_valid = (true_area > 0).permute(1, 2, 0)
+
     return {
         "video": video_p, "seg_raw": seg, "depth": depth_m, "log_depth": torch.log(depth_m),
         "flow": flow_norm, "cam_pos": cam_pos, "cam_quat": cam_quat, "is_dynamic": is_dyn_out, "sky_mask": sky_mask,
         "seg_small": seg_small, "bboxes_dense": bboxes_dense, "obj_dense": obj_dense, "cls_dense": cls_dense,
+        "track_gt_boxes": track_gt_boxes, "track_gt_valid": track_gt_valid,
     }
-
 
 class CUDAPrefetcher:
     def __init__(self, buffer, device, target_size=256):
