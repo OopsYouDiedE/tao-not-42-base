@@ -64,3 +64,10 @@ This log tracks architectural changes, critical bug fixes, performance optimizat
   6. **Tracklet-Aware 匈牙利匹配追踪** (`utils/losses.py`, `models/tao_core.py`, `utils/visualization.py`, `trainer.py`)：将追踪 Queries 数由 16 扩展为 32 提升 MOVi-E 帧容量。在 `compute_track_loss` 中，在 Chunk 时序维度上持久化维护 GT 和 Query 的 ID 绑定，仅对新出现的 GT 触发匈牙利 LSA 匹配，使得追踪 ID 在时序上高度稳定。
   7. **三阶段课程损失表调度与多指标自诊断** (`utils/losses.py`, `trainer.py`)：实现 0-2000、2000-5000 及 5000+ 三阶段渐进式损失权重曲线。自动诊断模块中新增 EPE 像素光流差与 AbsRel/RMSElog 深度度量并实时输出打印。
 - **验证结果**：经 `python test_mock.py` 完整测试（涵盖所有 5 阶段课程训练和第 6 阶段端到端追踪鲁棒性测试），全阶段闭环无 NaN 完美通过！可视化图像顺利保存，特征梯度反向传播状态检测完美（`Gradient norms OK`）。
+
+### 6. 运行鲁棒性、物理标签有效掩码与训练吞吐补丁（2026-05-27）
+- **导入鲁棒性**：`utils/visualization.py` 将 `torchvision` 导入异常捕获从 `ImportError` 扩展为 `Exception`，避免 torch/torchvision ABI 不匹配时因 `torchvision::nms` 缺失而导致训练器导入失败，并自动回退到项目内置 NMS。
+- **实例元数据安全填充**：`dataset.py` 的 `pad_instances()` 现在会保留完整 batch 维度，并配套 presence mask，避免某个样本缺失 `is_dynamic / velocities / visibility` 时标签与视频错位。
+- **分类污染防护**：`cls_dense` 在当前 class-agnostic 阶段保持全 `-100`，不再写入 MOVi category 占位值；YOLOE vocab 继续冻结且 `cls` loss 继续关闭。
+- **物理属性有效监督**：新增 `initial_dynamic_valid_dense` 与 `current_moving_valid_dense`，`compute_attribute_loss()` 只在有效标签位置计算属性 loss，缺失元数据不会被误当成全静止。
+- **GPU 训练启动与预取**：`train.py` 默认关闭 W&B，CUDA 下启用 `cudnn.benchmark` 与 matmul precision 设置；`CUDAPrefetcher.next()` 递归记录 CUDA stream，保护 list/dict 中 tensor 的异步生命周期。

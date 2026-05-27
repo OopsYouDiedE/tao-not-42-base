@@ -6,7 +6,13 @@ import torch.nn.functional as F
 try:
     import torchvision
     has_torchvision = True
-except ImportError:
+except Exception:
+    # Some environments can import torch but have a torchvision build that is
+    # ABI/operator incompatible with it.  In that case importing torchvision can
+    # raise RuntimeError (for example missing torchvision::nms), not ImportError.
+    # The pure-PyTorch fallback below is sufficient for visualization/NMS and
+    # keeps training imports from failing before the model even starts.
+    torchvision = None
     has_torchvision = False
 
 def nms_fallback(boxes, scores, iou_threshold):

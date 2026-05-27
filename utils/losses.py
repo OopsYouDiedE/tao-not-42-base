@@ -452,6 +452,7 @@ def compute_attribute_loss(preds, targets):
         return torch.tensor(0.0, device=next(iter(preds.values())).device)
 
     loss = torch.tensor(0.0, device=preds["attributes"][0].device)
+    n_terms = 0
 
     for i, pred_attr in enumerate(preds["attributes"]):
         obj = targets["obj_dense"][i]
@@ -462,17 +463,34 @@ def compute_attribute_loss(preds, targets):
 
         init_dyn = targets["initial_dynamic_dense"][i][:, 0]
         cur_mov = targets["current_moving_dense"][i][:, 0]
+        init_valid = targets.get("initial_dynamic_valid_dense", None)
+        cur_valid = targets.get("current_moving_valid_dense", None)
 
-        loss_init = F.binary_cross_entropy_with_logits(
-            pred_attr[:, 0], init_dyn.float(), reduction="none"
-        )
-        loss_cur = F.binary_cross_entropy_with_logits(
-            pred_attr[:, 1], cur_mov.float(), reduction="none"
-        )
-        loss_i = loss_init + loss_cur
-        loss = loss + (loss_i * pos.float()).sum() / pos.float().sum().clamp(min=1.0)
+        if init_valid is not None:
+            init_pos = pos & (init_valid[i][:, 0] > 0.5)
+        else:
+            init_pos = pos
 
-    return loss
+        if init_pos.any():
+            loss_init = F.binary_cross_entropy_with_logits(
+                pred_attr[:, 0], init_dyn.float(), reduction="none"
+            )
+            loss = loss + (loss_init * init_pos.float()).sum() / init_pos.float().sum().clamp(min=1.0)
+            n_terms += 1
+
+        if cur_valid is not None:
+            cur_pos = pos & (cur_valid[i][:, 0] > 0.5)
+        else:
+            cur_pos = pos
+
+        if cur_pos.any():
+            loss_cur = F.binary_cross_entropy_with_logits(
+                pred_attr[:, 1], cur_mov.float(), reduction="none"
+            )
+            loss = loss + (loss_cur * cur_pos.float()).sum() / cur_pos.float().sum().clamp(min=1.0)
+            n_terms += 1
+
+    return loss / max(n_terms, 1)
 
 
 def compute_physics_loss(preds, targets, img_t=None, img_next=None, mode="supervised", step=0):

@@ -146,7 +146,7 @@ class FeaturePredictorHead(nn.Module):
 
 
 class TrackQueryModule(nn.Module):
-    def __init__(self, feat_channels=128, num_queries=16, num_heads=4, nc=80, nm=32):
+    def __init__(self, feat_channels=128, num_queries=32, num_heads=4, nc=80, nm=32):
         super().__init__()
         self.num_queries = num_queries
         self.query_embed = nn.Embedding(num_queries, feat_channels)

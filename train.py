@@ -31,10 +31,22 @@ if __name__ == "__main__":
                         default="tao_not_42_weights.pth")
     parser.add_argument("--yolo_weights", type=str,
                         default="yoloe-26s-seg-pf.pt")
-    parser.add_argument("--use_wandb", action="store_true", default=True)
+    parser.add_argument("--use_wandb", action="store_true", default=False)
     parser.add_argument("--freeze", action="store_true", default=False)
     parser.add_argument("--finetune_after_epoch", type=int, default=0)
+    parser.add_argument("--torch_num_threads", type=int, default=0,
+                        help="CPU 线程上限；0 表示保持 PyTorch 默认值。主要用于本地 CPU smoke test，GPU 训练通常无需设置。")
     args = parser.parse_args()
+
+    if args.torch_num_threads > 0:
+        torch.set_num_threads(args.torch_num_threads)
+
+    if args.device.startswith("cuda") and torch.cuda.is_available():
+        torch.backends.cudnn.benchmark = True
+        try:
+            torch.set_float32_matmul_precision("high")
+        except Exception:
+            pass
 
     if args.use_wandb and wandb:
         wandb.init(project="tao_not_42", config=vars(args))

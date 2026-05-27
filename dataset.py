@@ -177,23 +177,55 @@ def process_batch_on_gpu(batch, device, target_size=256):
         flow_raw = flow_raw.float()
 
     def pad_instances(key):
-        if not batch.get(key) or batch[key][0] is None:
+        """Pad per-instance fields while preserving the batch dimension.
+
+        TFDS can occasionally omit optional instance metadata on individual
+        samples.  The old implementation skipped ``None`` entries, which could
+        silently shrink B and later misalign instance IDs with video frames.
+        """
+        values = batch.get(key)
+        if isinstance(values, torch.Tensor):
+            return values.to(device, non_blocking=True)
+        if not values:
             return None
-        max_len = max([len(d) for d in batch[key] if d is not None], default=0)
+
+        present = [x for x in values if x is not None]
+        if not present:
+            return None
+
+        max_len = max(len(x) for x in present)
+        exemplar = present[0]
         padded = []
-        for x in batch[key]:
+        for x in values:
             if x is None:
+                fill_shape = (max_len, *exemplar.shape[1:])
+                padded.append(torch.zeros(fill_shape, dtype=exemplar.dtype))
                 continue
+
             pad_dims = []
             for _ in range(x.dim() - 1):
                 pad_dims.extend([0, 0])
             pad_dims.extend([0, max_len - len(x)])
             padded.append(F.pad(x, tuple(pad_dims)))
+
         return torch.stack(padded).to(device, non_blocking=True)
 
+    def instance_presence(key):
+        values = batch.get(key)
+        if isinstance(values, torch.Tensor):
+            return torch.ones(values.shape[0], device=device, dtype=torch.bool)
+        if not values:
+            return None
+        return torch.tensor([x is not None for x in values], device=device, dtype=torch.bool)
+
     is_dyn_out = pad_instances("is_dynamic")
-    category_out = pad_instances("category")
+    is_dyn_present = instance_presence("is_dynamic")
     velocities_out = pad_instances("velocities")
+    velocities_present = instance_presence("velocities")
+    angular_velocities_out = pad_instances("angular_velocities")
+    angular_velocities_present = instance_presence("angular_velocities")
+    visibility_out = pad_instances("visibility")
+    visibility_present = instance_presence("visibility")
 
     depth_m = torch.clamp(depth_raw, 0.01, 100.0)
     depth_m[depth_raw == 0] = 100.0
@@ -239,7 +271,9 @@ def process_batch_on_gpu(batch, device, target_size=256):
 
     bboxes_dense, obj_dense, cls_dense = [], [], []
     initial_dynamic_dense = []
+    initial_dynamic_valid_dense = []
     current_moving_dense = []
+    current_moving_valid_dense = []
     MAX_INSTANCES = 24
 
     # 1. 准备展平的一维网格坐标
@@ -279,7 +313,9 @@ def process_batch_on_gpu(batch, device, target_size=256):
         o_d = torch.zeros(B, T, 1, H_f, W_f, device=device)
         c_d = torch.full((B, T, 1, H_f, W_f), fill_value=-100, dtype=torch.long, device=device)
         dyn_d = torch.zeros(B, T, 1, H_f, W_f, device=device)
+        dyn_valid_d = torch.zeros(B, T, 1, H_f, W_f, device=device)
         cur_mov_d = torch.zeros(B, T, 1, H_f, W_f, device=device)
+        cur_mov_valid_d = torch.zeros(B, T, 1, H_f, W_f, device=device)
 
         if stride == 8:
             s_mask = (box_area < 32**2)
@@ -302,30 +338,57 @@ def process_batch_on_gpu(batch, device, target_size=256):
                 ((xmin[n_idx, b_idx, t_idx] + xmax[n_idx, b_idx, t_idx]) / 2 / stride).long(), 0, W_f - 1)
 
             o_d[b_idx, t_idx, 0, cy, cx] = 1.0
-            if category_out is not None and category_out.numel() > 0:
-                cat_val = torch.full_like(n_idx, -100, dtype=torch.long, device=device)
-                valid_cat = n_idx.long() < category_out.shape[1]
-                if valid_cat.any():
-                    cat_val[valid_cat] = category_out[b_idx[valid_cat], n_idx[valid_cat].long()].long()
-                c_d[b_idx, t_idx, 0, cy, cx] = cat_val
 
             dyn_val = torch.zeros_like(n_idx, dtype=torch.float32, device=device)
             if is_dyn_out is not None and is_dyn_out.numel() > 0:
                 valid_dyn = n_idx.long() < is_dyn_out.shape[1]
+                if is_dyn_present is not None:
+                    valid_dyn = valid_dyn & is_dyn_present[b_idx]
                 if valid_dyn.any():
                     dyn_val[valid_dyn] = is_dyn_out[b_idx[valid_dyn], n_idx[valid_dyn].long()].float()
                 dyn_d[b_idx, t_idx, 0, cy, cx] = dyn_val
+                dyn_valid_d[b_idx[valid_dyn], t_idx[valid_dyn], 0, cy[valid_dyn], cx[valid_dyn]] = 1.0
 
-            if velocities_out is not None and velocities_out.numel() > 0:
-                cur_mov_val = torch.zeros_like(n_idx, dtype=torch.float32, device=device)
-                valid_vel = n_idx.long() < velocities_out.shape[1]
+            cur_mov_val = torch.zeros_like(n_idx, dtype=torch.float32, device=device)
+            cur_mov_valid_val = torch.zeros_like(n_idx, dtype=torch.float32, device=device)
+            moving_flag = torch.zeros_like(n_idx, dtype=torch.bool, device=device)
+            motion_defined = torch.zeros_like(n_idx, dtype=torch.bool, device=device)
+
+            if velocities_out is not None and velocities_out.numel() > 0 and velocities_out.dim() >= 4:
+                valid_vel = (n_idx.long() < velocities_out.shape[1]) & (t_idx.long() < velocities_out.shape[2])
+                if velocities_present is not None:
+                    valid_vel = valid_vel & velocities_present[b_idx]
                 if valid_vel.any():
                     v = velocities_out[b_idx[valid_vel], n_idx[valid_vel].long(), t_idx[valid_vel]]
-                    v_norm = torch.linalg.vector_norm(v, dim=-1)
-                    cur_mov_val[valid_vel] = (v_norm > 1e-3).float()
+                    moving_flag[valid_vel] |= torch.linalg.vector_norm(v, dim=-1) > 0.03
+                    motion_defined[valid_vel] = True
+
+            if angular_velocities_out is not None and angular_velocities_out.numel() > 0 and angular_velocities_out.dim() >= 4:
+                valid_ang = (n_idx.long() < angular_velocities_out.shape[1]) & (t_idx.long() < angular_velocities_out.shape[2])
+                if angular_velocities_present is not None:
+                    valid_ang = valid_ang & angular_velocities_present[b_idx]
+                if valid_ang.any():
+                    av = angular_velocities_out[b_idx[valid_ang], n_idx[valid_ang].long(), t_idx[valid_ang]]
+                    moving_flag[valid_ang] |= torch.linalg.vector_norm(av, dim=-1) > 0.03
+                    motion_defined[valid_ang] = True
+
+            visible_flag = torch.ones_like(n_idx, dtype=torch.bool, device=device)
+            if visibility_out is not None and visibility_out.numel() > 0 and visibility_out.dim() >= 3:
+                valid_vis = (n_idx.long() < visibility_out.shape[1]) & (t_idx.long() < visibility_out.shape[2])
+                if visibility_present is not None:
+                    valid_vis = valid_vis & visibility_present[b_idx]
+                if valid_vis.any():
+                    vis = visibility_out[b_idx[valid_vis], n_idx[valid_vis].long(), t_idx[valid_vis]].float()
+                    # MOVi visibility is commonly a visible-pixel count.  A low
+                    # threshold avoids supervising motion state for nearly hidden
+                    # objects, while segmentation positives still provide boxes/masks.
+                    visible_flag[valid_vis] = vis > 10.0
+
+            if motion_defined.any():
+                cur_mov_val[motion_defined] = (moving_flag[motion_defined] & visible_flag[motion_defined]).float()
+                cur_mov_valid_val[motion_defined] = 1.0
                 cur_mov_d[b_idx, t_idx, 0, cy, cx] = cur_mov_val
-            else:
-                cur_mov_d[b_idx, t_idx, 0, cy, cx] = dyn_val
+                cur_mov_valid_d[b_idx, t_idx, 0, cy, cx] = cur_mov_valid_val
 
             gx, gy = cx.float() * stride + stride / 2.0, cy.float() * stride + stride / 2.0
 
@@ -345,7 +408,9 @@ def process_batch_on_gpu(batch, device, target_size=256):
         obj_dense.append(o_d)
         cls_dense.append(c_d)
         initial_dynamic_dense.append(dyn_d)
+        initial_dynamic_valid_dense.append(dyn_valid_d)
         current_moving_dense.append(cur_mov_d)
+        current_moving_valid_dense.append(cur_mov_valid_d)
 
     seg_small = F.interpolate(seg.float().flatten(0, 1).unsqueeze(1), size=(
         target_size // 8, target_size // 8), mode="nearest").squeeze(1).view(B, T, target_size // 8, target_size // 8)
@@ -386,7 +451,10 @@ def process_batch_on_gpu(batch, device, target_size=256):
         "video": video_p, "seg_raw": seg, "depth": depth_m, "log_depth": torch.log(depth_m),
         "flow": flow_norm, "cam_pos": cam_pos, "cam_quat": cam_quat, "is_dynamic": is_dyn_out, "sky_mask": sky_mask,
         "seg_small": seg_small, "bboxes_dense": bboxes_dense, "obj_dense": obj_dense, "cls_dense": cls_dense,
-        "initial_dynamic_dense": initial_dynamic_dense, "current_moving_dense": current_moving_dense,
+        "initial_dynamic_dense": initial_dynamic_dense,
+        "initial_dynamic_valid_dense": initial_dynamic_valid_dense,
+        "current_moving_dense": current_moving_dense,
+        "current_moving_valid_dense": current_moving_valid_dense,
         "track_gt_boxes": track_gt_boxes, "track_gt_valid": track_gt_valid,
         "camera_focal_length": camera_focal_length,
         "camera_sensor_width": camera_sensor_width,
@@ -425,9 +493,18 @@ class CUDAPrefetcher:
         batch = self.queue.get()
         if self.stream:
             torch.cuda.current_stream().wait_stream(self.stream)
-            for v in batch.values():
-                if isinstance(v, torch.Tensor):
-                    v.record_stream(torch.cuda.current_stream())
+
+            def record(obj):
+                if isinstance(obj, torch.Tensor):
+                    obj.record_stream(torch.cuda.current_stream())
+                elif isinstance(obj, (list, tuple)):
+                    for x in obj:
+                        record(x)
+                elif isinstance(obj, dict):
+                    for x in obj.values():
+                        record(x)
+
+            record(batch)
         return batch
 
 # =====================================================================
