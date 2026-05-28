@@ -264,7 +264,9 @@ class CorrectYOLOESegment26(nn.Module):
         self.one2one_cv5 = nn.ModuleList(nn.Sequential(Conv(x, 32, 3), Conv(32, 32, 3), nn.Conv2d(32, 32, 1)) for x in ch)
         
         self.lrpc = nn.ModuleList([
-            LRPCHead(nn.Linear(c3, 4585), nn.Conv2d(c3, 1, 1), nn.Conv2d(32, 4, 1)) for _ in range(3)
+            LRPCHead(nn.Linear(c3, 4585), nn.Conv2d(c3, 1, 1), nn.Conv2d(32, 4, 1)), # Scale 0 (P3)
+            LRPCHead(nn.Linear(c3, 4585), nn.Conv2d(c3, 1, 1), nn.Conv2d(32, 4, 1)), # Scale 1 (P4)
+            LRPCHead(nn.Conv2d(c3, 4585, 1), nn.Conv2d(c3, 1, 1), nn.Conv2d(32, 4, 1)) # Scale 2 (P5) - 官方此处为 Conv2d
         ])
 
     def forward(self, x):
