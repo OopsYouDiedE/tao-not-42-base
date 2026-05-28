@@ -26,8 +26,8 @@ if __name__ == "__main__":
     parser.add_argument("--unfreeze_step_1", type=int, default=1000)
     parser.add_argument("--unfreeze_step_2", type=int, default=2000)
     parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--device", type=str,
-                        default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--device", type=str, default="cuda",
+                        help="训练使用的 GPU 设备类型。生产环境必须为 CUDA。")
     parser.add_argument("--checkpoint", type=str,
                         default="tao_not_42_weights.pth")
     parser.add_argument("--yolo_weights", type=str,
@@ -46,12 +46,10 @@ if __name__ == "__main__":
                         help="等待 TFDS/预取 batch 的最长秒数；超时会报出明确错误而不是静默卡住。")
     parser.add_argument("--freeze", action="store_true", default=False)
     parser.add_argument("--finetune_after_epoch", type=int, default=0)
-    parser.add_argument("--torch_num_threads", type=int, default=0,
-                        help="CPU 线程上限；0 表示保持 PyTorch 默认值。主要用于本地 CPU smoke test，GPU 训练通常无需设置。")
     args = parser.parse_args()
 
-    if args.torch_num_threads > 0:
-        torch.set_num_threads(args.torch_num_threads)
+    if not torch.cuda.is_available():
+        raise RuntimeError("严格要求 CUDA 环境！核心视觉组件无法在 CPU 上运行。")
 
     if args.device.startswith("cuda") and torch.cuda.is_available():
         torch.backends.cudnn.benchmark = True
@@ -75,9 +73,9 @@ if __name__ == "__main__":
                 anonymous="allow",
                 settings=settings,
             )
-            print(f"[W&B] tracking enabled: project={args.wandb_project}, mode={args.wandb_mode}")
+            print(f"[W&B] 跟踪已启用：项目={args.wandb_project}, 模式={args.wandb_mode}")
         except Exception as e:
-            print(f"[W&B] init failed, continuing without tracking: {type(e).__name__}: {e}")
+            print(f"[W&B] 初始化失败，在没有跟踪的情况下继续：{type(e).__name__}: {e}")
             wandb = None
     else:
         wandb = None

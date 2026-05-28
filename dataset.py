@@ -30,27 +30,18 @@ def decode_uint16_range(encoded, value_range):
 
 
 def maybe_pin_memory(tensor):
-    """Pin tensors only when CUDA is available.
-
-    PyTorch raises on CPU-only builds/environments when calling pin_memory().
-    Keeping this helper here lets the same code run in Colab GPU training and
-    in local/CI smoke tests without changing the data pipeline logic.
-    """
-    if isinstance(tensor, torch.Tensor) and torch.cuda.is_available():
-        try:
-            return tensor.pin_memory()
-        except RuntimeError:
-            return tensor
+    """将张量固定在分页锁定内存中，以便进行高速 CUDA PCIe 传输。"""
+    if isinstance(tensor, torch.Tensor):
+        return tensor.pin_memory()
     return tensor
 
 
 def numpy_to_pinned_tensor(value):
-    """Convert numpy/scalar values to tensors and pin them when useful.
+    """将 numpy/标量值转换为张量，并在有用时固定它们。
 
-    TFDS nested features such as events/collisions can arrive as dicts rather
-    than arrays.  Those are intentionally not converted here because they are
-    not consumed by the current training targets and trying to torch.from_numpy
-    a dict was the crash reported from Colab.
+    TFDS 嵌套特征（如事件/碰撞）可能以字典而非数组的形式到达。
+    这些在这里有意不进行转换，因为它们不被当前的训练目标消耗，
+    并且尝试对字典执行 torch.from_numpy 是从 Colab 报告的崩溃原因。
     """
     if value is None or isinstance(value, dict):
         return None
@@ -100,7 +91,7 @@ class AsyncDataBuffer:
             with self.lock:
                 self.error = e
                 self.has_data.notify_all()
-            print(f"[DataBuffer] fetch thread failed: {type(e).__name__}: {e}", flush=True)
+            print(f"[DataBuffer] 获取线程失败: {type(e).__name__}: {e}", flush=True)
 
     def _fetch_loop_impl(self):
         if tfds is None or tf is None:
@@ -125,7 +116,7 @@ class AsyncDataBuffer:
                 time.sleep(0.01)
             return
 
-        print(f"[DataBuffer] Loading TFDS movi_e split='{self.split}' from gs://kubric-public/tfds ...", flush=True)
+        print(f"[DataBuffer] 正在从 gs://kubric-public/tfds 加载 TFDS movi_e split='{self.split}' ...", flush=True)
         ds = tfds.load("movi_e", data_dir="gs://kubric-public/tfds", split=self.split,
                        read_config=tfds.ReadConfig(interleave_cycle_length=16)).repeat()
 
@@ -144,15 +135,15 @@ class AsyncDataBuffer:
                 **({"velocities": insts["velocities"]} if "velocities" in insts else {}),
                 **({"angular_velocities": insts["angular_velocities"]} if "angular_velocities" in insts else {}),
                 **({"visibility": insts["visibility"]} if "visibility" in insts else {}),
-                # Do not materialize events/collisions in the hot training path.
-                # TFDS returns this feature as a nested dict, not an ndarray, and
-                # it is not consumed by the current loss.  Loading it here caused
-                # the prefetch thread to crash before training began.
+                # 不要在热训练路径中实例化事件/碰撞。
+                # TFDS 将此特征作为嵌套字典返回，而不是 ndarray，并且
+                # 当前的损失函数不消耗它。在这里加载它导致
+                # 预取线程在训练开始前崩溃。
             }
 
         ds = ds.map(map_fn, num_parallel_calls=tf.data.AUTOTUNE).prefetch(
             tf.data.AUTOTUNE)
-        print("[DataBuffer] TFDS pipeline ready; filling async buffer ...", flush=True)
+        print("[DataBuffer] TFDS 流水线就绪；正在填充异步缓冲区 ...", flush=True)
 
         for item in tfds.as_numpy(ds):
             if self.stop_event.is_set():
@@ -183,7 +174,7 @@ class AsyncDataBuffer:
                 self.buffer.append(p_item)
                 self.num_fetched += 1
                 if self.num_fetched == 1 or self.num_fetched % 16 == 0:
-                    print(f"[DataBuffer] buffered {min(len(self.buffer), self.max_buffer_size)}/{self.batch_size} samples; total fetched={self.num_fetched}", flush=True)
+                    print(f"[DataBuffer] 已缓冲 {min(len(self.buffer), self.max_buffer_size)}/{self.batch_size} 个样本；总计已获取={self.num_fetched}", flush=True)
                 self.has_data.notify_all()
 
     def get_batch(self):
@@ -191,17 +182,17 @@ class AsyncDataBuffer:
         with self.lock:
             while len(self.buffer) < self.batch_size:
                 if self.error is not None:
-                    raise RuntimeError("AsyncDataBuffer fetch thread failed") from self.error
+                    raise RuntimeError("AsyncDataBuffer 获取线程失败") from self.error
 
                 now = time.time()
                 if now - self._last_wait_log >= 10.0:
-                    print(f"[DataBuffer] waiting for samples: {len(self.buffer)}/{self.batch_size}", flush=True)
+                    print(f"[DataBuffer] 正在等待样本: {len(self.buffer)}/{self.batch_size}", flush=True)
                     self._last_wait_log = now
 
                 if now - start_wait > self.wait_timeout_sec:
                     raise TimeoutError(
-                        f"Timed out waiting for data buffer after {self.wait_timeout_sec}s "
-                        f"({len(self.buffer)}/{self.batch_size} samples ready)."
+                        f"等待数据缓冲区 {self.wait_timeout_sec} 秒后超时 "
+                        f"({len(self.buffer)}/{self.batch_size} 个样本就绪)。"
                     )
 
                 self.has_data.wait(timeout=2.0)
@@ -253,11 +244,10 @@ def process_batch_on_gpu(batch, device, target_size=256):
         flow_raw = flow_raw.float()
 
     def pad_instances(key):
-        """Pad per-instance fields while preserving the batch dimension.
+        """填充每个实例的字段，同时保留批次维度。
 
-        TFDS can occasionally omit optional instance metadata on individual
-        samples.  The old implementation skipped ``None`` entries, which could
-        silently shrink B and later misalign instance IDs with video frames.
+        TFDS 有时会忽略单个样本上的可选实例元数据。
+        旧的实现跳过了 ``None`` 条目，这可能会在无意中缩小 B 并随后使实例 ID 与视频帧错位。
         """
         values = batch.get(key)
         if isinstance(values, torch.Tensor):
@@ -457,9 +447,9 @@ def process_batch_on_gpu(batch, device, target_size=256):
                     valid_vis = valid_vis & visibility_present[b_idx]
                 if valid_vis.any():
                     vis = visibility_out[b_idx[valid_vis], n_idx[valid_vis].long(), t_idx[valid_vis]].float()
-                    # MOVi visibility is commonly a visible-pixel count.  A low
-                    # threshold avoids supervising motion state for nearly hidden
-                    # objects, while segmentation positives still provide boxes/masks.
+                    # MOVi 可见性通常是可见像素计数。
+                    # 低阈值可避免对几乎隐藏的对象监督运动状态，
+                    # 而分割正例仍提供边界框/掩码。
                     visible_flag[valid_vis] = vis > 10.0
 
             if motion_defined.any():
@@ -504,9 +494,9 @@ def process_batch_on_gpu(batch, device, target_size=256):
     bw = (xmax_f - xmin_f).clamp(min=1.0 / target_size)
     bh = (ymax_f - ymin_f).clamp(min=1.0 / target_size)
 
-    # shape: [MAX_INSTANCES, B, T, 4] -> permute to [B, T, MAX_INSTANCES, 4]
+    # 形状: [MAX_INSTANCES, B, T, 4] -> 置换为 [B, T, MAX_INSTANCES, 4]
     track_gt_boxes = torch.stack([cx, cy, bw, bh], dim=-1).permute(1, 2, 0, 3)
-    # shape: [MAX_INSTANCES, B, T] -> permute to [B, T, MAX_INSTANCES]
+    # 形状: [MAX_INSTANCES, B, T] -> 置换为 [B, T, MAX_INSTANCES]
     track_gt_valid = (true_area > 0).permute(1, 2, 0)
 
     if "camera_focal_length" in batch and batch["camera_focal_length"] is not None and len(batch["camera_focal_length"]) > 0:
@@ -548,8 +538,7 @@ class CUDAPrefetcher:
         self.error = None
         self._last_wait_log = 0.0
         self.stop_event = threading.Event()
-        self.stream = torch.cuda.Stream(
-            device=device) if device.type == "cuda" else None
+        self.stream = torch.cuda.Stream(device=device)
         self.thread = threading.Thread(target=self._worker, daemon=True)
         self.thread.start()
         atexit.register(self.stop)
@@ -567,11 +556,7 @@ class CUDAPrefetcher:
                 time.sleep(1)
                 continue
             try:
-                if self.stream:
-                    with torch.cuda.stream(self.stream):
-                        batch_gpu = process_batch_on_gpu(
-                            batch, self.device, self.target_size)
-                else:
+                with torch.cuda.stream(self.stream):
                     batch_gpu = process_batch_on_gpu(
                         batch, self.device, self.target_size)
                 while not self.stop_event.is_set():
@@ -586,44 +571,43 @@ class CUDAPrefetcher:
                     self.queue.put_nowait(e)
                 except queue.Full:
                     pass
-                print(f"[Prefetcher] worker failed: {type(e).__name__}: {e}", flush=True)
+                print(f"[Prefetcher] 工作线程失败: {type(e).__name__}: {e}", flush=True)
                 return
 
     def next(self):
         start_wait = time.time()
         while True:
             if self.error is not None and self.queue.empty():
-                raise RuntimeError("CUDAPrefetcher worker failed") from self.error
+                raise RuntimeError("CUDAPrefetcher 工作线程失败") from self.error
             try:
                 batch = self.queue.get(timeout=2.0)
                 break
             except queue.Empty:
                 now = time.time()
                 if now - self._last_wait_log >= 10.0:
-                    print("[Prefetcher] waiting for a processed GPU batch ...", flush=True)
+                    print("[Prefetcher] 正在等待处理好的 GPU 批次 ...", flush=True)
                     self._last_wait_log = now
                 if now - start_wait > self.wait_timeout_sec:
                     raise TimeoutError(
-                        f"Timed out waiting for a processed batch after {self.wait_timeout_sec}s."
+                        f"等待处理好的批次 {self.wait_timeout_sec} 秒后超时。"
                     )
 
         if isinstance(batch, Exception):
-            raise RuntimeError("CUDAPrefetcher worker failed") from batch
+            raise RuntimeError("CUDAPrefetcher 工作线程失败") from batch
 
-        if self.stream:
-            torch.cuda.current_stream().wait_stream(self.stream)
+        torch.cuda.current_stream().wait_stream(self.stream)
 
-            def record(obj):
-                if isinstance(obj, torch.Tensor):
-                    obj.record_stream(torch.cuda.current_stream())
-                elif isinstance(obj, (list, tuple)):
-                    for x in obj:
-                        record(x)
-                elif isinstance(obj, dict):
-                    for x in obj.values():
-                        record(x)
+        def record(obj):
+            if isinstance(obj, torch.Tensor):
+                obj.record_stream(torch.cuda.current_stream())
+            elif isinstance(obj, (list, tuple)):
+                for x in obj:
+                    record(x)
+            elif isinstance(obj, dict):
+                for x in obj.values():
+                    record(x)
 
-            record(batch)
+        record(batch)
         return batch
 
 # =====================================================================

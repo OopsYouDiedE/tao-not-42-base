@@ -95,9 +95,9 @@ def inverse_warp(img_next, depth, pose, K, K_inv, depth_is_distance=True):
 
     points_3d = rays * z_scale
 
-    # Transform to next frame
+    # 变换到下一帧
     points_next = torch.bmm(pose_rot, points_3d) + pose_trans
-    # Project back to 2D
+    # 投影回 2D
     pixels_next = torch.bmm(K, points_next)
 
     depth_next = torch.clamp(pixels_next[:, 2:3, :], min=0.01).float()

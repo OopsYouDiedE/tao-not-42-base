@@ -3,52 +3,9 @@ import cv2
 import numpy as np
 import torch
 import torch.nn.functional as F
-try:
-    import torchvision
-    has_torchvision = True
-except Exception:
-    # Some environments can import torch but have a torchvision build that is
-    # ABI/operator incompatible with it.  In that case importing torchvision can
-    # raise RuntimeError (for example missing torchvision::nms), not ImportError.
-    # The pure-PyTorch fallback below is sufficient for visualization/NMS and
-    # keeps training imports from failing before the model even starts.
-    torchvision = None
-    has_torchvision = False
+import torchvision
 
-def nms_fallback(boxes, scores, iou_threshold):
-    # Sort boxes by scores in descending order
-    if boxes.numel() == 0:
-        return torch.empty((0,), dtype=torch.long, device=boxes.device)
-    
-    order = scores.argsort(descending=True)
-    keep = []
-    while order.numel() > 0:
-        if order.numel() == 1:
-            keep.append(order[0].item())
-            break
-        i = order[0].item()
-        keep.append(i)
-        
-        xx1 = boxes[order[1:], 0].clamp(min=boxes[i, 0])
-        yy1 = boxes[order[1:], 1].clamp(min=boxes[i, 1])
-        xx2 = boxes[order[1:], 2].clamp(max=boxes[i, 2])
-        yy2 = boxes[order[1:], 3].clamp(max=boxes[i, 3])
-        
-        w = (xx2 - xx1).clamp(min=0)
-        h = (yy2 - yy1).clamp(min=0)
-        inter = w * h
-        
-        area_i = (boxes[i, 2] - boxes[i, 0]) * (boxes[i, 3] - boxes[i, 1])
-        area_order = (boxes[order[1:], 2] - boxes[order[1:], 0]) * (boxes[order[1:], 3] - boxes[order[1:], 1])
-        
-        iou = inter / (area_i + area_order - inter + 1e-6)
-        inds = (iou <= iou_threshold).nonzero(as_tuple=False).squeeze()
-        if inds.dim() == 0:
-            inds = inds.unsqueeze(0)
-        if inds.numel() == 0:
-            break
-        order = order[inds + 1]
-    return torch.tensor(keep, dtype=torch.long, device=boxes.device)
+
 
 # =====================================================================
 
@@ -206,7 +163,7 @@ def depth_to_color(depth_map, d_min=None, d_max=None):
 
 
 
-def extract_instances(preds, score_thresh=0.3, nms_thresh=0.5, max_det=20):
+def extract_instances(preds, score_thresh=0.3, nms_thresh=0.5, max_det=20, with_nms=True):
     obj_list = preds.get("objectness", [])
     box_list = preds.get("boxes", [])
 
@@ -221,7 +178,7 @@ def extract_instances(preds, score_thresh=0.3, nms_thresh=0.5, max_det=20):
         coef_list = preds.get("mask_coefficients", [])
 
     B = obj_list[0].shape[0] if obj_list else 0
-    device = obj_list[0].device if obj_list else torch.device("cpu")
+    device = obj_list[0].device if obj_list else torch.device("cuda")
     H_img, W_img = (obj_list[0].shape[2] * 8,
                     obj_list[0].shape[3] * 8) if obj_list else (0, 0)
     results = []
@@ -284,11 +241,13 @@ def extract_instances(preds, score_thresh=0.3, nms_thresh=0.5, max_det=20):
         all_boxes = torch.cat(all_boxes, dim=0)
         all_classes = torch.cat(all_classes, dim=0)
 
-        boxes_scaled = all_boxes * torch.tensor([W_img, H_img, W_img, H_img], device=device)
-        if has_torchvision:
+        if with_nms:
+            boxes_scaled = all_boxes * torch.tensor([W_img, H_img, W_img, H_img], device=device)
             keep = torchvision.ops.nms(boxes_scaled, all_scores, nms_thresh)[:max_det]
         else:
-            keep = nms_fallback(boxes_scaled, all_scores, nms_thresh)[:max_det]
+            # 端到端检测，无需 NMS，直接取 Top-K
+            num_keep = min(max_det, all_scores.shape[0])
+            _, keep = torch.topk(all_scores, num_keep)
 
         protos = preds.get("mask_prototypes")
         protos = protos[0] if isinstance(protos, list) else protos

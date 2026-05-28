@@ -9,8 +9,10 @@ from models.custom_heads import *
 
 
 class MyYOLOE(nn.Module):
+    """自定义 YOLOE 网络，包含骨干网络和预测头。"""
     def __init__(self):
         super().__init__()
+        # 定义模型层列表
         self.model = nn.ModuleList([
             Conv(3, 32, 3, 2),  # 0
             Conv(32, 64, 3, 2),  # 1
@@ -81,14 +83,17 @@ class TAONot42VisionModel(nn.Module):
         return self.segmenter(peripheral)
 
     def forward_physics(self, f1, f2, p3_fused, p4, p5, dt, step, get_loss_weights_fn=None, original_shape=None, tgts=None):
+        """物理感知的前向传播，处理时空特征融合和几何预测。"""
         B, T = f1.shape[:2]
         h, w = original_shape if original_shape else (
             f1.shape[3] * 2, f1.shape[4] * 2)
 
+        # 时间步处理
         t0 = torch.rand(B, 1, device=f1.device) * 1000.0
         t_abs = t0 + torch.cumsum(dt, dim=1)
 
         def update_st(block, p_feat):
+            """应用时空 Mamba 模块进行特征增强。"""
             B_s, T_s, C_s, H_s, W_s = p_feat.shape
             pooled = F.avg_pool2d(p_feat.flatten(0, 1), 2, 2).view(
                 B_s, T_s, C_s, H_s//2, W_s//2)
@@ -97,10 +102,12 @@ class TAONot42VisionModel(nn.Module):
                 H_s, W_s), mode="bilinear", align_corners=False).view(B_s, T_s, C_s, H_s, W_s)
             return st_out, p_feat + st_out_up
 
+        # 更新各尺度的时空特征
         next_st, spatiotemporal_p3 = update_st(self.st_block, p3_fused)
         next_st_p4, spatiotemporal_p4 = update_st(self.st_block_p4, p4)
         next_st_p5, spatiotemporal_p5 = update_st(self.st_block_p5, p5)
 
+        # 运行 YOLOE 分割预测头
         preds = self.segmenter.model[-1]([
             spatiotemporal_p3.flatten(0, 1),
             spatiotemporal_p4.flatten(0, 1),
@@ -112,7 +119,7 @@ class TAONot42VisionModel(nn.Module):
 
         ego_pose = self.pose_head(spatiotemporal_p3.flatten(0, 1))
 
-        # f1: [B, T, 32, H, W] -> [B, 32, T, H, W] -> apply 3D conv -> back to [B, T, 32, H, W]
+        # f1: [B, T, 32, H, W] -> [B, 32, T, H, W] -> 应用 3D 卷积 -> 返回 [B, T, 32, H, W]
         f1_t = self.f1_temporal(f1.permute(
             0, 2, 1, 3, 4)).permute(0, 2, 1, 3, 4)
         f2_t = self.f2_temporal(f2.permute(

@@ -1,10 +1,10 @@
-# Agent Activity & Architectural Decision Log (AGENTS.md)
+# 智能体活动与架构决策日志 (AGENTS.md)
 
-This log tracks architectural changes, critical bug fixes, performance optimizations, and debugging isolation procedures implemented by agentic assistants.
+本日志记录了智能体助手实施的架构更改、关键错误修复、性能优化以及调试隔离程序。
 
 ---
 
-## Assistant Constraints & Guidelines
+## 助手约束与指南
 
 > [!IMPORTANT]
 > **开发与文档规范限制**
@@ -12,31 +12,35 @@ This log tracks architectural changes, critical bug fixes, performance optimizat
 > 2. **Mock 测试隔离原则**：
 >    - 核心代码库（如 `dataset.py`、`trainer.py`、`train.py`）必须保持纯净且适合生产环境训练（如 Google Colab / 云端 TFDS），不能掺杂任何本地 Mock 或调试用临时数据加载代码。
 >    - 本地调试测试脚本 `test_mock.py` 应该是**直接 `import train.py` (或对应的运行入口)**，然后再按需在运行时动态替换（Monkey Patch）其中的模块，而不是在生产代码中编写 Mock 逻辑。
+> 3. **禁止非 CUDA 环境测试与移除 CPU 兼容**：
+>    - 禁止在没有 CUDA 的环境中运行测试或核心模型。
+>    - 核心生产代码库（如 `dataset.py`、`trainer.py`、`train.py`、`models/custom_heads.py`、`utils/losses.py`、`utils/visualization.py`）必须彻底移除任何针对 CPU 运行或环境缺包（如未安装 `mamba_ssm`、`scipy` 或 `torchvision`）的兼容与降级（fallback）处理逻辑，导入失败必须直接报错。
+>    - 所有的 CPU 兼容和降级模拟逻辑**必须且仅允许**保存在独立的 `tests/` 目录下的 Mock 代码中。
 
 ---
 
-## Log Entry: 2026-05-28
+## 日志条目：2026-05-28
 
-### 1. GPU Efficiency Optimization (Utilization -> 90%+)
-- **Problem**: GPU utilization during training was limited to ~80% due to major bottlenecks in data loading, PCIe transfers, and massive CPU-GPU synchronizations inside the tracking loss computation block.
-- **Root Cause & Fixes**:
-  1. **Tracking Loss De-synchronization** (`utils/losses.py`):
-     - **Removed** redundant nested loops calling `.unique().tolist()`, `m.nonzero()`, and `.min()` / `.max()` on GPU tensors, which triggered 2400+ host-device roundtrips per batch.
-     - **Precalculated** ground truth tracking bounding boxes (`track_gt_boxes` and `track_gt_valid`) on the GPU within `process_batch_on_gpu`.
-     - **Batched Cost Computation**: Flattened sequences to compute cost matrix in a single `torch.cdist` call on GPU, resulting in exactly **one** `.cpu().numpy()` transfer to CPU per step.
-  2. **Pipeline PCIe Batching** (`dataset.py`):
-     - **Stacked** CPU-pinned tensors on CPU first before transferring to GPU via a single `to(device, non_blocking=True)` call.
-  3. **Main Training Loop Pipe-lining** (`trainer.py`):
-     - **Removed** blocking `loss.item()` calls inside the training steps, accumulating float losses as detached GPU tensors and converting to CPU scalar only once per epoch or log step (every 10 steps).
-  4. **Robust KeyError Resolution** (`trainer.py`):
-     - Changed direct lookup `l_dict[k]` to safe default access `l_dict.get(k, 0.0)` for all spatiotemporal loss components, ensuring that whenever a loss component (such as `'Photo'`) is inactive, the loop safely cascades to `0.0` without breaking the training run.
+### 1. GPU 效率优化 (利用率 -> 90%+)
+- **问题**：训练期间的 GPU 利用率被限制在约 80%，主要原因是数据加载、PCIe 传输以及追踪损失计算块内部的大量 CPU-GPU 同步造成了严重瓶颈。
+- **根本原因与修复方案**：
+  1. **追踪损失去同步化** (`utils/losses.py`)：
+     - **移除了**在 GPU 张量上调用 `.unique().tolist()`、`m.nonzero()` 和 `.min()` / `.max()` 的冗余嵌套循环，这些调用每批次会触发 2400 多次主机-设备往返。
+     - **预先计算**：在 `process_batch_on_gpu` 内部的 GPU 上预先计算地面真值追踪边界框（`track_gt_boxes` 和 `track_gt_valid`）。
+     - **批量代价计算**：展平序列，通过一次 GPU 上的 `torch.cdist` 调用计算代价矩阵，从而使每步仅需 **一次** `.cpu().numpy()` 传输至 CPU。
+  2. **流水线 PCIe 批处理** (`dataset.py`)：
+     - 在通过单次 `to(device, non_blocking=True)` 调用传输至 GPU 之前，先在 CPU 上**堆叠**固定内存（pinned memory）张量。
+  3. **主训练循环流水线化** (`trainer.py`)：
+     - **移除了**训练步骤内部的阻塞性 `loss.item()` 调用，将浮点损失累积为分离的 GPU 张量，并仅在每个 epoch 或日志步骤（每 10 步）转换一次为 CPU 标量。
+  4. **健壮的 KeyError 解析** (`trainer.py`)：
+     - 将所有时空损失组件的直接查找 `l_dict[k]` 更改为安全的默认访问 `l_dict.get(k, 0.0)`，确保每当损失组件（如 `'Photo'`）处于非活动状态时，循环能安全地回落到 `0.0` 而不会中断训练运行。
 
-### 2. Isolation of Mock & Debugging Utilities
-- **Decision**: To keep the core codebase (`dataset.py`, `trainer.py`, `train.py`) strictly production-ready and free of local development or mock file dependencies, all offline simulation and mock loading logic was completely isolated into `test_mock.py`.
-- **Implementation**:
-  - Reverted `dataset.py` to a clean, production-grade streaming dataloader with zero references to local NPZ files (`movi_e_sample_0000.npz`) or environment-dependent mock flags (`FORCE_MOCK`).
-  - Refactored `test_mock.py` to load and parse the local 32MB genuine Kubric sample `"movi_e_sample_0000.npz"` directly, adding support for the dataset's native high-fidelity properties (`depth_m` and `forward_flow_px`).
-  - Verified that running `python test_mock.py` completes successfully fully offline, performing exact curriculum physical and tracking loss validations.
+### 2. Mock 与调试工具的隔离
+- **决策**：为了保持核心代码库（`dataset.py`、`trainer.py`、`train.py`）严格处于生产就绪状态，且不依赖本地开发或 mock 文件，所有离线模拟和 mock 加载逻辑已被完全隔离到 `test_mock.py` 中。
+- **实现**：
+  - 将 `dataset.py` 恢复为纯净的、生产级的流式数据加载器，不再引用本地 NPZ 文件（`movi_e_sample_0000.npz`）或依赖环境的 mock 标志（`FORCE_MOCK`）。
+  - 重构了 `test_mock.py`，直接加载并解析 32MB 的真实 Kubric 样本 `"movi_e_sample_0000.npz"`，并增加了对数据集原生高保真属性（`depth_m` 和 `forward_flow_px`）的支持。
+  - 验证了运行 `python test_mock.py` 可以在完全离线的情况下成功完成，执行精确的课程物理和追踪损失验证。
 
 ### 3. 可视化模块 Grad 运行时异常修复 (Save Visualization RuntimeError Fix)
 - **问题**：在可视化保存阶段，`utils/visualization.py` 在执行第 62 行 `b_np = t_boxes[i].cpu().numpy()` 时触发了 `RuntimeError: Can't call numpy() on Tensor that requires grad. Use tensor.detach().numpy() instead.` 报错，导致训练中断。
@@ -65,9 +69,19 @@ This log tracks architectural changes, critical bug fixes, performance optimizat
   7. **三阶段课程损失表调度与多指标自诊断** (`utils/losses.py`, `trainer.py`)：实现 0-2000、2000-5000 及 5000+ 三阶段渐进式损失权重曲线。自动诊断模块中新增 EPE 像素光流差与 AbsRel/RMSElog 深度度量并实时输出打印。
 - **验证结果**：经 `python test_mock.py` 完整测试（涵盖所有 5 阶段课程训练和第 6 阶段端到端追踪鲁棒性测试），全阶段闭环无 NaN 完美通过！可视化图像顺利保存，特征梯度反向传播状态检测完美（`Gradient norms OK`）。
 
-### 6. 运行鲁棒性、物理标签有效掩码与训练吞吐补丁（2026-05-27）
+### 6. 运行鲁棒性、物理标签有效掩码与训练吞吐补丁 (2026-05-27)
 - **导入鲁棒性**：`utils/visualization.py` 将 `torchvision` 导入异常捕获从 `ImportError` 扩展为 `Exception`，避免 torch/torchvision ABI 不匹配时因 `torchvision::nms` 缺失而导致训练器导入失败，并自动回退到项目内置 NMS。
 - **实例元数据安全填充**：`dataset.py` 的 `pad_instances()` 现在会保留完整 batch 维度，并配套 presence mask，避免某个样本缺失 `is_dynamic / velocities / visibility` 时标签与视频错位。
 - **分类污染防护**：`cls_dense` 在当前 class-agnostic 阶段保持全 `-100`，不再写入 MOVi category 占位值；YOLOE vocab 继续冻结且 `cls` loss 继续关闭。
 - **物理属性有效监督**：新增 `initial_dynamic_valid_dense` 与 `current_moving_valid_dense`，`compute_attribute_loss()` 只在有效标签位置计算属性 loss，缺失元数据不会被误当成全静止。
 - **GPU 训练启动与预取**：`train.py` 默认关闭 W&B，CUDA 下启用 `cudnn.benchmark` 与 matmul precision 设置；`CUDAPrefetcher.next()` 递归记录 CUDA stream，保护 list/dict 中 tensor 的异步生命周期。
+
+### 7. 纯化 CUDA 核心库与 Mock 模块化重构 (CUDA-Only Purification & Mock Refactoring)
+- **决策背景**：此前系统在核心代码中遗留了部分针对 CPU 运行或环境缺失包（如 `torchvision`、`scipy`、`mamba_ssm`）的 Try-Except 兼容保护和 Fallback 算法（如 NMS 纯 PyTorch 实现、匈牙利匹配贪心回退等）。这违背了生产代码的绝对纯净化原则，使生产代码体积膨胀、维护困难。
+- **重构实现**：
+  1. **核心库彻底纯净化**：彻底清除了核心库中的 CPU 兼容与 Fallback 逻辑，如果 CUDA 或相应依赖包缺失，核心库将直接抛出异常崩溃。
+  2. **创建独立的 `tests/` 模块化 Mock 包**：
+     - `tests/mock_mamba.py`：封装并热替换 Mamba 时序骨干。
+     - `tests/mock_scipy.py`：仿冒 scipy.optimize 匈牙利匹配逻辑。
+     - `tests/mock_data.py`：高保真物理仿真球漂移模拟器及 MOVi-E 真实数据加载。
+  3. **测试入口环境约束**：重构 `test_mock.py`，在启动时强行断言 `torch.cuda.is_available()` 确保必须在 CUDA 环境下执行，并在模型与训练组件载入前自动完成多组件的 Mock 动态注入和测试校验。

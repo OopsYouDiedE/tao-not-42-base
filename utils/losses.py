@@ -2,10 +2,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-try:
-    from scipy.optimize import linear_sum_assignment as _lsa
-except ImportError:
-    _lsa = None
+from scipy.optimize import linear_sum_assignment as _lsa
 
 from utils.geometry import *
 
@@ -204,7 +201,7 @@ def get_ema_loss(name, current_val, alpha=0.95):
 def compute_track_loss(preds, targets, step):
     if "track_boxes" not in preds:
         device = next(iter(preds.values())
-                      ).device if preds else torch.device("cpu")
+                      ).device if preds else torch.device("cuda")
         return torch.tensor(0., device=device)
 
     track_boxes = preds["track_boxes"]
@@ -218,10 +215,10 @@ def compute_track_loss(preds, targets, step):
     if track_gt_boxes is None or track_gt_valid is None:
         return torch.tensor(0., device=device)
 
-    # track_gt_boxes initially has shape [B, T, MAX_INSTANCES, 4]
-    # track_gt_valid initially has shape [B, T, MAX_INSTANCES]
-    # But if targets was passed through _extract_target_chunk, it was flattened to [B * T, ...]
-    # Let's reconstruct the [B, T, ...] shape
+    # track_gt_boxes 初始形状为 [B, T, MAX_INSTANCES, 4]
+    # track_gt_valid 初始形状为 [B, T, MAX_INSTANCES]
+    # 但如果 targets 是通过 _extract_target_chunk 传递的，它会被展平为 [B * T, ...]
+    # 让我们重建 [B, T, ...] 形状
     if track_gt_boxes.dim() == 3:
         track_gt_boxes = track_gt_boxes.view(B, T, -1, 4)
     if track_gt_valid.dim() == 2:
@@ -231,12 +228,12 @@ def compute_track_loss(preds, targets, step):
     loss_alive = torch.tensor(0., device=device)
     n_matched_total = 0
 
-    # Batch compute cost matrix for all B and T on GPU
+    # 在 GPU 上批量计算所有 B 和 T 的代价矩阵
     flat_pred_boxes = track_boxes.flatten(0, 1)      # [B*T, N, 4]
     flat_gt_boxes = track_gt_boxes.flatten(0, 1)      # [B*T, M, 4]
     cost_matrix_all = torch.cdist(flat_pred_boxes.detach(), flat_gt_boxes, p=1) # [B*T, N, M]
 
-    # Transfer cost matrix and valid masks to CPU in exactly ONE synchronization!
+    # 在仅一次同步中将代价矩阵和有效掩码传输到 CPU！
     cost_matrix_cpu = cost_matrix_all.cpu().numpy()
     flat_gt_valid_cpu = track_gt_valid.flatten(0, 1).cpu().numpy()
 
@@ -282,25 +279,7 @@ def compute_track_loss(preds, targets, step):
 
                 cost = cost_matrix_cpu[idx][np.array(free_queries)][:, np.array(new_gt_ids)]
 
-                if _lsa is not None:
-                    q_local, g_local = _lsa(cost)
-                else:
-                    q_local, g_local = [], []
-                    used_local = set()
-                    for gi in range(len(new_gt_ids)):
-                        best = None
-                        best_cost = 1e18
-                        for qi_local in range(len(free_queries)):
-                            if qi_local in used_local:
-                                continue
-                            c = cost[qi_local, gi]
-                            if c < best_cost:
-                                best = qi_local
-                                best_cost = c
-                        if best is not None:
-                            used_local.add(best)
-                            q_local.append(best)
-                            g_local.append(gi)
+                q_local, g_local = _lsa(cost)
 
                 for qli, gli in zip(q_local, g_local):
                     qi = int(free_queries[qli])

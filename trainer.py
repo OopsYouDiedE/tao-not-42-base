@@ -33,7 +33,7 @@ class TAOTrainer:
                 for param in self.model.segmenter.parameters():
                     param.requires_grad = False
 
-        # [FIX] Freeze vocab during initialization to protect zero-shot classification
+        # [修复] 在初始化期间冻结词汇表，以保护零样本分类
         if hasattr(self.model.segmenter.model[-1], "lrpc"):
             for layer in self.model.segmenter.model[-1].lrpc:
                 if hasattr(layer, "vocab"):
@@ -48,10 +48,10 @@ class TAOTrainer:
 
     def _load_yolo_weights(self):
         if not os.path.exists(self.args.yolo_weights):
-            print(f"Downloading {self.args.yolo_weights} from Ultralytics...")
+            print(f"正在从 Ultralytics 下载 {self.args.yolo_weights}...")
             urllib.request.urlretrieve(
                 f"https://github.com/ultralytics/assets/releases/download/v8.4.0/{self.args.yolo_weights}", self.args.yolo_weights)
-            print("Download complete.")
+            print("下载完成。")
 
         for name, module in self.model.named_modules():
             if module.__class__.__name__ == 'Conv':
@@ -82,7 +82,7 @@ class TAOTrainer:
 
         loaded_keys = {k for k, v in sd.items() if map_key(
             k) in tgt and tgt[map_key(k)].shape == v.shape}
-        print(f"[YOLO] Successfully loaded {len(loaded_keys)}/{len(sd)} keys")
+        print(f"[YOLO] 成功加载了 {len(loaded_keys)}/{len(sd)} 个键")
         tgt.update({map_key(k): v for k, v in sd.items() if k in loaded_keys})
         self.model.load_state_dict(tgt)
 
@@ -125,7 +125,7 @@ class TAOTrainer:
 
             epoch_loss = self._train_epoch(epoch)
             print(
-                f"\n✅ Epoch {epoch} End | Avg Loss: {epoch_loss:.4f} | Mode: {self.mode}")
+                f"\n✅ 第 {epoch} 轮结束 | 平均损失: {epoch_loss:.4f} | 模式: {self.mode}")
             torch.save(self.model.state_dict(), self.args.checkpoint.replace(
                 ".pth", f"_epoch_{epoch}.pth"))
 
@@ -133,11 +133,11 @@ class TAOTrainer:
                 self.best_loss, self.epochs_no_improve = epoch_loss, 0
                 torch.save(self.model.state_dict(),
                            self.args.checkpoint.replace(".pth", "_best.pth"))
-                print(f"🌟 Best Model saved (Loss: {self.best_loss:.4f})")
+                print(f"🌟 已保存最佳模型 (损失: {self.best_loss:.4f})")
             else:
                 self.epochs_no_improve += 1
                 if self.epochs_no_improve >= self.args.early_stop_patience:
-                    print(f"\n🛑 Early Stopping Triggered!")
+                    print(f"\n🛑 已触发早停！")
                     break
 
     def _train_epoch(self, epoch):
@@ -311,7 +311,7 @@ class TAOTrainer:
 
             self.global_step += 1
             if self.global_step % 10 == 0:
-                print(f"[{time.time()-self.start_time:.1f}s] S{self.global_step} | Tot:{loss.item():.4f} | " + " ".join(
+                print(f"[{time.time()-self.start_time:.1f}s] 步数 {self.global_step} | 总计:{loss.item():.4f} | " + " ".join(
                     [f"{k}:{loss_acc[k]/total_frames:.2f}" for k in ["Obj", "Box", "Mask", "Depth", "Ego", "Flow", "Anom", "Attr", "Track", "FlowEPEpx", "DepthAbsRel"]]))
                 if self.wandb:
                     log_dict = {

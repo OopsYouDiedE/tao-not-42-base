@@ -1,41 +1,24 @@
 import sys
-import types
+import os
 import torch
 import numpy as np
-import cv2
-import os
 
-# 1. Define MockMamba class locally
-class MockMamba(torch.nn.Module):
-    def __init__(self, d_model, *args, **kwargs):
-        super().__init__()
-        self.proj = torch.nn.Linear(d_model, d_model)
-    def forward(self, x, *args, **kwargs):
-        return self.proj(x)
+# 0. 强制执行严格的 CUDA 约束以进行测试
+assert torch.cuda.is_available(), "严禁在非 CUDA 环境中进行测试！"
 
-# 2. Inject MockMamba into sys.modules to satisfy other components
-mamba_mock = types.ModuleType("mamba_ssm")
-mamba_mock.Mamba = MockMamba
-sys.modules["mamba_ssm"] = mamba_mock
+# 1. 在导入核心代码库前注入模块化 mock
+import tests.mock_mamba
+import tests.mock_scipy
+tests.mock_mamba.inject_mock_mamba()
+tests.mock_scipy.inject_mock_scipy()
 
-# 2b. Inject scipy mock (for test_mock; Colab has real scipy for training)
-scipy_mock = types.ModuleType("scipy")
-scipy_opt_mock = types.ModuleType("scipy.optimize")
-scipy_opt_mock.linear_sum_assignment = lambda cost: (
-    np.arange(min(cost.shape)), np.arange(min(cost.shape)))
-scipy_mock.optimize = scipy_opt_mock
-sys.modules["scipy"] = scipy_mock
-sys.modules["scipy.optimize"] = scipy_opt_mock
-
-# 3. Import modules and perform dynamic monkey patching injection of Mamba before any block initializes
-import models.custom_heads
-models.custom_heads.Mamba = MockMamba
-
+# 2. 导入核心代码库模块
 import train
 from models import TAONot42VisionModel
 from utils import get_loss_weights, compute_physics_loss, save_visualization, compute_track_loss
 from dataset import process_batch_on_gpu
 from trainer import TAOTrainer
+from tests.mock_data import get_movi_e_or_fallback
 
 def load_yoloe_weights(model, path="yoloe-26s-seg-pf.pt"):
     import torch
@@ -45,9 +28,9 @@ def load_yoloe_weights(model, path="yoloe-26s-seg-pf.pt"):
     
     if not os.path.exists(path):
         weights_url = f"https://github.com/ultralytics/assets/releases/download/v8.4.0/{path}"
-        print(f"Downloading weights from {weights_url} ...")
+        print(f"正在从 {weights_url} 下载权重...")
         urllib.request.urlretrieve(weights_url, path)
-        print("Download complete.")
+        print("下载完成。")
 
     for name, module in model.named_modules():
         if module.__class__.__name__ == 'Conv':
@@ -75,9 +58,6 @@ def load_yoloe_weights(model, path="yoloe-26s-seg-pf.pt"):
         ckpt = torch.load(path, map_location="cpu", weights_only=False)
         sd = ckpt["model"].state_dict() if isinstance(ckpt, dict) and "model" in ckpt else (ckpt.state_dict() if hasattr(ckpt, "state_dict") else ckpt)
 
-    
-    # 2. (REMOVED) 以前会把 4585 截断成 nc，现在不再截断，保留零样本能力
-
     tgt = model.state_dict()
     loaded_keys = {k for k, v in sd.items() if (k.replace("model.model.", "segmenter.model.").replace("model.", "segmenter.model.") if k.startswith("model.") else k) in tgt and tgt[(k.replace("model.model.", "segmenter.model.").replace("model.", "segmenter.model.") if k.startswith("model.") else k)].shape == v.shape}
     print(f"====================================================")
@@ -92,267 +72,28 @@ class DummyTrainer:
         self.device = device
         self.global_step = global_step
 
-def generate_synthetic_physical_video(B=1, T=12, H=256, W=256):
-    """
-    Generates a high-fidelity synthetic physical video of a 3D ball drifting closer 
-    to the camera over a gradient background. Simulates proper geometric depth, 
-    ego-motion flow, dynamic object flow, and object segmentation.
-    """
-    video = np.zeros((B, T, H, W, 3), dtype=np.uint8)
-    depth = np.ones((B, T, H, W), dtype=np.float32) * 50.0  # Background distance: 50m
-    seg = np.zeros((B, T, H, W), dtype=np.int16)
-    flow = np.zeros((B, T, H, W, 2), dtype=np.float32)
-    
-    for b in range(B):
-        for t in range(T):
-            # Background gradient
-            img = np.zeros((H, W, 3), dtype=np.uint8)
-            for y in range(H):
-                img[y, :, 0] = int(120 + 40 * (y / H))  # Blue
-                img[y, :, 1] = int(60 + 80 * (y / H))   # Green
-                img[y, :, 2] = int(40 + 20 * (y / H))   # Red
-            
-            # Simulated camera movement: pan right
-            cam_dx = 1.0 * t
-            img = np.roll(img, -int(cam_dx), axis=1)
-            bg_flow_x = -1.0
-            
-            # Render a 3D red ball drifting closer
-            center_x = int(60 + 10 * t)
-            center_y = int(140 - 3 * t)
-            radius = int(24 + 1.2 * t)
-            
-            cv2.circle(img, (center_x, center_y), radius, (0, 0, 255), -1)
-            
-            # Ball depth decreases as it gets closer
-            ball_depth = 5.0 - 0.2 * t
-            y_grid, x_grid = np.ogrid[:H, :W]
-            dist_sq = (x_grid - center_x)**2 + (y_grid - center_y)**2
-            ball_mask = dist_sq <= radius**2
-            
-            depth_frame = np.ones((H, W), dtype=np.float32) * 50.0
-            depth_frame[ball_mask] = ball_depth
-            
-            seg_frame = np.zeros((H, W), dtype=np.int16)
-            seg_frame[ball_mask] = 1
-            
-            flow_frame = np.zeros((H, W, 2), dtype=np.float32)
-            flow_frame[..., 0] = bg_flow_x
-            flow_frame[ball_mask, 0] = 10.0
-            flow_frame[ball_mask, 1] = -3.0
-            
-            video[b, t] = img
-            depth[b, t] = depth_frame
-            seg[b, t] = seg_frame
-            flow[b, t] = flow_frame
-            
-    return video, depth, seg, flow
-
-def get_movi_e_or_fallback(npz_path="movi_e_sample_0000.npz", B=1, T=12, H=256, W=256):
-    """
-    Dynamically loads a genuine Kubric MOVi-E dataset sample exported from Colab,
-    extracting all 7 physical elements: video, depth, segmentation, flow, camera positions,
-    camera quaternions, and is_dynamic parameters.
-    """
-    if not os.path.exists(npz_path) and npz_path == "movi_e_sample_0000.npz" and os.path.exists("movi_e_sample.npz"):
-        npz_path = "movi_e_sample.npz"
-    elif not os.path.exists(npz_path) and npz_path == "movi_e_sample.npz" and os.path.exists("movi_e_sample_0000.npz"):
-        npz_path = "movi_e_sample_0000.npz"
-
-    if os.path.exists(npz_path):
-        print(f"====================================================")
-        print(f"[INFO] Genuine MOVi-E Dataset sample detected: '{npz_path}'!")
-        print(f"====================================================")
-        try:
-            data = np.load(npz_path, allow_pickle=True)
-            v_np = data["video"]                  # Expected: [T, H, W, 3] or [B, T, H, W, 3]
-            d_np = data["depth_m"] if "depth_m" in data else data["depth"]
-            s_np = data["segmentation"]           # Expected: [T, H, W] or [B, T, H, W]
-            f_np = data["forward_flow_px"].astype(np.float32) if "forward_flow_px" in data else data["forward_flow"].astype(np.float32)
-            cp_np = data.get("cam_pos")           # Expected: [T, 3] or [B, T, 3]
-            cq_np = data.get("cam_quat")          # Expected: [T, 4] or [B, T, 4]
-            id_np = data.get("is_dynamic")        # Expected: [NumInstances] or List of them
-            cat_np = data.get("category")
-            vel_np = data.get("velocities")
-            avel_np = data.get("angular_velocities")
-            vis_np = data.get("visibility")
-            col_np = data.get("collisions")
-            
-            # 1. Dimensional Alignment Helper
-            def ensure_5d(arr, is_channel=False):
-                if len(arr.shape) == 3 and not is_channel: # [T, H, W] -> [1, T, H, W]
-                    arr = np.expand_dims(arr, axis=0)
-                elif len(arr.shape) == 4 and is_channel:   # [T, H, W, C] -> [1, T, H, W, C]
-                    arr = np.expand_dims(arr, axis=0)
-                if arr.shape[0] < B:
-                    arr = np.repeat(arr, B, axis=0)
-                return arr
-                
-            v_np = ensure_5d(v_np, is_channel=True)[:, :T]
-            d_np = ensure_5d(d_np, is_channel=False)[:, :T]
-            s_np = ensure_5d(s_np, is_channel=False)[:, :T]
-            f_np = ensure_5d(f_np, is_channel=True)[:, :T]
-            
-            # Align Camera Position
-            if cp_np is not None:
-                if len(cp_np.shape) == 2: # [T, 3] -> [1, T, 3]
-                    cp_np = np.expand_dims(cp_np, axis=0)
-                if cp_np.shape[0] < B:
-                    cp_np = np.repeat(cp_np, B, axis=0)
-                cp_np = cp_np[:, :T]
-            else:
-                cp_np = np.zeros((B, T, 3), dtype=np.float32)
-                
-            # Align Camera Rotation Quaternions
-            if cq_np is not None:
-                if len(cq_np.shape) == 2: # [T, 4] -> [1, T, 4]
-                    cq_np = np.expand_dims(cq_np, axis=0)
-                if cq_np.shape[0] < B:
-                    cq_np = np.repeat(cq_np, B, axis=0)
-                cq_np = cq_np[:, :T]
-            else:
-                cq_np = np.zeros((B, T, 4), dtype=np.float32)
-                cq_np[..., 0] = 1.0
-                
-            # Align lists of instances
-            def align_list(arr, default_gen):
-                if arr is not None:
-                    if isinstance(arr, np.ndarray) and (arr.ndim == 1 or arr.ndim == 3 or arr.ndim == 2):
-                        return [arr for _ in range(B)]
-                    elif isinstance(arr, list):
-                        return arr
-                return [default_gen() for _ in range(B)]
-                
-            id_np = align_list(id_np, lambda: np.array([True], dtype=bool))
-            cat_np = align_list(cat_np, lambda: np.array([0], dtype=np.int32))
-            vel_np = align_list(vel_np, lambda: np.zeros((1, T, 3), dtype=np.float32))
-            avel_np = align_list(avel_np, lambda: np.zeros((1, T, 3), dtype=np.float32))
-            vis_np = align_list(vis_np, lambda: np.ones((1, T), dtype=np.float32))
-            col_np = align_list(col_np, lambda: np.zeros((0, 2), dtype=np.int32))
-            
-            # 2. Spatial Resizing Helper
-            if v_np.shape[2] != H or v_np.shape[3] != W:
-                print(f"Resizing MOVi-E samples from {v_np.shape[2]}x{v_np.shape[3]} to {H}x{W}...")
-                v_res, d_res, s_res, f_res = [], [], [], []
-                for b in range(B):
-                    v_res.append(np.stack([cv2.resize(v_np[b, t], (W, H)) for t in range(T)]))
-                    d_res.append(np.stack([cv2.resize(d_np[b, t], (W, H), interpolation=cv2.INTER_NEAREST) for t in range(T)]))
-                    s_res.append(np.stack([cv2.resize(s_np[b, t].astype(np.float32), (W, H), interpolation=cv2.INTER_NEAREST).astype(np.int16) for t in range(T)]))
-                    f_res.append(np.stack([cv2.resize(f_np[b, t], (W, H)) for t in range(T)]))
-                v_np, d_np, s_np, f_np = np.stack(v_res), np.stack(d_res), np.stack(s_res), np.stack(f_res)
-                
-            print("Successfully loaded and prepared genuine Kubric MOVi-E sample!")
-            return v_np, d_np, s_np, f_np, cp_np, cq_np, id_np, cat_np, vel_np, avel_np, vis_np, col_np
-        except Exception as e:
-            print(f"Error loading MOVi-E sample from npz: {e}")
-            
-    # Graceful fallback online download / 3D Ball Simulation
-    print(f"Genuine local sample '{npz_path}' not found.")
-    video_path = "sample_video.mp4"
-    if not os.path.exists(video_path):
-        url = "https://github.com/intel-iot-devkit/sample-videos/raw/master/bottle-detection.mp4"
-        print(f"Attempting to download sample video from:\n  {url}")
-        try:
-            import urllib.request
-            urllib.request.urlretrieve(url, video_path)
-            print("Download completed successfully!")
-        except Exception as e:
-            print(f"Failed to download online video sample: {e}")
-            print("Falling back to high-fidelity local 3D physical simulator...")
-            v_np, d_np, s_np, f_np = generate_synthetic_physical_video(B, T, H, W)
-            cp_np = np.zeros((B, T, 3), dtype=np.float32)
-            cq_np = np.zeros((B, T, 4), dtype=np.float32)
-            cq_np[..., 0] = 1.0
-            id_np = [np.array([True], dtype=bool) for _ in range(B)]
-            cat_np = [np.array([0], dtype=np.int32) for _ in range(B)]
-            vel_np = [np.zeros((1, T, 3), dtype=np.float32) for _ in range(B)]
-            avel_np = [np.zeros((1, T, 3), dtype=np.float32) for _ in range(B)]
-            vis_np = [np.ones((1, T), dtype=np.float32) for _ in range(B)]
-            col_np = [np.zeros((0, 2), dtype=np.int32) for _ in range(B)]
-            return v_np, d_np, s_np, f_np, cp_np, cq_np, id_np, cat_np, vel_np, avel_np, vis_np, col_np
-            
-    try:
-        cap = cv2.VideoCapture(video_path)
-        frames = []
-        while cap.isOpened() and len(frames) < T:
-            ret, frame = cap.read()
-            if not ret:
-                break
-            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            frame_resized = cv2.resize(frame_rgb, (W, H))
-            frames.append(frame_resized)
-        cap.release()
-        
-        if len(frames) < T:
-            while len(frames) < T:
-                frames.append(frames[-1] if len(frames) > 0 else np.zeros((H, W, 3), dtype=np.uint8))
-                
-        video_np = np.stack(frames, axis=0)
-        video_np = np.expand_dims(video_np, axis=0)
-        if B > 1:
-            video_np = np.repeat(video_np, B, axis=0)
-            
-        print(f"Successfully loaded fallback video: '{video_path}'!")
-        
-        depth = np.ones((B, T, H, W), dtype=np.float32) * 10.0
-        seg = np.zeros((B, T, H, W), dtype=np.int16)
-        flow = np.zeros((B, T, H, W, 2), dtype=np.float32)
-        
-        for b in range(B):
-            for t in range(T):
-                gray = cv2.cvtColor(video_np[b, t], cv2.COLOR_RGB2GRAY)
-                depth[b, t] = 20.0 - 15.0 * (gray.astype(np.float32) / 255.0)
-                _, thresh = cv2.threshold(gray, 128, 1, cv2.THRESH_BINARY)
-                seg[b, t] = thresh.astype(np.int16)
-                flow[b, t, ..., 0] = -1.0
-                
-        cp_np = np.zeros((B, T, 3), dtype=np.float32)
-        cq_np = np.zeros((B, T, 4), dtype=np.float32)
-        cq_np[..., 0] = 1.0
-        id_np = [np.array([True], dtype=bool) for _ in range(B)]
-        cat_np = [np.array([0], dtype=np.int32) for _ in range(B)]
-        vel_np = [np.zeros((1, T, 3), dtype=np.float32) for _ in range(B)]
-        avel_np = [np.zeros((1, T, 3), dtype=np.float32) for _ in range(B)]
-        vis_np = [np.ones((1, T), dtype=np.float32) for _ in range(B)]
-        col_np = [np.zeros((0, 2), dtype=np.int32) for _ in range(B)]
-        
-        return video_np, depth, seg, flow, cp_np, cq_np, id_np, cat_np, vel_np, avel_np, vis_np, col_np
-    except Exception as e:
-        print(f"Error reading backup video: {e}")
-        print("Falling back to high-fidelity local 3D physical simulator...")
-        v_np, d_np, s_np, f_np = generate_synthetic_physical_video(B, T, H, W)
-        cp_np = np.zeros((B, T, 3), dtype=np.float32)
-        cq_np = np.zeros((B, T, 4), dtype=np.float32)
-        cq_np[..., 0] = 1.0
-        id_np = [np.array([True], dtype=bool) for _ in range(B)]
-        cat_np = [np.array([0], dtype=np.int32) for _ in range(B)]
-        vel_np = [np.zeros((1, T, 3), dtype=np.float32) for _ in range(B)]
-        avel_np = [np.zeros((1, T, 3), dtype=np.float32) for _ in range(B)]
-        vis_np = [np.ones((1, T), dtype=np.float32) for _ in range(B)]
-        col_np = [np.zeros((0, 2), dtype=np.int32) for _ in range(B)]
-        return v_np, d_np, s_np, f_np, cp_np, cq_np, id_np, cat_np, vel_np, avel_np, vis_np, col_np
-
 def test_all_stages():
+    """测试所有训练阶段，从基础检测到端到端追踪。"""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"====================================================")
-    print(f"[RUN] RUNNING MULTI-STAGE REAL PHYSICAL TESTING ON {device.type.upper()}")
+    print(f"[RUN] 正在 {device.type.upper()} 上运行多阶段真实物理测试")
     print(f"====================================================")
     
-    # 1. Instantiate vision model
+    # 1. 实例化视觉模型
     model = TAONot42VisionModel().to(device)
     load_yoloe_weights(model, 'yoloe-26s-seg-pf.pt')
     model.train()
     
-    # Model Parameter Summary
+    # 模型参数摘要
     total_params = sum(p.numel() for p in model.parameters())
-    print(f"Total model parameters: {total_params / 1e6:.2f} M")
-    print(f"Static weight memory footprint: {total_params * 4 / (1024**2):.2f} MB\n")
+    print(f"总模型参数量: {total_params / 1e6:.2f} M")
+    print(f"静态权重内存占用: {total_params * 4 / (1024**2):.2f} MB\n")
     
-    # 2. Get real MOVi-E genuine sample or fallback
-    B, T, img_size = 1, 12, 256
+    # 2. 获取真实的 MOVi-E 样本或回退方案
+    B, T, img_size = 1, 24, 256
     v_np, d_np, s_np, f_np, cp_np, cq_np, id_np, cat_np, vel_np, avel_np, vis_np, col_np = get_movi_e_or_fallback("movi_e_sample_0000.npz", B, T, img_size, img_size)
     
-    # Prepare batch dictionary matching the dataset output format
+    # 准备匹配数据集输出格式的 Batch 字典
     batch = {
         "video": torch.from_numpy(v_np),
         "depth": torch.from_numpy(d_np),
@@ -367,62 +108,62 @@ def test_all_stages():
         "visibility": [torch.from_numpy(x) for x in vis_np],
     }
     
-    # Run GPU preprocessing pipeline
-    print("Running GPU batch preprocessing...")
+    # 运行 GPU 预处理流水线
+    print("正在运行 GPU Batch 预处理...")
     gpu_batch = process_batch_on_gpu(batch, device, img_size)
     
-    # 3. Define curriculum training steps covering all 5 core stages
+    # 3. 定义涵盖所有 5 个核心阶段的课程训练步骤
     stages = {
-        1: ("Stage 1: Detection & Depth Focused", 50),
-        2: ("Stage 2: Camera Pose Introduction", 250),
-        3: ("Stage 3: Optical Flow Introduction", 500),
-        4: ("Stage 4: Photo-Error & Class-learning", 1500),
-        5: ("Stage 5: Anomaly Self-Supervision Active", 5000)
+        1: ("阶段 1: 聚焦检测与深度", 50),
+        2: ("阶段 2: 引入相机姿态", 250),
+        3: ("阶段 3: 引入光流", 500),
+        4: ("阶段 4: 光度误差与类别学习", 1500),
+        5: ("阶段 5: 激活异常自监督", 5000)
     }
     
-    # Extract preprocessed input sequences
+    # 提取预处理后的输入序列
     v_seq = gpu_batch["video"]
     t_max = v_seq.shape[1]
     
-    # Mock future frames for warp-based photometric computation in compute_physics_loss
+    # 为光度计算 Mock 未来帧
     img_next = torch.zeros_like(v_seq)
     for t in range(t_max):
         img_next[:, t] = v_seq[:, min(t + 1, t_max - 1)]
     
-    print("\nStarting multi-stage verification...\n")
+    print("\n开始多阶段验证...\n")
     
     for stage_id, (stage_name, step) in stages.items():
         print(f"----------------------------------------------------")
-        print(f"[RUN] Testing Curriculum {stage_name} (Step = {step})")
+        print(f"[RUN] 正在测试课程 {stage_name} (Step = {step})")
         print(f"----------------------------------------------------")
         
-        # Get active loss weights for this step
+        # 获取当前步的激活损失权重
         lw = get_loss_weights(step)
         active_losses = [k for k, v in lw.items() if v > 0]
-        print(f"Active Loss Components: {active_losses}")
+        print(f"激活的损失组件: {active_losses}")
         
-        # Feature extraction from Segmenter
+        # 从分割器提取特征
         with torch.no_grad():
             feats = [f.view(B, T, *f.shape[1:]) for f in model.extract_features(v_seq.flatten(0, 1))]
         
-        # Enable gradients for features
+        # 为特征启用梯度
         for f in feats:
             f.requires_grad = True
             
         dt = torch.full((B, T), 1.0 / 24.0, device=device)
         
-        # Forward Pass
+        # 前向传播
         preds = model.forward_physics(
             *feats, dt, step=step, 
             get_loss_weights_fn=get_loss_weights, 
             original_shape=(img_size, img_size)
         )
         
-        # 4. Extract targets directly reusing TAOTrainer._extract_target_chunk to eliminate duplicates
+        # 4. 直接复用 TAOTrainer._extract_target_chunk 提取目标
         dummy_trainer = DummyTrainer(device, step)
         tgts = TAOTrainer._extract_target_chunk(dummy_trainer, gpu_batch, c_start=0, c_end=T, max_t=t_max)
         
-        # Loss Computation
+        # 损失计算
         loss, l_dict, w_img = compute_physics_loss(
             preds, tgts, 
             v_seq.flatten(0, 1), 
@@ -431,16 +172,16 @@ def test_all_stages():
             step=step
         )
         
-        # Backward Pass
+        # 反向传播
         loss.backward()
-        print(f"Loss computed: {loss.item():.4f}")
+        print(f"损失计算完成: {loss.item():.4f}")
         for l_name, l_val in l_dict.items():
             if lw.get(l_name.lower()[:4], 0.0) > 0 or l_name == "Tot":
-                print(f"  - {l_name} Loss: {l_val.item():.4f}")
+                print(f"  - {l_name} 损失: {l_val.item():.4f}")
                 
-        # 5. Generate Visualization Output for Visual Inspection at Stage 5
+        # 5. 在阶段 5 生成可视化输出以供人工检查
         if stage_id == 5:
-            print("\nGenerating visual verification grid for inspection...")
+            print("\n正在生成可视化验证网格...")
             # Slice the second frame (index 1) from the flattened B*T tensors,
             # matching TAOTrainer visualization slice logic.
             vis_frame_idx = 1  # second frame: has both t-1 and t+1 neighbours
