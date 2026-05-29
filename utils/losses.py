@@ -491,7 +491,8 @@ def compute_physics_loss(preds, targets, img_t=None, img_next=None, mode="superv
             torch.bmm(R_n_inv, quaternion_to_matrix(targets["cam_quat_t"])))
         gt_pose = torch.cat([trans_diff, rot_diff], dim=1)
 
-        loss_ego = F.smooth_l1_loss(preds["ego_pose"], gt_pose)
+        pred_pose_vec = torch.cat([preds["ego_pose"]["t"], preds["ego_pose"]["rot6d"]], dim=-1)
+        loss_ego = F.smooth_l1_loss(pred_pose_vec, gt_pose)
 
         v_d_mask = (~targets["sky_mask"]).float()
         l_depth_base = (F.smooth_l1_loss(
@@ -559,10 +560,11 @@ def compute_physics_loss(preds, targets, img_t=None, img_next=None, mode="superv
                 sensor_width=targets.get("camera_sensor_width", None),
                 dtype=preds["depth"].dtype,
             )
+            pred_pose_vec = torch.cat([preds["ego_pose"]["t"], preds["ego_pose"]["rot6d"]], dim=-1)
             warped_img, v_w_mask = inverse_warp(
                 img_next,
                 preds["depth"].unsqueeze(1),
-                preds["ego_pose"],
+                pred_pose_vec,
                 K,
                 K_inv,
                 depth_is_distance=True,

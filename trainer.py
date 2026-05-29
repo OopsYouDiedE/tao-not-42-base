@@ -254,6 +254,9 @@ class TAOTrainer:
             "Attr", "Track", "FlowEPEpx", "DepthAbsRel", "DepthRMSElog", "DepthDelta1"
         ]}
         total_frames = 0
+        
+        # 跨 Chunk 追踪状态持久化记忆
+        prev_queries = None
 
         for c_start in range(0, t_max, self.args.seq_len):
             c_end = min(c_start + self.args.seq_len, t_max)
@@ -285,8 +288,22 @@ class TAOTrainer:
                                 tgts["cls_dense"].view(
                                     v_seq.shape[0], T_chunk, *tgts["cls_dense"].shape[1:])[:, i] = -100
 
+                K, K_inv = None, None
+                if "camera_focal_length" in tgts:
+                    from utils.geometry import generate_intrinsics
+                    K, K_inv = generate_intrinsics(
+                        c_vids.shape[-2], c_vids.shape[-1], self.device,
+                        focal_length=tgts.get("camera_focal_length"),
+                        sensor_width=tgts.get("camera_sensor_width"),
+                        dtype=torch.float32
+                    )
+
+                # 将上一个 Chunk 遗留的查询状态以及内参送入前向传播
                 preds = self.model.forward_physics(
-                    *feats, dt, self.global_step, get_loss_weights, c_vids.shape[-2:], tgts=tgts)
+                    *feats, dt, self.global_step, get_loss_weights, c_vids.shape[-2:], tgts=tgts,
+                    K=K, K_inv=K_inv, prev_queries=prev_queries)
+                    
+                prev_queries = preds.get("next_queries", None)
 
                 img_next = self._build_next_frames(v_seq, c_start, c_end, t_max)
 
@@ -328,6 +345,8 @@ class TAOTrainer:
     def _slice_frame(self, v, B, T_chunk):
         if v is None:
             return None
+        if isinstance(v, dict):
+            return {k: self._slice_frame(val, B, T_chunk) for k, val in v.items()}
         if isinstance(v, list):
             res = []
             for x in v:

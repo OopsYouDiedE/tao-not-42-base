@@ -1,100 +1,59 @@
-# 系统整机集成、自监督损失与课程学习专题 (system_integration.md)
+# 系统整机集成、半监督几何重投影与课程学习专题 (system_integration.md)
 
-本专题系统性地介绍了大模型的整机网络前向组装（TAONot42VisionModel）、多阶段自适应课程训练控制（TAOTrainer）、物理自监督几何重投影损失，以及面向高稳定性追踪的 Tracklet-Aware 匈牙利时空损失。
+本专题系统性地介绍了大模型的整机网络前向组装（TAONot42VisionModel）、多阶段自适应课程训练控制（TAOTrainer）、结合双帧尺度约束的几何重投影损失，以及面向高稳定性追踪的 Tracklet-Aware 匈牙利时空损失。
 
 ---
 
 ## 1. 统一视觉大模型整机集成 (TAONot42VisionModel)
 
-`TAONot42VisionModel` 是整个感知大模型的大脑，负责将底层的二维图像特征提取（`YOLOEBackbone`）、时空序列动态特征混合（`SpatioTemporalMambaBlock`）、绝对三维几何解码（`UnifiedGeometryDecoder`）、相机自运动估计（`EgoPoseHead`）、自监督异常检测（`FeaturePredictorHead`）以及时空追踪（`TrackQueryModule`）完美地编织在一起。
+`TAONot42VisionModel` 是整个感知大模型的大脑，负责将底层的二维图像特征提取（`YOLOEBackbone`）、时空序列动态特征混合（`SpatioTemporalMambaBlock` / `SpatioTemporalGRUFallback`）、绝对三维几何解析（`SE3PhysicsHead` / `UnifiedGeometryDecoder`）、相机自运动估计（`EgoPoseHead`）、自监督异常检测（`FeaturePredictorHead`）以及时空追踪（`TrackQueryModule`）完美地编织在一起。
 
-### 1.1 系统架构与前向拓扑
-
-```mermaid
-graph TD
-    Input["Video Sequence (B, T, C, H, W)"] -- "分帧特征抽取" --> Backbone["YOLOEBackbone Backbone"]
-    Backbone -- "P3, P4, P5 特征图" --> Mamba["SpatioTemporalMambaBlock (时空混合)"]
-    
-    Mamba -- "时空P3" --> Pose["EgoPoseHead (相对位姿)"]
-    Mamba -- "时空P3" --> Track["TrackQueryModule (匈牙利追踪)"]
-    Mamba -- "时空P3, P4, P5" --> YHead["YOLOESegment26 (分割与检测)"]
-    
-    Mamba -- "时空P3" --> Geom["UnifiedGeometryDecoder (几何重建)"]
-    Pose -- "旋转/平移特征图" --> Geom
-    Geom --> Depth["Pred Depth (绝对深度)"]
-    Geom --> Flow["Pred Flow (稠密光流)"]
-    
-    Mamba -- "时空P3" --> Predictor["FeaturePredictorHead (物理预测)"]
-    Predictor -- "特征平滑L1偏差" --> Anomaly["Anomaly Map (时空异常度)"]
-```
-
-### 1.2 分离设计与统一拼装
-在 `forward_physics` 阶段：
-1. **时空特征提取与多尺度混合**：输入分帧视频，通过 `YOLOEBackbone` 快速提取多尺度特征，送入时空 Mamba 模块进行状态时序混合，得到时空表征特征图（P3_fused, P4, P5）。
-2. **YOLO 检测与分割**：将混合特征展开送入对齐的 `YOLOESegment26` 头中，预测类别、边界框及分割系数。
-3. **几何反投影与三维重建**：结合 Ego-Pose 自运动参数与时空浅层卷积，在 `UnifiedGeometryDecoder` 中输出稠密深度与前后帧像素光流。
-4. **自监督特征动力学预测**：依靠 `FeaturePredictorHead` 通过历史状态和位姿预测下一刻特征图，与真实未来图做 L1 距离比对，计算异常特征偏置。
-5. **实例时空追踪**：利用 32 个持久化 Queries 并行提取追踪特征并计算匹配边界框及概率。
+### 1.1 系统架构与几何投影闭环
+在 `forward_physics` 阶段，系统执行严密的计算闭环：
+1. **时空特征交互**：输入视频流，通过骨干网络提取多尺度特征，送入时空 Mamba 模块进行状态时序流动。
+2. **尺度约束深度与 SE(3) 解析**：利用时序和相关性特征，输出场景的尺度约束深度与刚体/非刚体掩码。**深度的绝对米制尺度唯一来源于训练时的相机真值监督**。
+3. **强制几何反投影推导光流**：严格禁止网络随意预测光流作弊。所有的物理光流均由公式计算得出：
+   `Flow_rigid = Project( SE3_cam * Backproject(Depth, K), K )`
+   `Final_Flow = Flow_rigid + Flow_residual * Dynamic_Mask`
+4. **实例追踪与状态持久化**：依靠 32 个跨 Chunk 持久化存在的 Queries 状态执行跨越时间线的物体锁定。
 
 ---
 
 ## 2. 多阶段自适应课程训练器 (TAOTrainer)
 
-物理常识与三维几何关系的无监督学习极难在单一阶段或单一损失下直接收敛。`TAOTrainer` 担当“交响乐指挥家”，负责多阶段课程训练、在线评估诊断及训练性能极致优化。
+物理常识与三维几何关系的无监督学习极难在单一阶段或单一损失下直接收敛。`TAOTrainer` 担当“交响乐指挥家”，负责多阶段课程训练。
 
 ### 2.1 三阶段动态课程调度 (Curriculum Loss Scheduling)
-
-```mermaid
-timeline
-    title 多阶段课程调度曲线
-    0 ~ 2000 步 : 阶段 1：聚焦检测与深度 <br> 激活目标检测、实例分割和单帧深度分支。 <br> 损失配比：obj=1.0, box=2, mask=2, depth=5.0
-    2000 ~ 5000 步 : 阶段 2：引入相机姿态与稠密光流 <br> 激活 Ego-Pose 自运动估计与前后向光流预测。 <br> 引入 smooth 平滑约束（权重 0.05）。
-    5000+ 步 : 阶段 3：激活异常自监督与时空追踪 <br> 激活时空 Mamba 的特征预测机制与 Tracklet-Aware 匈牙利追踪。 <br> 引入 anom=1.0, track=1.0, attr=0.5 (带有效掩码的物理属性)。
-```
-
-### 2.2 极致去同步化与 GPU 高效利用
-
-为了确保英伟达 GPU 带宽利用率在自监督大模型训练中持续维持在 **90% 以上**，本模块实现了以下极致优化运行路径：
-* **零阻断日志系统**：在主训练循环内，将反向传播计算所得的损失浮点数作为 `detached GPU Tensor` 累加。彻底清除了高频的 `.item()` 主机-设备（Host-Device）阻塞同步。只有在每 10 步的日志打印迭代中，才将累加的 Tensor 批量在 CPU 端转换一次，消除了 PCI-e 传输瓶颈。
-* **在线自诊断度量评估 (Diagnostic Metrics)**：在没有标注的训练过程中，利用 GPU 在线实时估算预测与真实的 **AbsRel (绝对相对深度误差)**、**RMSElog (对数均方根误差)**、**EPEpx (像素级光流终点误差)**，实时评估物理自监督的收敛健康度。
+1. **阶段 1 (0-2000步)**：聚焦静态物体与基础视差，启动深度分支与刚性特征。
+2. **阶段 2 (2000-5000步)**：引入全局相机真实运动监督（Ego Pose GT），建立起几何重构的绝对尺度锚点，计算刚体光流误差。
+3. **阶段 3 (5000+步)**：激活残差光流、异常预测与 Tracklet-Aware 时空追踪，实现完整的物理系统解耦。
 
 ---
 
-## 3. 自监督三维几何与光度重投影损失
+## 3. 半监督混合几何重投影训练与防毒
 
-在无标注单目视觉下，模型通过建立前后两帧在三维空间中的投影等价关系来计算自监督损失：
+在依赖前后多帧序列建立的三维空间重投影等价关系中，为了保证在极具挑战的游戏环境中稳健收敛，我们引入了两项巧妙的防毒机制：
 
-### 3.1 物理反投影 Warping 与 SSIM 光度损失
-* **三维投影建立 (`inverse_warp`)**：
-  给定当前时刻图像 $I_t$，预测的绝对深度图 $D_t$，相机自运动位姿变换矩阵 $T_{t \to t+1}$ 以及相机内参矩阵 $K$。
-  1. 我们首先将 $I_t$ 的二维像素坐标 $p_t = [u, v, 1]^T$ 乘以绝对深度 $D_t(p_t)$，利用相机内参逆矩阵反投影回三维相机坐标系下的 3D 点云 $P_t = [X, Y, Z]^T$：
-     $$P_t = D_t(p_t) \cdot K^{-1} p_t$$
-  2. 根据预测的相对位姿将点云变换到下一时刻坐标系：
-     $$P_{t+1} = R_{t \to t+1} P_t + T_{t \to t+1}$$
-  3. 将变换后的点云重新正投影回下一时刻的图像二维网格坐标 $p_{t+1}$ 上：
-     $$p_{t+1} = K P_{t+1}$$
-  4. 利用重投影得到的采样网格 $p_{t+1}$ 对未来帧图像 $I_{t+1}$ 执行双线性插值采样，重构出逆向 warped 图像 $\hat{I}_t$。
-* **SSIM 混合光度一致性损失 (Photometric Loss)**：
-  通过比对原始图像 $I_t$ 与 warped 重构图像 $\hat{I}_t$ 之间的结构相似度与绝对差值，强迫模型理解空间的三维深度与自运动结构：
-  $$\mathcal{L}_{\text{photo}} = \alpha \cdot \frac{1 - \text{SSIM}(I_t, \hat{I}_t)}{2} + (1 - \alpha) \cdot \|I_t - \hat{I}_t\|_1$$
+### 3.1 相机真值注入与 UI 数据投毒 (Data Augmentation)
+* **相机真值强监督**：在训练阶段，直接利用游戏引擎提取的两帧间相机真实运动 GT $\xi_{cam\_gt}$ 对相机的 SE3 分支施加 L1/L2 强监督。这直接打破了单目推断极难避免的**深度与自车运动尺度模糊性（Scale Ambiguity）**，迫使网络专注求解真实的深度几何。
+* **合成假 UI 增强（“数据投毒”）**：由于原始数据集无 UI，我们在 Dataloader 阶段随机在画面中绘制彩色几何图块（假血条等），强迫网络训练出极其灵敏的掩码 $p_{ui}$。
 
-### 3.2 边缘感知深度平滑损失 (Edge-Aware Smoothness Loss)
-为了防止深度预测图在纹理平坦的区域出现大范围杂乱突变，但在物体边缘处保持清晰分界，引入了边缘感知的二阶梯度平滑损失。当原始图像的局部颜色变化较小时，对深度图的局部梯度惩罚增大；反之，若图像边缘颜色变化剧烈（代表真实的边界），则减小对深度的平滑惩罚：
-$$\mathcal{L}_{\text{smooth}} = \left| \partial_x D \right| e^{-\left| \partial_x I \right|} + \left| \partial_y D \right| e^{-\left| \partial_y I \right|}$$
+### 3.2 物理反投影 Warping 与自动异常拦截 (Photometric Loss)
+* **三维投影建立 (`inverse_warp`)**：通过给定的相机内参 $K$、求解到的尺度约束深度和位姿 $R, T$，将当前帧像素反投回 3D 点云，经过刚体变换后重新正投影到原图，执行双线性插值进行图像重构。
+* **SSIM 混合光度一致性损失与拦截**：
+  $$\mathcal{L}_{\text{photo}} = (1 - p_{ui}) \cdot \min\left(\mathcal{L}_{\text{fwd\_photo}}, \mathcal{L}_{\text{bwd\_photo}}\right)$$
+  1. **自动遮挡剔除 (Auto-Masking)**：前向与后向重构误差取最小值 $\min()$，自动剔除物体遮挡带来的谬误。
+  2. **UI 干扰截断**：误差乘以 $(1 - p_{ui})$，任何落在假 UI 或 HUD 界面的像素，其重投影误差都会被拦截清零，保证传回 Backbone 的每一滴梯度都纯净无瑕。
 
 ---
 
-## 4. 时序稳定 Tracklet-Aware 匈牙利追踪损失
+## 4. 异常特征检测与持久化时序追踪损失
 
-在进行多尺度实例追踪时，直接为每帧独立求解匈牙利匹配会由于物体遮挡或短暂重叠而导致实例 ID 频繁跳变（ID Switch）。我们特别设计了持久化 **Tracklet-Aware 追踪状态匹配机制**：
+### 4.1 FeaturePredictorHead (基于不确定性的异常发现)
+真正的物理异常检测不仅是特征相减。网络同时预测出一个**不确定性方差图 (Uncertainty Map)**。
+异常分数计算公式升级为：`Anomaly_Score = Norm(Pred_Feature - True_Feature) / Predicted_Uncertainty`。
+在遮挡、模糊等网络原本就不确定的区域，方差增大，抑制错误的高分异常，大幅提升检测可靠性。
 
-### 4.1 持久化 ID 时序绑定与关联
-* 在一段 Chunk 时序序列（长度为 24 帧）中，模型在首帧对 32 个 Query 向量执行全局匈牙利线性匹配（Linear Sum Assignment）。
-* **匹配持久化**：在随后的时序传播中，凡是上一时刻已经匹配并成功绑定的实例，**其 ID 映射关系将强行锁定**，仅对新产生的 GT 实例触发新一轮的匈牙利匹配关联。
-* 这绝对保障了同一个物体在其生命周期内始终牢牢绑定到同一个 Query 插槽上，大幅降低了追踪 ID 跳变。
-
-### 4.2 向量化损失合并发射
-* 为了最小化由于逐物体计算损失带来的 PyTorch 算子发射高额延迟，我们将所有绑定的存活实例在其对应的帧位置切片汇总。
-* 在 CPU 上集中收集切片索引，最终在循环外**单次发射向量化** Smooth L1（用于边界框坐标回归）与 BCE（用于存活置信度评估）算子：
-  $$\mathcal{L}_{\text{track}} = \sum_{k \in \text{active}} \text{SmoothL1}\left( B_{\text{pred}}^{(k)}, B_{\text{gt}}^{(k)} \right) + \sum_{k} \text{BCE}\left( P_{\text{alive}}^{(k)}, Y_{\text{alive}}^{(k)} \right)$$
-  极大减少了 Host 侧指令的发射开销，实现了高稳定性与高速推理的完美融合。
+### 4.2 时序稳定的 Tracklet-Aware 匈牙利匹配
+* **Persistent Memory (跨帧锁死)**：凡是上一时刻已经匹配的实例，其 ID 映射关系将强行锁定并继承其隐含状态，仅对新产生的 GT 实例触发新一轮的匈牙利线性匹配关联。
+* **激活保障**：所有追踪宽高的预测输出经过严密的 `Softplus(x) + 1e-4` 处理，完全杜绝了 GIoU 损失计算崩盘。

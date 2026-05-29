@@ -58,15 +58,19 @@ class YOLOEBackbone(nn.Module):
         return y[0], y[1], y[16], y[19], y[22]
 
 class TAONot42VisionModel(nn.Module):
-    """TAO-Not-42 视觉模型，集成了检测、分割、深度、光流和追踪功能。"""
+    """TAO-Not-42 视觉模型，集成了检测、分割、多帧几何解译、Splatting 物理组装和追踪功能。"""
     def __init__(self):
         super().__init__()
         self.segmenter = YOLOEBackbone() 
+        
         self.geom_decoder = UnifiedGeometryDecoder(128, 64, 32)
+        self.se3_physics_head = SE3PhysicsHead(ch_list=[128, 256, 512], prototype_ch=32)
+        self.rigid_projector = RigidFlowProjector()
+        
         self.st_block = SpatioTemporalMambaBlock(128)
         self.st_block_p4 = SpatioTemporalMambaBlock(256)
         self.st_block_p5 = SpatioTemporalMambaBlock(512)
-        self.pose_head = EgoPoseHead(128)
+        
         self.feature_predictor = FeaturePredictorHead(128)
         self.state_update_gate_head = nn.Sequential(nn.Linear(128, 64), nn.SiLU(), nn.Linear(64, 1))
         self.track_module = TrackQueryModule(feat_channels=128, num_queries=32, num_heads=4, nc=4585, nm=32)
@@ -77,18 +81,18 @@ class TAONot42VisionModel(nn.Module):
     def extract_features(self, peripheral):
         return self.segmenter(peripheral)
 
-    def forward_physics(self, f1, f2, p3_fused, p4, p5, dt, step, get_loss_weights_fn=None, original_shape=None, tgts=None):
+    def forward_physics(self, f1, f2, p3_fused, p4, p5, dt, step, get_loss_weights_fn=None, original_shape=None, tgts=None, K=None, K_inv=None, prev_queries=None):
         B, T = f1.shape[:2]
         h, w = original_shape if original_shape else (f1.shape[3] * 2, f1.shape[4] * 2)
         t0 = torch.rand(B, 1, device=f1.device) * 1000.0
         t_abs = t0 + torch.cumsum(dt, dim=1)
 
-        # 1. 时空特征混合
+        # 1. 时序特征混合
         next_st, spatiotemporal_p3, spatiotemporal_p4, spatiotemporal_p5 = self._run_spatiotemporal_mixing(
             p3_fused, p4, p5, t_abs
         )
 
-        # 2. 运行 YOLOE 分割预测头（训练时返回 dict，推理时返回 tuple）
+        # 2. 运行 YOLOE 分割预测头
         seg_preds = self.segmenter.model[-1]([
             spatiotemporal_p3.flatten(0, 1),
             spatiotemporal_p4.flatten(0, 1),
@@ -97,37 +101,40 @@ class TAONot42VisionModel(nn.Module):
         seg_dict = seg_preds if isinstance(seg_preds, dict) else {}
 
         lw = get_loss_weights_fn(step) if get_loss_weights_fn else {"flow": 1, "box": 1, "mask": 1, "anom": 1}
-        ego_pose = self.pose_head(spatiotemporal_p3.flatten(0, 1))
 
-        # 3. 几何与运动预测解码
-        depth_pred, flow_pred = self._run_geometry_decoding(
-            f1, f2, spatiotemporal_p3, ego_pose, (lw["flow"] > 0), B, T, h, w
+        # 3. 严格遵循物理方程的几何与运动解码 (深度、位姿、Object Splatting 拼装最终光流)
+        depth_pred, flow_pred, ego_pose_dict = self._run_geometry_decoding(
+            f1, f2, spatiotemporal_p3, spatiotemporal_p4, spatiotemporal_p5, B, T, h, w, K, K_inv
         )
+        
+        # 将 EgoPose 的字典提取出用于 Feature Predictor 的拼接动作向量
+        ego_action_vec = torch.cat([ego_pose_dict["t"], ego_pose_dict["rot6d"]], dim=1)
 
         # 状态更新门计算
         gate_logits = self.state_update_gate_head(spatiotemporal_p3.mean(dim=[3, 4]).flatten(0, 1))
         gate = torch.sigmoid(gate_logits).view(B*T)
 
-        # 4. 异常检测与自监督计算
-        feat_err = self._run_anomaly_detection(next_st, ego_pose, lw["anom"], B, T, f1.device)
+        # 4. 异常检测与自监督计算 (结合不确定性方差)
+        feat_err = self._run_anomaly_detection(next_st, ego_action_vec, lw["anom"], B, T, f1.device)
 
-        # 5. 端到端追踪预测模块
-        track_out = self._run_tracking(spatiotemporal_p3)
+        # 5. 跨 Chunk 持久化时序追踪
+        track_out, next_queries = self._run_tracking(spatiotemporal_p3, prev_queries)
 
         return {
-            # ── 检测与分割预测（由 YOLOESegment26.forward 输出）──────────────
-            **seg_dict,   # objectness, boxes, box_dist, mask_coefficients, mask_prototypes, classification
-            # ── 几何与运动预测 ────────────────────────────────────────────────
-            "depth": depth_pred, "log_depth": torch.log(depth_pred), "ego_pose": ego_pose,
+            **seg_dict, 
+            "depth": depth_pred, 
+            "log_depth": torch.log(depth_pred + 1e-4), 
+            "ego_pose": ego_pose_dict,
             "flow": flow_pred,
-            # ── 时空特征与异常检测 ────────────────────────────────────────────
-            "features": spatiotemporal_p3.flatten(0, 1), "anomaly_map": feat_err.flatten(0, 1),
-            "feature_error": feat_err.mean(), "state_update_gate": gate,
-            # ── 追踪预测 ──────────────────────────────────────────────────────
+            "features": spatiotemporal_p3.flatten(0, 1), 
+            "anomaly_map": feat_err.flatten(0, 1),
+            "feature_error": feat_err.mean(), 
+            "state_update_gate": gate,
             "track_boxes":   track_out["track_boxes"],
             "track_classes": track_out["track_classes"],
             "track_alive":   track_out["track_alive"],
             "track_masks":   track_out["track_masks"],
+            "next_queries":  next_queries
         }
 
     def _run_spatiotemporal_mixing(self, p3_fused, p4, p5, t_abs):
@@ -143,26 +150,65 @@ class TAONot42VisionModel(nn.Module):
         next_st_p5, spatiotemporal_p5 = update_st(self.st_block_p5, p5)
         return next_st, spatiotemporal_p3, spatiotemporal_p4, spatiotemporal_p5
 
-    def _run_geometry_decoding(self, f1, f2, spatiotemporal_p3, ego_pose, need_flow, B, T, h, w):
+    def _run_geometry_decoding(self, f1, f2, spatiotemporal_p3, spatiotemporal_p4, spatiotemporal_p5, B, T, h, w, K, K_inv):
         f1_t = self.f1_temporal(f1.permute(0, 2, 1, 3, 4)).permute(0, 2, 1, 3, 4)
         f2_t = self.f2_temporal(f2.permute(0, 2, 1, 3, 4)).permute(0, 2, 1, 3, 4)
 
-        depth_raw, flow_raw = self.geom_decoder(
-            f1_t.flatten(0, 1), f2_t.flatten(0, 1), spatiotemporal_p3.flatten(0, 1),
-            ego_pose_feat=ego_pose, need_flow=need_flow
+        # UnifiedGeometryDecoder 仅负责解译深度与遮挡
+        geom_out = self.geom_decoder(
+            f1_t.flatten(0, 1), f2_t.flatten(0, 1), spatiotemporal_p3.flatten(0, 1)
         )
-        depth_pred = torch.exp(torch.clamp(F.interpolate(depth_raw, size=(h, w), mode="bilinear", align_corners=False).squeeze(1), min=-4.6, max=4.6)).view(B*T, h, w)
-        flow_pred = flow_raw * 1.5 if flow_raw is not None else None
-        return depth_pred, flow_pred
+        inv_depth_raw = geom_out["inv_depth"]
+        
+        # SE3PhysicsHead 预测位姿、对象锚点、覆盖权重，并组装出 dense_obj_mask 和 residual_flow
+        se3_out = self.se3_physics_head([
+            spatiotemporal_p3.flatten(0, 1),
+            spatiotemporal_p4.flatten(0, 1),
+            spatiotemporal_p5.flatten(0, 1)
+        ])
+        
+        T_cam = se3_out["se3_cam"]["T"]
+        
+        # 伪造默认内参矩阵，防止 K=None
+        if K is None:
+            B_T = B * T
+            device = f1.device
+            K = torch.eye(3, device=device).unsqueeze(0).repeat(B_T, 1, 1)
+            K[:, 0, 0] = w
+            K[:, 1, 1] = h
+            K[:, 0, 2] = w / 2.0
+            K[:, 1, 2] = h / 2.0
+            K_inv = torch.inverse(K)
+            
+        inv_depth_resized = F.interpolate(inv_depth_raw, size=(h, w), mode="bilinear", align_corners=False)
+        
+        # 背景光流：严格由 3D 刚体反投影推导产生，严禁作弊
+        flow_rigid = self.rigid_projector(inv_depth_resized, T_cam, K, K_inv)
+        
+        # 动态残差流：仅作用于被 Object Splatting 圈出来的对象掩码区域内
+        obj_mask = F.interpolate(se3_out["dense_obj_mask"], size=(h, w), mode="bilinear", align_corners=False)
+        res_flow = F.interpolate(se3_out["residual_flow"], size=(h, w), mode="bilinear", align_corners=False)
+        
+        # 最终输出的严谨物理流
+        flow_final = flow_rigid + obj_mask * res_flow
+        
+        depth_pred = inv_depth_resized.view(B*T, h, w)
+        return depth_pred, flow_final, se3_out["se3_cam"]
 
-    def _run_anomaly_detection(self, next_st, ego_pose, lw_anom, B, T, device):
+    def _run_anomaly_detection(self, next_st, ego_action_vec, lw_anom, B, T, device):
         feat_err = torch.zeros(B, T, next_st.shape[-2], next_st.shape[-1], device=device)
         if lw_anom > 0 and T > 1:
             prev_st = next_st[:, :-1].flatten(0, 1)
-            prev_ego = ego_pose.view(B, T, 9)[:, :-1].flatten(0, 1)
-            predicted_st = self.feature_predictor(prev_st, prev_ego).view(B, T-1, *next_st.shape[2:])
-            feat_err[:, 1:] = F.smooth_l1_loss(predicted_st, next_st[:, 1:], reduction="none").mean(dim=2)
+            prev_ego = ego_action_vec.view(B, T, 9)[:, :-1].flatten(0, 1)
+            
+            predicted = self.feature_predictor(prev_st, prev_ego)
+            pred_feat = predicted["pred_feat"].view(B, T-1, *next_st.shape[2:])
+            uncertainty = predicted["uncertainty"].view(B, T-1, *next_st.shape[2:])
+            
+            error = F.smooth_l1_loss(pred_feat, next_st[:, 1:], reduction="none")
+            anomaly_score = (error / uncertainty).mean(dim=2)
+            feat_err[:, 1:] = anomaly_score
         return feat_err
 
-    def _run_tracking(self, spatiotemporal_p3):
-        return self.track_module(spatiotemporal_p3)
+    def _run_tracking(self, spatiotemporal_p3, prev_queries=None):
+        return self.track_module(spatiotemporal_p3, prev_queries)

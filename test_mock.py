@@ -187,6 +187,8 @@ def test_all_stages():
             vis_frame_idx = 1  # second frame: has both t-1 and t+1 neighbours
             def slice_vis_frame(v):
                 if v is None: return None
+                if isinstance(v, dict):
+                    return {k: slice_vis_frame(val) for k, val in v.items()}
                 if isinstance(v, list):
                     return [x[(B - 1) * T + vis_frame_idx : (B - 1) * T + vis_frame_idx + 1] if (x.dim() > 0 and x.shape[0] == B * T) else (x[-B:] if x.dim() > 0 else x) for x in v]
                 if v.dim() == 0: return v
