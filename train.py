@@ -89,7 +89,7 @@ if __name__ == "__main__":
             wait_timeout_sec=args.data_timeout_sec)
         model = TAONot42VisionModel()
 
-        trainer = TAOTrainer(args, model, data_buffer, prefetcher)
+        trainer = TAOTrainer(args, model, prefetcher)
         trainer.train()
     except KeyboardInterrupt:
         print("\n🛑 训练被用户中断。")

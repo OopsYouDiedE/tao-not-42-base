@@ -19,13 +19,13 @@ from utils.visualization import *
 # =====================================================================
 
 class TAOTrainer:
-    def __init__(self, args, model, buffer, prefetcher):
+    def __init__(self, args, model, prefetcher):
         self.args = args
         self.device = torch.device(args.device)
         self.model = model.to(self.device)
-        self.buffer = buffer
         self.prefetcher = prefetcher
         self.wandb = wandb if (wandb is not None and getattr(wandb, "run", None) is not None) else None
+        self.loss_ema = {}
 
         if self.args.yolo_weights:
             self._load_yolo_weights()
@@ -243,16 +243,6 @@ class TAOTrainer:
         tgt["cam_quat_next"] = cam_quat_next.flatten(0, 1)
         tgt["has_next"] = has_next.flatten(0, 1)
 
-        if "cls_dense" in tgt:
-            for i, step in enumerate(range(c_start, c_end)):
-                if self.global_step < 1000 or step < 2:
-                    if isinstance(tgt["cls_dense"], list):
-                        for x in tgt["cls_dense"]:
-                            x.view(B, T, *x.shape[1:])[:, i] = -100
-                    else:
-                        tgt["cls_dense"].view(
-                            B, T, *tgt["cls_dense"].shape[1:])[:, i] = -100
-
         return tgt
 
     def _train_chunk(self, batch):
@@ -283,15 +273,26 @@ class TAOTrainer:
                 dt = torch.full(
                     (v_seq.shape[0], T_chunk), 1.0 / 24.0, device=self.device)
                 tgts = self._extract_target_chunk(batch, c_start, c_end, t_max)
+
+                # 步骤 5：在提取完 Target Chunk 后，利用 self.global_step 完成 cls_dense 重写覆盖
+                if "cls_dense" in tgts:
+                    for i, step in enumerate(range(c_start, c_end)):
+                        if self.global_step < 1000 or step < 2:
+                            if isinstance(tgts["cls_dense"], list):
+                                for x in tgts["cls_dense"]:
+                                    x.view(v_seq.shape[0], T_chunk, *x.shape[1:])[:, i] = -100
+                            else:
+                                tgts["cls_dense"].view(
+                                    v_seq.shape[0], T_chunk, *tgts["cls_dense"].shape[1:])[:, i] = -100
+
                 preds = self.model.forward_physics(
                     *feats, dt, self.global_step, get_loss_weights, c_vids.shape[-2:], tgts=tgts)
 
-                img_next = torch.zeros_like(c_vids)
-                for i, step in enumerate(range(c_start, c_end)):
-                    img_next[:, i] = v_seq[:, min(step+1, t_max-1)]
+                img_next = self._build_next_frames(v_seq, c_start, c_end, t_max)
 
+                # 步骤 4：显式向 compute_physics_loss 传入实例 EMA 状态
                 loss, l_dict, w_img = compute_physics_loss(preds, tgts, c_vids.flatten(
-                    0, 1), img_next.flatten(0, 1), self.mode, self.global_step)
+                    0, 1), img_next.flatten(0, 1), self.mode, self.global_step, ema_state=self.loss_ema)
 
             if self.scaler:
                 self.scaler.scale(loss).backward()
@@ -308,43 +309,8 @@ class TAOTrainer:
             for k in loss_acc:
                 loss_acc[k] += l_dict.get(k, 0.0) * T_chunk
 
-            if (self.global_step + 1) % self.args.vis_interval == 0:
-                def slice_second_frame(v):
-                    if v is None:
-                        return None
-                    if isinstance(v, list):
-                        res = []
-                        for x in v:
-                            if x.dim() == 0:
-                                res.append(x)
-                            elif x.shape[0] == v_seq.shape[0] * T_chunk:
-                                res.append(
-                                    x[(v_seq.shape[0] - 1) * T_chunk + 1: (v_seq.shape[0] - 1) * T_chunk + 2])
-                            else:
-                                res.append(x[-v_seq.shape[0]:])
-                        return res
-                    if v.dim() == 0:
-                        return v
-                    if (
-                        v.dim() >= 4
-                        and v.shape[0] == v_seq.shape[0]
-                        and v.shape[1] == T_chunk
-                    ):
-                        frame_id = min(1, T_chunk - 1)
-                        return v[-1:, frame_id]
-                    if v.shape[0] == v_seq.shape[0] * T_chunk:
-                        return v[(v_seq.shape[0] - 1) * T_chunk + 1: (v_seq.shape[0] - 1) * T_chunk + 2]
-                    return v[-v_seq.shape[0]:]
-
-                fp = save_visualization(
-                    c_vids[-1:, 1],
-                    {k: slice_second_frame(v) for k, v in tgts.items()},
-                    {k: slice_second_frame(v) for k, v in preds.items()},
-                    self.global_step + 1,
-                    slice_second_frame(w_img) if w_img is not None else None
-                )
-                if self.wandb and fp:
-                    self.wandb.log({"Vis": self.wandb.Image(fp)}, step=self.global_step)
+            # 步骤 2：使用提取出的外部可视化辅助方法
+            self._maybe_visualize(c_vids, tgts, preds, w_img, T_chunk)
 
             self.global_step += 1
             if self.global_step % 10 == 0:
@@ -359,4 +325,49 @@ class TAOTrainer:
 
         return total_loss_tensor
 
-# =====================================================================
+    def _slice_frame(self, v, B, T_chunk):
+        if v is None:
+            return None
+        if isinstance(v, list):
+            res = []
+            for x in v:
+                if x.dim() == 0:
+                    res.append(x)
+                elif x.shape[0] == B * T_chunk:
+                    res.append(
+                        x[(B - 1) * T_chunk + 1: (B - 1) * T_chunk + 2])
+                else:
+                    res.append(x[-B:])
+            return res
+        if v.dim() == 0:
+            return v
+        if (
+            v.dim() >= 4
+            and v.shape[0] == B
+            and v.shape[1] == T_chunk
+        ):
+            frame_id = min(1, T_chunk - 1)
+            return v[-1:, frame_id]
+        if v.shape[0] == B * T_chunk:
+            return v[(B - 1) * T_chunk + 1: (B - 1) * T_chunk + 2]
+        return v[-B:]
+
+    def _build_next_frames(self, v_seq, c_start, c_end, t_max):
+        c_vids = v_seq[:, c_start:c_end]
+        img_next = torch.zeros_like(c_vids)
+        for i, step in enumerate(range(c_start, c_end)):
+            img_next[:, i] = v_seq[:, min(step+1, t_max-1)]
+        return img_next
+
+    def _maybe_visualize(self, c_vids, tgts, preds, w_img, T_chunk):
+        if (self.global_step + 1) % self.args.vis_interval == 0:
+            B = c_vids.shape[0]
+            fp = save_visualization(
+                c_vids[-1:, 1],
+                {k: self._slice_frame(v, B, T_chunk) for k, v in tgts.items()},
+                {k: self._slice_frame(v, B, T_chunk) for k, v in preds.items()},
+                self.global_step + 1,
+                self._slice_frame(w_img, B, T_chunk) if w_img is not None else None
+            )
+            if self.wandb and fp:
+                self.wandb.log({"Vis": self.wandb.Image(fp)}, step=self.global_step)

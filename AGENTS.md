@@ -85,3 +85,36 @@
      - `tests/mock_scipy.py`：仿冒 scipy.optimize 匈牙利匹配逻辑。
      - `tests/mock_data.py`：高保真物理仿真球漂移模拟器及 MOVi-E 真实数据加载。
   3. **测试入口环境约束**：重构 `test_mock.py`，在启动时强行断言 `torch.cuda.is_available()` 确保必须在 CUDA 环境下执行，并在模型与训练组件载入前自动完成多组件的 Mock 动态注入和测试校验。
+
+### 8. 核心头部模块解耦与根目录纯净化重构 (Core Heads Decoupling & Root Directory Purification)
+- **决策背景**：此前 `models/custom_heads.py` 体积庞大，混合了官方 YOLOE-26s-seg-pf 对齐专有的目标检测与分割预测头（如 `YOLOESegment26`、`LRPCHead` 等）以及项目特定的时空追踪/物理/几何估计头部，职责不够单一，不利于后续的对齐冻结、训练参数隔离以及模块化测试。此外，根目录下遗留了临时、一次性开发调试脚本（如 `check_backbone.py` 和 `deep_compare.py`），导致命名空间和根目录不够纯净。
+- **重构方案与实现**：
+  1. **YOLOE 对齐头部完全独立剥离**：新建了 `models/yoloe_head.py`，将 `YOLOESegment26`、`LRPCHead`、`Proto26`、`BNContrastiveHead` 以及辅助 Transformer 的 `SwiGLUFFN`、`Residual`、`SAVPE` 全部解耦移入其中。
+  2. **项目特定任务头部职责单一化**：在 `models/custom_heads.py` 中仅留存项目特有的 `SpatioTemporalMambaBlock`、`UnifiedGeometryDecoder`、`EgoPoseHead`、`FeaturePredictorHead` 和 `TrackQueryModule`，两套头部分别归属于对应的文件，使得架构逻辑极致清晰。
+  3. **根目录纯净化与路径强固化**：删除了根目录下的 `check_backbone.py` 和 `deep_compare.py`，将其规范移动到 `scripts/` 目录下（`scripts/check_backbone.py` 和 `scripts/deep_compare.py`），并在顶部加入了鲁棒的 Python 包搜索路径设置 `sys.path.insert(0, ...)`，确保可以跨目录从项目根运行且保持环境整洁。
+  4. **全套级联引用重构**：更新了 `models/tao_core.py` 里的多头部引用，并补全了 `models/__init__.py` 里的统一导出。
+- **验证结果**：
+  - 运行 `python tests/test_yoloe_bus.py`：对齐测试完美通过！迁移官方权重后，我们重构的骨干与分割头在真实图像上取得了 46/46 个检测目标 **100% 毫无差别的数值一致性**，完美对齐官方推理结果！
+  - 运行 `python test_mock.py`：5 阶段物理与时空联合课程训练及第 6 阶段端到端追踪训练在 GPU 上 **完美闭环运行通过**，反向传播梯度检测状态优良（Gradient norms OK），可视化文件顺利输出！
+
+
+## 日志条目：2026-05-29
+
+### 9. 核心代码库解耦、模块化演进与工程纯净化重构 (Core Codebase Decoupling, Modularization & Purification)
+- **决策背景**：系统经过多轮优化与物理模块的引入，核心文件开始臃肿，出现了职责重叠与局部过度耦合的情况（例如 `dataset.py` 中承担了过重的 GPU 预处理标定算子、`trainer.py` 内部 `_train_chunk` 充斥嵌套闭包、`losses.py` 中存在全局可变 EMA 状态导致多进程隐患）。为提升组件内聚力与模块化水平，展开本次高标准结构重构。
+- **重构方案与实现**：
+  1. **GPU 预处理模块彻底剥离**：新建了 `utils/label_generator.py`，将 300 多行的密集 GPU 标注切分与数据转换大函数 `process_batch_on_gpu` 及其配套的 `pad_instances` 和 `instance_presence` 彻底搬移其中。在 `dataset.py` 中移除该函数，替换为标准且清晰的导入链 `from utils.label_generator import process_batch_on_gpu`，在 `utils/__init__.py` 中补全导出。
+  2. **消除全局 losses.py EMA 字典**：彻底清除了 `utils/losses.py` 内部的全局可变变量 `LOSS_EMA = {}`，改在 `TAOTrainer.__init__` 中作为实例级字典 `self.loss_ema` 初始化，并在主训练循环和 `compute_physics_loss` 中以局部传参 `ema_state=self.loss_ema` 的方式在方法链上游走，完美消除了并发状态争抢与隐性全局变量污染。
+  3. **前向物理预测核心方法职责分治**：重构 `models/tao_core.py` 里的 `TAONot42VisionModel.forward_physics`，将其拆解为 4 个职责极其单一的私有子方法：`_run_spatiotemporal_mixing`、`_run_geometry_decoding`、`_run_anomaly_detection` 和 `_run_tracking`，并在 `forward_physics` 方法中作为总控协调执行，极大地降低了认知负载。
+  4. **数据切片逻辑纯化**：将 `_extract_target_chunk` 中的 `self.global_step` 依赖彻底解耦移除。把对 `cls_dense = -100` 的训练阶段重写覆盖逻辑移回 `_train_chunk` 内部，使其作为切片提取后的独立流水线操作。
+  5. **主训练循环内部嵌套解耦与重塑**：
+     - 在 `trainer.py` 中，将 `_train_chunk` 复杂的 nested `slice_second_frame` 本地闭包函数提取为 `TAOTrainer._slice_frame` 方法。
+     - 将未来图像帧 `img_next` 的时序拼装行为提取为 `TAOTrainer._build_next_frames` 方法.
+     - 将可视化渲染与 W&B 日志调用提取为 `TAOTrainer._maybe_visualize` 方法。
+     - 极大地精炼了 `_train_chunk` 的长函数体积，主循环行数骤减 60%，清晰呈现前向计算、梯度回传与参数更新核心流程。
+  6. **构造与传参规范化纯化**：清除了 `TAOTrainer` 构造函数中未被引用的 `buffer` 传参，将 `self.buffer` 彻底删除；同步更新 `train.py` 中的实例化链，使得整个工程不留一丝冗余死码。
+- **验证结果**：
+  - 运行 `python tests/test_yoloe_bus.py`：对齐测试完美通过！数值比对余弦相似度均维持 **1.000000**，46 个检测目标 100% 绝对一致！
+  - 运行 `python test_mock.py`：多课程闭环与 Stage 6 时序追踪回归测试 100% 完美通过，梯度流动极为健康，可视化输出毫无偏移！
+
+

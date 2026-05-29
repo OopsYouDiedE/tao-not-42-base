@@ -179,19 +179,17 @@ def get_loss_weights(step):
     }
 
 
-LOSS_EMA = {}
-
-
-def get_ema_loss(name, current_val, alpha=0.95):
-    global LOSS_EMA
+def get_ema_loss(name, current_val, alpha=0.95, ema_state=None):
+    if ema_state is None:
+        ema_state = {}
     with torch.no_grad():
         val = current_val.detach()
-        if name not in LOSS_EMA:
-            LOSS_EMA[name] = val.clone() if val > 0.0 else torch.tensor(
+        if name not in ema_state:
+            ema_state[name] = val.clone() if val > 0.0 else torch.tensor(
                 1.0, device=val.device)
         if val > 0.0:
-            LOSS_EMA[name] = LOSS_EMA[name] * alpha + val * (1.0 - alpha)
-        return torch.clamp(LOSS_EMA[name], min=1e-4) if val > 0.0 else torch.tensor(1.0, device=val.device)
+            ema_state[name] = ema_state[name] * alpha + val * (1.0 - alpha)
+        return torch.clamp(ema_state[name], min=1e-4) if val > 0.0 else torch.tensor(1.0, device=val.device)
 
 # =====================================================================
 # 端到端追踪损失函数
@@ -472,7 +470,7 @@ def compute_attribute_loss(preds, targets):
     return loss / max(n_terms, 1)
 
 
-def compute_physics_loss(preds, targets, img_t=None, img_next=None, mode="supervised", step=0):
+def compute_physics_loss(preds, targets, img_t=None, img_next=None, mode="supervised", step=0, ema_state=None):
     device = preds["depth"].device
     H, W = preds["depth"].shape[-2:]
     w = get_loss_weights(step)
@@ -598,7 +596,7 @@ def compute_physics_loss(preds, targets, img_t=None, img_next=None, mode="superv
     }
 
     tot = sum(w.get(k.lower(), 0) *
-              (l / get_ema_loss(k[:3], l)) for k, l in loss_components.items())
+              (l / get_ema_loss(k[:3], l, ema_state=ema_state)) for k, l in loss_components.items())
     tot += w.get("smooth", 0.05) * loss_smooth + w.get("gate",
                                                        0.05) * loss_gate + w.get("track", 0) * loss_track
 

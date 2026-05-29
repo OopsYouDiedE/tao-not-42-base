@@ -81,3 +81,38 @@
 2. 权重 state_dict 中的官方路径（如 `model.*` 或 `model.model.*`）被自动映射为本地的 `segmenter.model.*`。
 3. 严格匹配机制：仅当参数名称映射成功且张量形状完全一致时才会载入。
 4. **加载成功率**：可成功加载 **243 / 298 个键**（81.5%）。诸如 RepRTA、SAVPE 等在本地被精简或改造的结构参数被安全跳过。
+
+---
+
+## 3. 项目核心类（Class）分门别类详细索引 (Structured Class Directory)
+
+为了便于开发者极速查询和深度掌握代码实现，项目为各文件夹下的每一个核心 Class 均构建了**专有的、极其细致的独立知识文档**。点击下方超链接可一键直达对应 Class 的说明：
+
+### 📂 [dataset/](file:///c:/Users/iii/Desktop/tao-not-42-base/dataset.py) — 异步数据加载与 GPU 预处理
+- 🚀 [AsyncDataBuffer 详细文档](file:///c:/Users/iii/Desktop/tao-not-42-base/knowledge/dataset/AsyncDataBuffer.md) — 后台异步多模态 TFDS 视频帧缓冲区。
+- ⚡ [CUDAPrefetcher 详细文档](file:///c:/Users/iii/Desktop/tao-not-42-base/knowledge/dataset/CUDAPrefetcher.md) — GPU 并行预取、PCIe 压缩传输与 GPU 端异步并行解码器。
+
+### 📂 [trainer/](file:///c:/Users/iii/Desktop/tao-not-42-base/trainer.py) — 课程训练器
+- 📊 [TAOTrainer 详细文档](file:///c:/Users/iii/Desktop/tao-not-42-base/knowledge/trainer/TAOTrainer.md) — 多阶段自适应课程损失调度与在线自诊断评估系统。
+
+### 📂 [models/tao_core/](file:///c:/Users/iii/Desktop/tao-not-42-base/models/tao_core.py) — 核心架构与大模型集成
+- 🧠 [MyYOLOE 详细文档](file:///c:/Users/iii/Desktop/tao-not-42-base/knowledge/models/tao_core/MyYOLOE.md) — 完全对齐官方 yoloe-26s 拓扑的多尺度特征骨干网络。
+- 🦅 [TAONot42VisionModel 详细文档](file:///c:/Users/iii/Desktop/tao-not-42-base/knowledge/models/tao_core/TAONot42VisionModel.md) — 时空物理自监督与端到端追踪视觉大模型整机集成。
+
+### 📂 [models/custom_heads/](file:///c:/Users/iii/Desktop/tao-not-42-base/models/custom_heads.py) — 项目自定义时空与物理预测头
+- 🕒 [SpatioTemporalMambaBlock 详细文档](file:///c:/Users/iii/Desktop/tao-not-42-base/knowledge/models/custom_heads/SpatioTemporalMambaBlock.md) — 时空特征混合与傅里叶时间嵌入状态空间单元。
+- 📐 [UnifiedGeometryDecoder 详细文档](file:///c:/Users/iii/Desktop/tao-not-42-base/knowledge/models/custom_heads/UnifiedGeometryDecoder.md) — 融入 Ego-Pose 自视差解耦的光流与绝对深度并行预测器。
+- 🚗 [EgoPoseHead 详细文档](file:///c:/Users/iii/Desktop/tao-not-42-base/knowledge/models/custom_heads/EgoPoseHead.md) — 连续 6D 三维旋转矩阵回归头。
+- 🔮 [FeaturePredictorHead 详细文档](file:///c:/Users/iii/Desktop/tao-not-42-base/knowledge/models/custom_heads/FeaturePredictorHead.md) — 自监督物理特征动力学异常映射预测器。
+- 🔗 [TrackQueryModule 详细文档](file:///c:/Users/iii/Desktop/tao-not-42-base/knowledge/models/custom_heads/TrackQueryModule.md) — 持久化时空 Queries 端到端自监督追踪器。
+
+### 📂 [models/yoloe_head/](file:///c:/Users/iii/Desktop/tao-not-42-base/models/yoloe_head.py) — 官方对齐预测与实例分割头
+- 🎯 [YOLOESegment26 详细文档](file:///c:/Users/iii/Desktop/tao-not-42-base/knowledge/models/yoloe_head/YOLOESegment26.md) — 双轨运行、LRTB 坐标映射与 Top-K NMS-Free 推理头。
+- 🎛️ [LRPCHead 详细文档](file:///c:/Users/iii/Desktop/tao-not-42-base/knowledge/models/yoloe_head/LRPCHead.md) — 词表映射层折叠与 PF 门控粗选过滤层。
+- 🧩 [Proto26 详细文档](file:///c:/Users/iii/Desktop/tao-not-42-base/knowledge/models/yoloe_head/Proto26.md) — 爱因斯坦求和实例分割高分辨率原型图生成层。
+- 🧲 [BNContrastiveHead 详细文档](file:///c:/Users/iii/Desktop/tao-not-42-base/knowledge/models/yoloe_head/BNContrastiveHead.md) — 归一化特征高维余弦空间对比度分类分支。
+- 🗺️ [SAVPE 详细文档](file:///c:/Users/iii/Desktop/tao-not-42-base/knowledge/models/yoloe_head/SAVPE.md) — 空间感知多尺度视觉提示词嵌入交互层。
+- 🌀 [SwiGLUFFN_Residual 详细文档](file:///c:/Users/iii/Desktop/tao-not-42-base/knowledge/models/yoloe_head/SwiGLUFFN_Residual.md) — Transformer 双通道非线性门控反馈残差组合层。
+
+### 📂 [models/yolo_blocks/](file:///c:/Users/iii/Desktop/tao-not-42-base/models/yolo_blocks.py) — 底层核心算子积木块
+- 🧱 [YOLO_Blocks 整合文档](file:///c:/Users/iii/Desktop/tao-not-42-base/knowledge/models/yolo_blocks/YOLO_Blocks.md) — SPPF 快速空间池化、C3k2 特征密集流动块、DWConv 等 12 个积木类合集。

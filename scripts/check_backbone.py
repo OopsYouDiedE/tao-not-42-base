@@ -1,3 +1,7 @@
+import sys
+import os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import torch
 import cv2
 import tests.mock_mamba
@@ -80,5 +84,3 @@ for i in range(23):
     if y_off[i] is not None and y_ours[i] is not None:
         diff = torch.max(torch.abs(y_off[i] - y_ours[i])).item()
         print(f"Layer {i} Diff: {diff:.8f}")
-
-EOF
