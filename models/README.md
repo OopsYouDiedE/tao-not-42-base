@@ -23,10 +23,18 @@
 * **`Proto26`**：掩膜原型图发生器，输出 32 通道 1/4 分辨率原型图。
 * **`BNContrastiveHead` & `SAVPE`**：批归一化特征对比学习头与空间感知视觉提示嵌入（用于开放词表与多模态交互）。
 
-### 4. 🛠 [yolo_blocks.py](file:///c:/Users/iii/Desktop/tao-not-42-base/models/yolo_blocks.py) (YOLO 底层基础算子)
+### 4. 🧱 [custom_blocks.py](file:///c:/Users/iii/Desktop/tao-not-42-base/models/custom_blocks.py) (自研细粒度基础模块与几何算子)
+* **`SpatioTemporalMambaBlock` & `SpatioTemporalGRUFallback`**：用于时空维度建模，包括高参数化 Mamba 模块及其向下兼容的 ConvGRU 替代模块。
+* **`TemporalConditioning` & `LocalCorrelationVolume`**：基于 FiLM 的时间步长条件注入模块与 RAFT-lite 风格的局部相关性特征提取模块。
+* **`C2f_SE3Temporal`**：集成 Delta T 条件注入和相关性特征拼接的时空融合 C2f 模块。
+* **各种 Decoder 预测头**：包括逆深度解码器 `DepthDecoder`、SE(3) 运动解码器 `SE3TwistDecoder`、掩码分配解码器 `CoverageMaskDecoder` 与 UI 遮挡解码器 `UIMaskDecoder` 等。
+* **几何与投影积木**：如 `RigidFlowProjector`（相机刚体流三维投影）、`ObjectSE3Composer`（基于 Sparse Splatting 的密集 SE(3) 场合成）和 `ResidualFlowDecoder`（残差流估计）等。
+
+### 5. 🛠 [yolo_blocks.py](file:///c:/Users/iii/Desktop/tao-not-42-base/models/yolo_blocks.py) (YOLO 底层基础算子)
 * 包含了官方标准和增强的底层通用运算积木（如 `Conv` 自动对齐、`DWConv` 深度可分离卷积、`C3k2` 密集跨接增强块、`C2PSA` 金字塔自注意力机制和 `SPPF` 快速空间金字塔池化等）。
 
 ---
+
 
 ## 🛠 设计准则
 

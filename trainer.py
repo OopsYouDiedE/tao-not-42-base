@@ -132,7 +132,7 @@ class TAOTrainer:
             param.requires_grad = False
 
         trainable_modules = [
-            self.model.geom_decoder, self.model.pose_head, self.model.st_block,
+            self.model.geom_decoder, self.model.se3_physics_head, self.model.st_block,
             self.model.st_block_p4, self.model.st_block_p5,
             self.model.feature_predictor, self.model.state_update_gate_head
         ]

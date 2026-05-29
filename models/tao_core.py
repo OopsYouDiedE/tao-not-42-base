@@ -41,7 +41,7 @@ class YOLOEBackbone(nn.Module):
         ])
 
         # 定义路由连接
-        self.routes = {12: [-1, 6], 15: [-1, 4], 18: [-1, 13], 21: [-1, 10], 23: [16, 19, 22]}
+        self.routes = {12: [-1, 6], 15: [-1, 4], 18: [-1, 13], 21: [-1, 10]}
 
     def forward(self, x):
         """前向传播，返回多尺度特征图。"""
@@ -120,6 +120,14 @@ class TAONot42VisionModel(nn.Module):
         # 5. 跨 Chunk 持久化时序追踪
         track_out, next_queries = self._run_tracking(spatiotemporal_p3, prev_queries)
 
+        # 6. 将 anomaly_map 插值到与 depth, flow 同样的高分辨率 (h, w) 以对齐空间结构
+        anomaly_map_resized = F.interpolate(
+            feat_err.flatten(0, 1).unsqueeze(1),
+            size=(h, w),
+            mode="bilinear",
+            align_corners=False
+        ).squeeze(1)
+
         return {
             **seg_dict, 
             "depth": depth_pred, 
@@ -127,7 +135,7 @@ class TAONot42VisionModel(nn.Module):
             "ego_pose": ego_pose_dict,
             "flow": flow_pred,
             "features": spatiotemporal_p3.flatten(0, 1), 
-            "anomaly_map": feat_err.flatten(0, 1),
+            "anomaly_map": anomaly_map_resized,
             "feature_error": feat_err.mean(), 
             "state_update_gate": gate,
             "track_boxes":   track_out["track_boxes"],
@@ -185,12 +193,31 @@ class TAONot42VisionModel(nn.Module):
         # 背景光流：严格由 3D 刚体反投影推导产生，严禁作弊
         flow_rigid = self.rigid_projector(inv_depth_resized, T_cam, K, K_inv)
         
+        # 3D 刚体光流合成：计算对象 3D 刚体流 flow_obj_rigid
+        depth = 1.0 / (inv_depth_resized + 1e-6)
+        X1 = backproject(depth, K_inv)  # Shape: [B*T, 3, h, w]
+        
+        # 从 dense_obj_twist 解码平移与旋转场
+        dense_twist_resized = F.interpolate(se3_out["dense_obj_twist"], size=(h, w), mode="bilinear", align_corners=False)
+        v = dense_twist_resized[:, :3, :, :]
+        omega = dense_twist_resized[:, 3:6, :, :]
+        
+        # 叉乘计算 3D 刚体运动场 dX = v + w x X1
+        dX = v + torch.cross(omega, X1, dim=1)  # Shape: [B*T, 3, h, w]
+        X2_obj = X1 + dX
+        
+        # 投影回 2D 并计算刚体光流
+        uv2_obj = project(X2_obj, K)
+        B_T = inv_depth_resized.shape[0]
+        grid = meshgrid(B_T, h, w, inv_depth_resized.dtype, inv_depth_resized.device)[:, :2, :, :]
+        flow_obj_rigid = uv2_obj - grid  # Shape: [B*T, 2, h, w]
+        
         # 动态残差流：仅作用于被 Object Splatting 圈出来的对象掩码区域内
         obj_mask = F.interpolate(se3_out["dense_obj_mask"], size=(h, w), mode="bilinear", align_corners=False)
         res_flow = F.interpolate(se3_out["residual_flow"], size=(h, w), mode="bilinear", align_corners=False)
         
         # 最终输出的严谨物理流
-        flow_final = flow_rigid + obj_mask * res_flow
+        flow_final = flow_rigid + obj_mask * (flow_obj_rigid + res_flow)
         
         depth_pred = inv_depth_resized.view(B*T, h, w)
         return depth_pred, flow_final, se3_out["se3_cam"]

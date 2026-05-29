@@ -28,8 +28,35 @@ def test_async_data_buffer_offline():
         assert "cam_quat" in item
         assert "forward_flow" in item
         
-        # Check shapes/types
+        # Check shapes, dimensions, and types (Hard contracts)
         assert isinstance(item["video"], torch.Tensor)
         assert item["video"].dim() == 4  # [T, H, W, C]
+        assert item["video"].dtype in (torch.uint8, torch.float32)
+
+        assert isinstance(item["depth"], torch.Tensor)
+        assert item["depth"].dim() == 3  # [T, H, W]
+        assert item["depth"].dtype == torch.float32
+
+        assert isinstance(item["cam_pos"], torch.Tensor)
+        assert item["cam_pos"].dim() == 2  # [T, 3]
+        assert item["cam_pos"].dtype == torch.float32
+
+        assert isinstance(item["cam_quat"], torch.Tensor)
+        assert item["cam_quat"].dim() == 2  # [T, 4]
+        assert item["cam_quat"].dtype == torch.float32
+
+        assert isinstance(item["forward_flow"], torch.Tensor)
+        assert item["forward_flow"].dim() == 4  # [T, H, W, 2]
+        assert item["forward_flow"].dtype == torch.float32
+
+        # 物理合理区间校验
+        # 1. 逆深度处于 [0.01, 100.0]m 的合理物理区间
+        assert torch.all(item["depth"] >= 0.01), f"Depth below 0.01m: min={item['depth'].min().item()}"
+        assert torch.all(item["depth"] <= 100.0), f"Depth above 100.0m: max={item['depth'].max().item()}"
+
+        # 2. 四元数校验（L2 范数在误差范围内等于 1.0）
+        quat_norms = torch.linalg.vector_norm(item["cam_quat"], dim=1)
+        assert torch.allclose(quat_norms, torch.ones_like(quat_norms), atol=1e-5), f"Quaternion not normalized: norms={quat_norms}"
+
     finally:
         buffer.stop()

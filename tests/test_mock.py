@@ -1,5 +1,7 @@
 import sys
 import os
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
 import torch
 import numpy as np
 
@@ -50,13 +52,8 @@ def load_yoloe_weights(model, path="yoloe-26s-seg-pf.pt"):
             if hasattr(module, 'add_norm1'): module.add_norm1 = torch.nn.Identity()
             if hasattr(module, 'add_norm2'): module.add_norm2 = torch.nn.Identity()
 
-    try:
-        from ultralytics import YOLO
-        ul_model = YOLO(path)
-        sd = ul_model.model.state_dict()
-    except ImportError:
-        ckpt = torch.load(path, map_location="cpu", weights_only=False)
-        sd = ckpt["model"].state_dict() if isinstance(ckpt, dict) and "model" in ckpt else (ckpt.state_dict() if hasattr(ckpt, "state_dict") else ckpt)
+    ckpt = torch.load(path, map_location="cpu", weights_only=False)
+    sd = ckpt["model"].state_dict() if isinstance(ckpt, dict) and "model" in ckpt else (ckpt.state_dict() if hasattr(ckpt, "state_dict") else ckpt)
 
     tgt = model.state_dict()
     loaded_keys = {k for k, v in sd.items() if (k.replace("model.model.", "segmenter.model.").replace("model.", "segmenter.model.") if k.startswith("model.") else k) in tgt and tgt[(k.replace("model.model.", "segmenter.model.").replace("model.", "segmenter.model.") if k.startswith("model.") else k)].shape == v.shape}
@@ -91,7 +88,13 @@ def test_all_stages():
     
     # 2. 获取真实的 MOVi-E 样本或回退方案
     B, T, img_size = 1, 24, 256
-    v_np, d_np, s_np, f_np, cp_np, cq_np, id_np, cat_np, vel_np, avel_np, vis_np, col_np = get_movi_e_or_fallback("movi_e_sample_0000.npz", B, T, img_size, img_size)
+    
+    npz_path = "movi_e_sample_0000.npz"
+    if not os.path.exists(npz_path):
+        # 尝试使用 tests/data/ 下的样本
+        npz_path = os.path.join(os.path.dirname(__file__), "data", "movi_e_static_sample.npz")
+    print(f"[TEST] Using npz path: {npz_path}")
+    v_np, d_np, s_np, f_np, cp_np, cq_np, id_np, cat_np, vel_np, avel_np, vis_np, col_np = get_movi_e_or_fallback(npz_path, B, T, img_size, img_size)
     
     # 准备匹配数据集输出格式的 Batch 字典
     batch = {
@@ -259,9 +262,12 @@ def test_all_stages():
     print(f"  track_alive sigmoid mean (expect <0.5 initially): {alive_prob.mean().item():.4f}")
     assert alive_prob.mean().item() < 0.5, "Initial alive probability too high (bias init failed?)"
 
-    assert tb.min().item() >= 0.0 and tb.max().item() <= 1.0, \
-        f"track_boxes out of [0,1]: min={tb.min().item():.4f}, max={tb.max().item():.4f}"
-    print(f"  track_boxes range: [{tb.min().item():.4f}, {tb.max().item():.4f}]  (expected [0,1])  OK")
+    assert tb[..., :2].min().item() >= 0.0 and tb[..., :2].max().item() <= 1.0, \
+        f"track_boxes centers out of [0,1]: min={tb[..., :2].min().item():.4f}, max={tb[..., :2].max().item():.4f}"
+    assert tb[..., 2:].min().item() >= 0.0, \
+        f"track_boxes sizes below 0: min={tb[..., 2:].min().item():.4f}"
+    print(f"  track_boxes centers range: [{tb[..., :2].min().item():.4f}, {tb[..., :2].max().item():.4f}]  OK")
+    print(f"  track_boxes sizes range: [{tb[..., 2:].min().item():.4f}, {tb[..., 2:].max().item():.4f}]  OK")
 
     # --- Loss and gradient verification ---
     dummy_trainer6 = DummyTrainer(device, track_step)

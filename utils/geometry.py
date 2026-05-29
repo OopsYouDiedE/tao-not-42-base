@@ -67,9 +67,16 @@ def inverse_warp(img_next, depth, pose, K, K_inv, depth_is_distance=True):
         W, device=depth.device), indexing="ij")
 
     if K.dim() == 2:
-        K = K.unsqueeze(0).expand(B, -1, -1)
+        K = K.unsqueeze(0)
     if K_inv.dim() == 2:
-        K_inv = K_inv.unsqueeze(0).expand(B, -1, -1)
+        K_inv = K_inv.unsqueeze(0)
+
+    if K.shape[0] != B:
+        T_factor = B // K.shape[0]
+        K = K.unsqueeze(1).expand(-1, T_factor, -1, -1).flatten(0, 1)
+    if K_inv.shape[0] != B:
+        T_factor = B // K_inv.shape[0]
+        K_inv = K_inv.unsqueeze(1).expand(-1, T_factor, -1, -1).flatten(0, 1)
 
     pixels = torch.stack(
         [

@@ -31,7 +31,7 @@ def test_model_forward_backward():
         "segmentation": torch.zeros(B, T, H, W, dtype=torch.int16),
         "forward_flow": torch.rand(B, T, H, W, 2),
         "cam_pos": torch.rand(B, T, 3),
-        "cam_quat": torch.tensor([[1.0, 0.0, 0.0, 0.0]] * T).unsqueeze(0),
+        "cam_quat": torch.tensor([[1.0, 0.0, 0.0, 0.0]]).repeat(B, T, 1),
         "is_dynamic": [torch.tensor([1, 0])] * B,
         "category": [torch.tensor([0, 1])] * B,
         "velocities": [torch.rand(2, 3)] * B,
