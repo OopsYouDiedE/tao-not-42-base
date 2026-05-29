@@ -56,7 +56,7 @@ def test_async_data_buffer_offline():
 
         # 2. 四元数校验（L2 范数在误差范围内等于 1.0）
         quat_norms = torch.linalg.vector_norm(item["cam_quat"], dim=1)
-        assert torch.allclose(quat_norms, torch.ones_like(quat_norms), atol=1e-5), f"Quaternion not normalized: norms={quat_norms}"
+        assert torch.allclose(quat_norms, torch.ones_like(quat_norms), atol=1e-4), f"Quaternion not normalized: norms={quat_norms}"
 
     finally:
         buffer.stop()

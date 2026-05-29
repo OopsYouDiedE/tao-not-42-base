@@ -194,7 +194,18 @@ class C2f_SE3Temporal(nn.Module):
 # =====================================================================
 
 class SE3TwistDecoder(nn.Module):
-    """预测稀疏点位的局部 SE3 运动 (6维) 和 相对中心偏移 (2维)。"""
+    """
+    预测稀疏锚点处的局部物体级三维刚体运动旋量 twist (6 维) 和 相对中心偏移量 offset (2 维)。
+    
+    物理设计与自监督约束机理：
+    - twist 前 3 维表示平移速度向量 v，后 3 维表示旋转角速度向量 omega。
+    - 虽然解码器本身是全连接或卷积映射，但在下游的三维运动重投影计算中，其输出严格遵循刚体运动学方程：
+      dX = v + omega x X1
+    - 由于平移分量 v 的贡献与空间坐标 X1 无关，而旋转分量 omega 的贡献与 X1 呈叉乘的距离线性缩放关系，
+      两者的物理响应特性完全不同。
+    - 因此，当计算重投影损失（SSIM 光度一致性损失）时，梯度反向传播会根据物理投影的反投影坐标特征，
+      自动且唯一地约束并迫使网络将前 3 维学习为平移速度，将后 3 维学习为旋转角速度，实现无监督物理语义的自动解耦。
+    """
     def __init__(self, c1, c2=8):
         super().__init__()
         self.conv = nn.Sequential(
@@ -205,7 +216,7 @@ class SE3TwistDecoder(nn.Module):
     def forward(self, x):
         # x: [B, C, H, W]
         out = self.conv(x)
-        # return se3_twist (6), offset (2)
+        # 返回刚体 twist 旋量 [v (0:3), omega (3:6)]，以及偏移量 [offset (6:8)]
         return out[:, :6, ...], out[:, 6:8, ...]
 
 class DepthDecoder(nn.Module):

@@ -6,7 +6,7 @@
 
 ## 1. 统一视觉大模型整机集成 (TAONot42VisionModel)
 
-`TAONot42VisionModel` 是整个感知大模型的大脑，负责将底层的二维图像特征提取（`YOLOEBackbone`）、时空序列动态特征混合（`SpatioTemporalMambaBlock` / `SpatioTemporalGRUFallback`）、绝对三维几何解析（`SE3PhysicsHead` / `UnifiedGeometryDecoder`）、相机自运动估计（`EgoPoseHead`）、自监督异常检测（`FeaturePredictorHead`）以及时空追踪（`TrackQueryModule`）完美地编织在一起。
+`TAONot42VisionModel` 是整个感知大模型的大脑，负责将底层的二维图像特征提取（`YOLOEBackbone`）、时空序列动态特征混合（`SpatioTemporalMambaBlock` / `SpatioTemporalGRUFallback`）、绝对三维几何解析（`SE3PhysicsHead` / `UnifiedGeometryDecoder`）、相机自运动估计（`GlobalEgoMotionDecoder`）、自监督异常检测（`FeaturePredictorHead`）以及时空追踪（`TrackQueryModule`）完美地编织在一起。
 
 ### 1.1 系统架构与几何投影闭环
 在 `forward_physics` 阶段，系统执行严密的计算闭环：

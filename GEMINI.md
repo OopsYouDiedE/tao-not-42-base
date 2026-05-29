@@ -20,7 +20,7 @@ python tests/test_yoloe_bus.py
 ---
 
 ## Mock 2: 自定义数据集训练测试
-**文件:** `test_mock.py`
+**文件:** `tests/test_mock.py`
 
 ### 描述
 该测试使用来自 MOVi-E 数据集的单个无限重复样本来模拟完整的训练课程。
@@ -43,6 +43,6 @@ np.savez_compressed('movi_e_sample_0000.npz', **sample)
 
 ### 如何运行
 ```bash
-python test_mock.py
+python tests/test_mock.py
 ```
 *(注意: 需要 CUDA 支持)*
