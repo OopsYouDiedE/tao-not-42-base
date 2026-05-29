@@ -285,28 +285,37 @@ def compute_track_loss(preds, targets, step):
                     v = 1.0 / (torch.matmul(P.t(), u) + 1e-8)
                 P_opt = u.unsqueeze(1) * P * v.unsqueeze(0)
 
-                # 将软概率硬化：贪婪提取最大概率分配 (完全在 GPU 上)
-                P_flat = P_opt.view(-1)
-                for _ in range(min(cost.size(0), cost.size(1))):
-                    max_val, flat_idx = torch.max(P_flat, dim=0)
-                    if max_val <= 0:
-                        break
-                    r = flat_idx // cost.size(1)
-                    c = flat_idx % cost.size(1)
-                    
-                    qi = int(free_queries[r.item()])
-                    gt_idx = int(new_gt_ids[c.item()])
-                    assignments[(b, gt_idx)] = qi
-                    
-                    alive_target[b, qi] = 1.0
-                    b_list.append(b)
-                    t_list.append(t)
-                    q_list.append(qi)
-                    g_list.append(gt_idx)
-                    
-                    # 屏蔽已分配的行和列
-                    P_flat[r * cost.size(1) : (r + 1) * cost.size(1)] = -1.0
-                    P_flat[c :: cost.size(1)] = -1.0
+                # 将软概率向量化硬化匹配 (0 次微观 CPU 同步阻断)
+                fq_tensor = torch.tensor(free_queries, device=device, dtype=torch.long)
+                gt_tensor = torch.tensor(new_gt_ids, device=device, dtype=torch.long)
+
+                # 1. 沿列方向 (GT 维度) 寻找每个 Query 匹配的最大概率
+                max_probs, matched_cols = torch.max(P_opt, dim=1)
+
+                # 2. 设定匹配阈值筛选有效匹配 (完全在 GPU 上完成)
+                valid_matches = max_probs > 0.1
+
+                # 3. 提取匹配的 Query 和 GT 的原始索引
+                matched_qs = fq_tensor[valid_matches]
+                matched_gs = gt_tensor[matched_cols[valid_matches]]
+
+                # 4. 更新 alive_target (利用 GPU 级高级索引，0 次 CPU 同步)
+                alive_target[b, matched_qs] = 1.0
+
+                # 5. 回写 assignments 字典与列表统计 (单次批量传输)
+                mq_list = matched_qs.tolist()
+                mg_list = matched_gs.tolist()
+                seen_gts = set()
+                for qi, gt_idx in zip(mq_list, mg_list):
+                    gt_idx_int = int(gt_idx)
+                    if gt_idx_int not in seen_gts:
+                        seen_gts.add(gt_idx_int)
+                        qi_int = int(qi)
+                        assignments[(b, gt_idx_int)] = qi_int
+                        q_list.append(qi_int)
+                        g_list.append(gt_idx_int)
+                        b_list.append(b)
+                        t_list.append(t)
 
         loss_alive = loss_alive + F.binary_cross_entropy_with_logits(
             alive_t, alive_target
