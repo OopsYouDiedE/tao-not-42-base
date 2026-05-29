@@ -58,6 +58,9 @@ def transfer_weights(official_sd: dict, our_model: nn.Module):
             if our_sd[dst_k].shape == src_v.shape:
                 new_sd[dst_k] = src_v.clone()
                 stats["direct"] += 1
+            elif src_v.dim() == 4 and our_sd[dst_k].dim() == 2 and src_v.shape[:2] == our_sd[dst_k].shape:
+                new_sd[dst_k] = src_v.view_as(our_sd[dst_k]).clone()
+                stats["direct"] += 1
             else:
                 mismatch_log.append((dst_k, tuple(src_v.shape), tuple(our_sd[dst_k].shape)))
                 stats["shape_mismatch"] += 1

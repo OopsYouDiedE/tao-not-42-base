@@ -161,6 +161,7 @@ class YOLOESegment26(nn.Module):
     def __init__(self, nc=4585, nm=32, npr=256, embed=512, ch=(), **kwargs):
         super().__init__()
         self.nc = nc
+        self.nm = nm
         self.nl = len(ch)
         self.reg_max = 1
         self.register_buffer("stride", torch.tensor([8.0, 16.0, 32.0]))
@@ -287,9 +288,21 @@ class YOLOESegment26(nn.Module):
             [self.one2one_cv5[i](x[i]).view(bs, 32, -1) for i in range(self.nl)], dim=2
         )
         index_cat = torch.cat(index_out)
+        raw_boxes = torch.cat(boxes_out, 2)  # [B, 4, 8400]
+
+        # ── 生成锚点并解码为原图物理坐标 (xyxy 格式) ──
+        anchors, strides = self.make_anchors(x, self.stride)
+        anchors = anchors.unsqueeze(0).transpose(1, 2)  # [1, 2, 8400]
+        strides = strides.unsqueeze(0).transpose(1, 2)  # [1, 1, 8400]
+        
+        # dist2bbox: raw_boxes 是 ltrb 距离
+        lt, rb = raw_boxes.chunk(2, dim=1)
+        x1y1 = anchors - lt
+        x2y2 = anchors + rb
+        decoded_boxes = torch.cat((x1y1, x2y2), dim=1) * strides  # [B, 4, 8400]
 
         preds_dict = dict(
-            boxes=torch.cat(boxes_out, 2),
+            boxes=decoded_boxes[..., index_cat],
             scores=torch.cat(scores_out, 2),
             feats=x,
             index=index_cat,
@@ -299,7 +312,53 @@ class YOLOESegment26(nn.Module):
         # 拼接为 [B, 4+nc_kept+nm, N_kept] 的推理结果张量
         scores_sig = preds_dict["scores"].sigmoid()
         y = torch.cat([preds_dict["boxes"], scores_sig, preds_dict["mask_coefficient"]], dim=1)
+        
+        if getattr(self, "end2end", True):
+            y = self.postprocess(y.permute(0, 2, 1))
+            
         return (y, preds_dict), proto
+
+    def postprocess(self, preds: torch.Tensor) -> torch.Tensor:
+        """端到端后处理，获取 top-k 检测结果。
+        preds: [B, N, 4 + nc + nm] (最后一个维度格式：xyxy, scores, mask_coef)
+        返回: [B, max_det, 6 + nm] (最后一个维度格式：xyxy, max_score, cls_idx, mask_coef)
+        """
+        boxes, scores, mask_coefficient = preds.split([4, self.nc, self.nm], dim=-1)
+        scores, conf, idx = self.get_topk_index(scores, getattr(self, "max_det", 300))
+        boxes = boxes.gather(dim=1, index=idx.repeat(1, 1, 4))
+        mask_coefficient = mask_coefficient.gather(dim=1, index=idx.repeat(1, 1, self.nm))
+        return torch.cat([boxes, scores, conf, mask_coefficient], dim=-1)
+
+    def get_topk_index(self, scores: torch.Tensor, max_det: int):
+        """获取分数最高的前 max_det 个索引。"""
+        batch_size, anchors, nc = scores.shape
+        k = min(max_det, anchors)
+        if getattr(self, "agnostic_nms", False):
+            scores, labels = scores.max(dim=-1, keepdim=True)
+            scores, indices = scores.topk(k, dim=1)
+            labels = labels.gather(1, indices)
+            return scores, labels, indices
+        ori_index = scores.max(dim=-1)[0].topk(k)[1].unsqueeze(-1)
+        scores = scores.gather(dim=1, index=ori_index.repeat(1, 1, nc))
+        scores, index = scores.flatten(1).topk(k)
+        idx = ori_index[torch.arange(batch_size)[..., None], index // nc]
+        return scores[..., None], (index % nc)[..., None].float(), idx
+
+    @staticmethod
+    def make_anchors(feats, strides, grid_cell_offset=0.5):
+
+        """根据特征图尺寸生成中心点锚点。"""
+        anchor_points, stride_tensor = [], []
+        dtype, device = feats[0].dtype, feats[0].device
+        for i, stride in enumerate(strides):
+            _, _, h, w = feats[i].shape
+            sx = torch.arange(end=w, device=device, dtype=dtype) + grid_cell_offset
+            sy = torch.arange(end=h, device=device, dtype=dtype) + grid_cell_offset
+            sy, sx = torch.meshgrid(sy, sx, indexing='ij')
+            anchor_points.append(torch.stack((sx, sy), -1).view(-1, 2))
+            stride_tensor.append(torch.full((h * w, 1), stride, dtype=dtype, device=device))
+        return torch.cat(anchor_points), torch.cat(stride_tensor)
+
 
 
 class BNContrastiveHead(nn.Module):
