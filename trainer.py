@@ -47,44 +47,81 @@ class TAOTrainer:
         self.mode = "supervised"
 
     def _load_yolo_weights(self):
+        """智能加载 YOLOE 预训练权重。
+
+        策略：
+        - 官方 Conv 使用 bias=True 且无 BN，我们使用 bias=False + BN。
+        - 对于 conv.weight：直接复制（shape 完全相同）。
+        - 对于 conv.bias：将其加到对应的 bn.bias 中，等效吸收偏移量，
+          保持 BN 结构不变，对训练稳定性友好。
+        - 对于 lrpc.2.vocab（我们改为 Conv2d，官方也是 Conv2d）：直接复制。
+        - 对于 proto.semseg.2（官方 80 类，我们 80 类）：直接复制。
+        - 跳过 shape 不匹配的 key，不破坏任何结构。
+        """
         if not os.path.exists(self.args.yolo_weights):
             print(f"正在从 Ultralytics 下载 {self.args.yolo_weights}...")
             urllib.request.urlretrieve(
-                f"https://github.com/ultralytics/assets/releases/download/v8.4.0/{self.args.yolo_weights}", self.args.yolo_weights)
+                f"https://github.com/ultralytics/assets/releases/download/v8.4.0/{self.args.yolo_weights}",
+                self.args.yolo_weights)
             print("下载完成。")
 
-        for name, module in self.model.named_modules():
-            if module.__class__.__name__ == 'Conv':
-                c1, c2 = module.conv.in_channels, module.conv.out_channels
-                k, s = module.conv.kernel_size, module.conv.stride
-                p, g, d = module.conv.padding, module.conv.groups, module.conv.dilation
-
-                new_conv = nn.Conv2d(
-                    c1, c2, k, s, p, groups=g, dilation=d, bias=True)
-                new_conv.to(module.conv.weight.device)
-                module.conv = new_conv
-                module.bn = nn.Identity()
-            elif module.__class__.__name__ == 'PSABlock':
-                if hasattr(module, 'add_norm1'):
-                    module.add_norm1 = nn.Identity()
-                if hasattr(module, 'add_norm2'):
-                    module.add_norm2 = nn.Identity()
-
-        ckpt = torch.load(self.args.yolo_weights,
-                          map_location="cpu", weights_only=False)
-        sd = ckpt["model"].state_dict() if isinstance(ckpt, dict) and "model" in ckpt else (
+        ckpt = torch.load(self.args.yolo_weights, map_location="cpu", weights_only=False)
+        sd_src = ckpt["model"].state_dict() if isinstance(ckpt, dict) and "model" in ckpt else (
             ckpt.state_dict() if hasattr(ckpt, "state_dict") else ckpt)
 
         tgt = self.model.state_dict()
 
-        def map_key(k):
-            return k.replace("model.model.", "segmenter.model.").replace("model.", "segmenter.model.") if k.startswith("model.") else k
+        # 官方 key 前缀 "model." → 我们的 "segmenter.model."
+        def remap(k):
+            if k.startswith("model."):
+                return "segmenter." + k
+            return k
 
-        loaded_keys = {k for k, v in sd.items() if map_key(
-            k) in tgt and tgt[map_key(k)].shape == v.shape}
-        print(f"[YOLO] 成功加载了 {len(loaded_keys)}/{len(sd)} 个键")
-        tgt.update({map_key(k): v for k, v in sd.items() if k in loaded_keys})
-        self.model.load_state_dict(tgt)
+        direct_loaded = 0      # 直接 shape 匹配并复制
+        bias_absorbed = 0      # bias 被吸收到 bn.bias
+        shape_skipped = 0      # shape 不匹配，跳过
+        key_skipped = 0        # key 在我们模型中不存在
+
+        new_sd = dict(tgt)  # 从我们的 state_dict 出发（保留未命中参数的随机初始化）
+
+        for src_k, src_v in sd_src.items():
+            dst_k = remap(src_k)
+
+            if dst_k not in tgt:
+                # 官方有，我们没有对应 key
+                # 检查是否是 conv.bias，对应我们的 conv.weight 同级 bn.bias
+                if src_k.endswith(".conv.bias"):
+                    # 尝试将 bias 吸收到对应的 bn.bias
+                    bn_key = remap(src_k.replace(".conv.bias", ".bn.bias"))
+                    if bn_key in tgt and tgt[bn_key].shape == src_v.shape:
+                        new_sd[bn_key] = tgt[bn_key] + src_v  # 加法吸收偏移
+                        bias_absorbed += 1
+                    else:
+                        key_skipped += 1
+                else:
+                    key_skipped += 1
+                continue
+
+            if tgt[dst_k].shape != src_v.shape:
+                shape_skipped += 1
+                continue
+
+            new_sd[dst_k] = src_v
+            direct_loaded += 1
+
+        self.model.load_state_dict(new_sd, strict=False)
+
+        total_src = len(sd_src)
+        print(f"\n{'='*55}")
+        print(f"[YOLO 权重加载统计]")
+        print(f"  官方总参数块数 : {total_src}")
+        print(f"  ✅ 直接复制    : {direct_loaded} ({direct_loaded/total_src*100:.1f}%)")
+        print(f"  ✅ bias→BN 吸收: {bias_absorbed} ({bias_absorbed/total_src*100:.1f}%)")
+        print(f"  ⚠️ shape 不匹配: {shape_skipped}")
+        print(f"  ⚠️ key 不存在  : {key_skipped}")
+        effective = direct_loaded + bias_absorbed
+        print(f"  🎯 实际命中率  : {effective}/{total_src} = {effective/total_src*100:.1f}%")
+        print(f"{'='*55}\n")
 
     def _setup_finetune(self):
         for param in self.model.segmenter.parameters():

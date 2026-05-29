@@ -81,8 +81,12 @@ class LRPCHead(nn.Module):
         return self.loc(loc_feat), self.vocab(cls_feat), None
 
 class Proto26(nn.Module):
-    """YOLOE-26 分割原型生成模块。"""
-    def __init__(self, ch, npr=256, nm=32, nc=80):
+    """YOLOE-26 分割原型生成模块。
+    
+    注意：semseg_nc 默认 80（对齐官方 COCO 预训练权重 shape），
+    与追踪/检测用的 nc=4585 解耦，避免权重加载 shape 不匹配。
+    """
+    def __init__(self, ch, npr=256, nm=32, nc=80, semseg_nc=80):
         super().__init__()
         self.cv1 = Conv(npr, npr, 3)
         self.upsample = nn.ConvTranspose2d(npr, npr, 2, 2, 0, bias=True)
@@ -90,7 +94,8 @@ class Proto26(nn.Module):
         self.cv3 = Conv(npr, nm, 1)
         self.feat_refine = nn.ModuleList(Conv(x, ch[0], 1) for x in ch[1:])
         self.feat_fuse = Conv(ch[0], npr, 3)
-        self.semseg = nn.Sequential(Conv(ch[0], npr, 3), Conv(npr, npr, 3), nn.Conv2d(npr, nc, 1))
+        # semseg_nc=80 与官方预训练权重对齐；追踪目标使用 track_module 独立预测
+        self.semseg = nn.Sequential(Conv(ch[0], npr, 3), Conv(npr, npr, 3), nn.Conv2d(npr, semseg_nc, 1))
 
     def forward(self, x):
         feat = x[0]
@@ -135,14 +140,18 @@ class YOLOESegment26(nn.Module):
         self.reprta = Residual(SwiGLUFFN(embed, embed))
         self.savpe = SAVPE(ch, c3, embed)
         
-        # 分割组件
-        self.proto = Proto26(ch, npr, nm, nc)
+        # 分割组件（semseg_nc=80 对齐官方预训练权重，追踪使用独立 track_module）
+        self.proto = Proto26(ch, npr, nm, nc, semseg_nc=80)
         self.cv5 = nn.ModuleList(nn.Sequential(Conv(x, 32, 3), Conv(32, 32, 3), nn.Conv2d(32, 32, 1)) for x in ch)
         self.one2one_cv5 = nn.ModuleList(nn.Sequential(Conv(x, 32, 3), Conv(32, 32, 3), nn.Conv2d(32, 32, 1)) for x in ch)
         
-        # 词表投影头
+        # 词表投影头（LRPC）
+        # lrpc.0, lrpc.1: vocab 为 Linear(c3, nc)，对齐官方 shape (nc, c3)
+        # lrpc.2: vocab 为 Conv2d(c3, nc, 1)，对齐官方 shape (nc, c3, 1, 1)
         self.lrpc = nn.ModuleList([
-            LRPCHead(nn.Linear(c3, self.nc), nn.Conv2d(c3, 1, 1), nn.Conv2d(32, 4, 1)) for _ in range(3)
+            LRPCHead(nn.Linear(c3, self.nc), nn.Conv2d(c3, 1, 1), nn.Conv2d(32, 4, 1)),
+            LRPCHead(nn.Linear(c3, self.nc), nn.Conv2d(c3, 1, 1), nn.Conv2d(32, 4, 1)),
+            LRPCHead(nn.Conv2d(c3, self.nc, 1), nn.Conv2d(c3, 1, 1), nn.Conv2d(32, 4, 1)),
         ])
 
     def forward(self, x):

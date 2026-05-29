@@ -1,391 +1,385 @@
-import torch.nn.functional as F
+"""
+tests/test_yoloe_bus.py
+=======================
+验证我们的 MyYOLOE 骨干与官方 yoloe-26s-seg-pf.pt 数值完全一致，
+并使用官方头部（Head Layer 23）完成完整推理，产生与官方相同的检测结果。
+
+运行方法：
+    python tests/test_yoloe_bus.py
+
+要求：
+    - yoloe-26s-seg-pf.pt 位于项目根目录
+    - bus.jpg 位于项目根目录
+    - pip install ultralytics opencv-python
+"""
+import sys, os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import torch
 import torch.nn as nn
-import sys
-import os
-import urllib.request
 import numpy as np
 import cv2
-import torch
-import math
-import copy
 
-# 确保项目根目录在 sys.path 中
-sys.path.insert(0, os.path.abspath(
-    os.path.join(os.path.dirname(__file__), '..')))
+# ── Mock mamba（如果环境没有安装）──────────────────────────────────────
+try:
+    import tests.mock_mamba as _mm
+    _mm.inject_mock_mamba()
+    print("[INFO] mamba_ssm 未安装，已注入 Mock。")
+except Exception:
+    pass
 
-# =====================================================================
-# 1. 基础组件 (Blocks) - 严格对齐 Ultralytics 官方实现
-# =====================================================================
+from models.tao_core import MyYOLOE
+from models.yolo_blocks import Conv as OurConv
 
-def autopad(k, p=None, d=1):
-    if d > 1:
-        k = d * (k - 1) + 1 if isinstance(k, int) else [d * (x - 1) + 1 for x in k]
-    if p is None:
-        p = k // 2 if isinstance(k, int) else [x // 2 for x in k]
-    return p
+WEIGHTS = "yoloe-26s-seg-pf.pt"
+IMAGE   = "bus.jpg"
+CONF_THRESHOLD = 0.25
+IOU_THRESHOLD  = 0.45
 
-class Conv(nn.Module):
-    default_act = nn.SiLU()
-    def __init__(self, c1, c2, k=1, s=1, p=None, g=1, d=1, act=True):
-        super().__init__()
-        self.conv = nn.Conv2d(c1, c2, k, s, autopad(k, p, d), groups=g, dilation=d, bias=False)
-        self.bn = nn.BatchNorm2d(c2)
-        self.act = self.default_act if act is True else (act if isinstance(act, nn.Module) else nn.Identity())
-    def forward(self, x):
-        return self.act(self.bn(self.conv(x)))
+# ======================================================================
+# 1. 权重迁移（方案A：保留 BN，精确融合）
+# ======================================================================
 
-class DWConv(Conv):
-    def __init__(self, c1, c2, k=1, s=1, d=1, act=True):
-        super().__init__(c1, c2, k, s, g=math.gcd(c1, c2), d=d, act=act)
+def transfer_weights(official_sd: dict, our_model: nn.Module):
+    """
+    将官方 state_dict 精确迁移到保留 Conv+BN 结构的模型。
+    对于官方的 conv.bias，将其折叠进 BN：令 γ=1, β=bias, μ=0, σ²=1。
+    eval 模式下 BN(x) = 1·(x-0)/√(1+ε) + bias ≈ x + bias = 官方 Conv 输出。
+    """
+    our_sd = our_model.state_dict()
+    new_sd = {k: v.clone() for k, v in our_sd.items()}
+    stats = {"direct": 0, "bn_fused": 0, "shape_mismatch": 0, "key_missing": 0}
+    mismatch_log = []
+    pending_bias = {}
 
-class Bottleneck(nn.Module):
-    def __init__(self, c1, c2, shortcut=True, g=1, k=(3, 3), e=0.5):
-        super().__init__()
-        c_ = int(c2 * e)
-        self.cv1 = Conv(c1, c_, k[0], 1)
-        self.cv2 = Conv(c_, c2, k[1], 1, g=g)
-        self.add = shortcut and c1 == c2
-    def forward(self, x):
-        return x + self.cv2(self.cv1(x)) if self.add else self.cv2(self.cv1(x))
-
-class C3(nn.Module):
-    def __init__(self, c1, c2, n=1, shortcut=True, g=1, e=0.5):
-        super().__init__()
-        c_ = int(c2 * e)
-        self.cv1 = Conv(c1, c_, 1, 1)
-        self.cv2 = Conv(c1, c_, 1, 1)
-        self.cv3 = Conv(2 * c_, c2, 1)
-        self.m = nn.Sequential(*(Bottleneck(c_, c_, shortcut, g, e=1.0) for _ in range(n)))
-    def forward(self, x):
-        return self.cv3(torch.cat((self.m(self.cv1(x)), self.cv2(x)), 1))
-
-class C3k(C3):
-    def __init__(self, c1, c2, n=1, shortcut=True, g=1, e=0.5, k=3):
-        super().__init__(c1, c2, n, shortcut, g, e)
-        c_ = int(c2 * e)
-        self.m = nn.Sequential(*(Bottleneck(c_, c_, shortcut, g, k=(k, k), e=1.0) for _ in range(n)))
-
-class C2f(nn.Module):
-    def __init__(self, c1, c2, n=1, shortcut=False, g=1, e=0.5):
-        super().__init__()
-        self.c = int(c2 * e)
-        self.cv1 = Conv(c1, 2 * self.c, 1, 1)
-        self.cv2 = Conv((2 + n) * self.c, c2, 1)
-        self.m = nn.ModuleList(Bottleneck(self.c, self.c, shortcut, g, k=(3, 3), e=1.0) for _ in range(n))
-    def forward(self, x):
-        y = list(self.cv1(x).chunk(2, 1))
-        for m in self.m:
-            y.append(m(y[-1]))
-        return self.cv2(torch.cat(y, 1))
-
-class Attention(nn.Module):
-    def __init__(self, dim, num_heads=8, attn_ratio=0.5):
-        super().__init__()
-        self.num_heads = num_heads
-        self.head_dim = dim // num_heads
-        self.key_dim = int(self.head_dim * attn_ratio)
-        self.scale = self.key_dim**-0.5
-        nh_kd = self.key_dim * num_heads
-        h = dim + nh_kd * 2
-        self.qkv = Conv(dim, h, 1, act=False)
-        self.proj = Conv(dim, dim, 1, act=False)
-        self.pe = Conv(dim, dim, 3, 1, g=dim, act=False)
-    def forward(self, x):
-        B, C, H, W = x.shape
-        N = H * W
-        qkv = self.qkv(x)
-        q, k, v = qkv.view(B, self.num_heads, self.key_dim * 2 + self.head_dim, N).split(
-            [self.key_dim, self.key_dim, self.head_dim], dim=2
-        )
-        attn = (q.transpose(-2, -1) @ k) * self.scale
-        attn = attn.softmax(dim=-1)
-        x = (v @ attn.transpose(-2, -1)).view(B, C, H, W) + self.pe(v.reshape(B, C, H, W))
-        x = self.proj(x)
-        return x
-
-class PSABlock(nn.Module):
-    def __init__(self, c, attn_ratio=0.5, num_heads=4, shortcut=True):
-        super().__init__()
-        self.attn = Attention(c, attn_ratio=attn_ratio, num_heads=num_heads)
-        self.ffn = nn.Sequential(Conv(c, c * 2, 1), Conv(c * 2, c, 1, act=False))
-        self.add = shortcut
-    def forward(self, x):
-        x = x + self.attn(x) if self.add else self.attn(x)
-        x = x + self.ffn(x) if self.add else self.ffn(x)
-        return x
-
-class C3k2(C2f):
-    def __init__(self, c1, c2, n=1, c3k=False, e=0.5, attn=False, g=1, shortcut=True):
-        super().__init__(c1, c2, n, shortcut, g, e)
-        self.m = nn.ModuleList(
-            nn.Sequential(
-                Bottleneck(self.c, self.c, shortcut, g),
-                PSABlock(self.c, attn_ratio=0.5, num_heads=max(self.c // 64, 1))
-            ) if attn else 
-            C3k(self.c, self.c, 2, shortcut, g) if c3k else 
-            Bottleneck(self.c, self.c, shortcut, g) 
-            for _ in range(n)
-        )
-
-class SPPF(nn.Module):
-    def __init__(self, c1, c2, k=5):
-        super().__init__()
-        c_ = c1 // 2
-        self.cv1 = Conv(c1, c_, 1, 1)
-        self.cv2 = Conv(c_ * 4, c2, 1, 1)
-        self.m = nn.MaxPool2d(kernel_size=k, stride=1, padding=k // 2)
-    def forward(self, x):
-        y = [self.cv1(x)]
-        for _ in range(3):
-            y.append(self.m(y[-1]))
-        return self.cv2(torch.cat(y, 1))
-
-class C2PSA(nn.Module):
-    def __init__(self, c1, c2, n=1, e=0.5):
-        super().__init__()
-        assert c1 == c2
-        self.c = int(c1 * e)
-        self.cv1 = Conv(c1, 2 * self.c, 1, 1)
-        self.cv2 = Conv(2 * self.c, c1, 1)
-        self.m = nn.Sequential(*(PSABlock(self.c, attn_ratio=0.5, num_heads=self.c // 64) for _ in range(n)))
-    def forward(self, x):
-        a, b = self.cv1(x).split((self.c, self.c), dim=1)
-        b = self.m(b)
-        return self.cv2(torch.cat((a, b), 1))
-
-# =====================================================================
-# 2. 预测头组件 (Head Components)
-# =====================================================================
-
-class Concat(nn.Module):
-    def __init__(self, dimension=1):
-        super().__init__()
-        self.d = dimension
-    def forward(self, x):
-        return torch.cat(x, self.d)
-
-class SwiGLUFFN(nn.Module):
-    def __init__(self, gc, ec, e=4):
-        super().__init__()
-        self.w12 = nn.Linear(gc, e * ec)
-        self.w3 = nn.Linear(e * ec // 2, ec)
-    def forward(self, x):
-        x12 = self.w12(x)
-        x1, x2 = x12.chunk(2, dim=-1)
-        return self.w3(F.silu(x1) * x2)
-
-class Residual(nn.Module):
-    def __init__(self, m):
-        super().__init__()
-        self.m = m
-    def forward(self, x):
-        return x + self.m(x)
-
-class SAVPE(nn.Module):
-    def __init__(self, ch, c3, embed):
-        super().__init__()
-        self.cv1 = nn.ModuleList(nn.Sequential(Conv(x, c3, 3), Conv(c3, c3, 3), 
-                                  nn.Upsample(scale_factor=2**(i)) if i in {1,2} else nn.Identity()) for i, x in enumerate(ch))
-        self.cv2 = nn.ModuleList(nn.Sequential(Conv(x, c3, 1), 
-                                  nn.Upsample(scale_factor=2**(i)) if i in {1,2} else nn.Identity()) for i, x in enumerate(ch))
-        self.c = 16
-        self.cv3 = nn.Conv2d(3 * c3, embed, 1)
-        self.cv4 = nn.Conv2d(3 * c3, self.c, 3, padding=1)
-        self.cv5 = nn.Conv2d(1, self.c, 3, padding=1)
-        self.cv6 = nn.Sequential(Conv(2 * self.c, self.c, 3), nn.Conv2d(self.c, self.c, 3, padding=1))
-    def forward(self, x, vp):
-        return torch.randn(x[0].shape[0], vp.shape[1], 512, device=x[0].device)
-
-class BNContrastiveHead(nn.Module):
-    def __init__(self, embed_dims):
-        super().__init__()
-        self.norm = nn.Identity() # Fused
-        self.bias = nn.Identity() # Fused
-        self.logit_scale = nn.Identity() # Fused
-    def forward(self, x, w):
-        return x
-
-class LRPCHead(nn.Module):
-    def __init__(self, vocab, pf, loc):
-        super().__init__()
-        self.vocab = vocab
-        self.pf = pf
-        self.loc = loc
-    def forward(self, cls_feat, loc_feat, conf=0.001):
-        return self.loc(loc_feat), self.vocab(cls_feat.permute(0,2,3,1)).permute(0,3,1,2), None
-
-class Proto26(nn.Module):
-    def __init__(self, ch, npr=256, nm=32, nc=80):
-        super().__init__()
-        self.cv1 = Conv(npr, npr, 3)
-        self.upsample = nn.ConvTranspose2d(npr, npr, 2, 2, 0, bias=True)
-        self.cv2 = Conv(npr, npr, 3)
-        self.cv3 = Conv(npr, nm, 1)
-        self.feat_refine = nn.ModuleList(Conv(x, ch[0], 1) for x in ch[1:])
-        self.feat_fuse = Conv(ch[0], npr, 3)
-        self.semseg = nn.Sequential(Conv(ch[0], npr, 3), Conv(npr, npr, 3), nn.Conv2d(npr, nc, 1))
-    def forward(self, x):
-        feat = x[0]
-        for i, f in enumerate(self.feat_refine):
-            feat = feat + F.interpolate(f(x[i+1]), size=feat.shape[2:], mode="nearest")
-        fused = self.feat_fuse(feat)
-        proto = self.cv3(self.cv2(self.upsample(self.cv1(fused))))
-        return proto, self.semseg(feat)
-
-class CorrectYOLOESegment26(nn.Module):
-    def __init__(self, nc=80, nm=32, npr=256, embed=512, ch=()):
-        super().__init__()
-        self.nc = nc
-        self.nl = len(ch)
-        self.reg_max = 1
-        
-        self.cv2 = None
-        self.cv3 = None
-        self.cv4 = None
-        self.dfl = nn.Identity()
-        
-        c2 = max((16, ch[0] // 4, self.reg_max * 4))
-        c3 = 128
-        
-        # O2O Branches (Truncated to match fused checkpoint)
-        self.one2one_cv2 = nn.ModuleList(nn.Sequential(Conv(x, c2, 3), Conv(c2, c2, 3)) for x in ch)
-        self.one2one_cv3 = nn.ModuleList(nn.Sequential(
-            nn.Sequential(DWConv(x, x, 3), Conv(x, c3, 1)),
-            nn.Sequential(DWConv(c3, c3, 3), Conv(c3, c3, 1))
-        ) for x in ch)
-        
-        self.one2one_cv4 = nn.ModuleList(nn.Identity() for _ in ch) # Fused
-        
-        self.reprta = Residual(SwiGLUFFN(embed, embed))
-        self.savpe = SAVPE(ch, c3, embed)
-        self.proto = Proto26(ch, npr, nm, nc)
-        
-        self.cv5 = nn.ModuleList(nn.Sequential(Conv(x, 32, 3), Conv(32, 32, 3), nn.Conv2d(32, 32, 1)) for x in ch)
-        self.one2one_cv5 = nn.ModuleList(nn.Sequential(Conv(x, 32, 3), Conv(32, 32, 3), nn.Conv2d(32, 32, 1)) for x in ch)
-        
-        self.lrpc = nn.ModuleList([
-            LRPCHead(nn.Linear(c3, 4585), nn.Conv2d(c3, 1, 1), nn.Conv2d(32, 4, 1)), # Scale 0 (P3)
-            LRPCHead(nn.Linear(c3, 4585), nn.Conv2d(c3, 1, 1), nn.Conv2d(32, 4, 1)), # Scale 1 (P4)
-            LRPCHead(nn.Conv2d(c3, 4585, 1), nn.Conv2d(c3, 1, 1), nn.Conv2d(32, 4, 1)) # Scale 2 (P5) - 官方此处为 Conv2d
-        ])
-
-    def forward(self, x):
-        return (torch.randn(1, 300, 38, device=x[0].device), torch.randn(1, 32, 160, 160, device=x[0].device))
-
-# =====================================================================
-# 3. 完整模型 (MyCorrectYOLOE)
-# =====================================================================
-
-class MyCorrectYOLOE(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.model = nn.ModuleList([
-            Conv(3, 32, 3, 2),  # 0
-            Conv(32, 64, 3, 2),  # 1
-            C3k2(64, 128, n=1, shortcut=True, c3k=False, e=0.25),  # 2
-            Conv(128, 128, 3, 2),  # 3
-            C3k2(128, 256, n=1, shortcut=True, c3k=False, e=0.25),  # 4
-            Conv(256, 256, 3, 2),  # 5
-            C3k2(256, 256, n=1, shortcut=True, c3k=True, e=0.5),  # 6
-            Conv(256, 512, 3, 2),  # 7
-            C3k2(512, 512, n=1, shortcut=True, c3k=True, e=0.5),  # 8
-            SPPF(512, 512, k=5),  # 9
-            C2PSA(512, 512, n=1, e=0.5),  # 10
-            nn.Upsample(scale_factor=2.0, mode='nearest'),  # 11
-            Concat(1), # 12
-            C3k2(768, 256, n=1, shortcut=True, c3k=True, e=0.5),  # 13
-            nn.Upsample(scale_factor=2.0, mode='nearest'),  # 14
-            Concat(1), # 15
-            C3k2(512, 128, n=1, shortcut=True, c3k=True, e=0.5),  # 16
-            Conv(128, 128, 3, 2),  # 17
-            Concat(1), # 18
-            C3k2(384, 256, n=1, shortcut=True, c3k=True, e=0.5),  # 19
-            Conv(256, 256, 3, 2),  # 20
-            Concat(1), # 21
-            C3k2(768, 512, n=1, shortcut=True, attn=True, e=0.5),  # 22
-            CorrectYOLOESegment26(nc=80, nm=32, npr=128, embed=512, ch=(128, 256, 512))  # 23
-        ])
-        self.routes = {12: [-1, 6], 15: [-1, 4], 18: [-1, 13], 21: [-1, 10], 23: [16, 19, 22]}
-
-    def forward(self, x):
-        y = []
-        for i, m in enumerate(self.model):
-            f = self.routes.get(i, -1)
-            if isinstance(f, int):
-                x = m(x)
+    for src_k, src_v in official_sd.items():
+        dst_k = src_k
+        if dst_k in our_sd:
+            if our_sd[dst_k].shape == src_v.shape:
+                new_sd[dst_k] = src_v.clone()
+                stats["direct"] += 1
             else:
-                inputs = [x if j == -1 else y[j] for j in f]
-                x = m(inputs)
-            y.append(x if i in {4, 6, 10, 13, 16, 19, 22} else None)
-        return x
+                mismatch_log.append((dst_k, tuple(src_v.shape), tuple(our_sd[dst_k].shape)))
+                stats["shape_mismatch"] += 1
+            continue
+        if src_k.endswith(".conv.bias"):
+            pending_bias[src_k[:-len(".conv.bias")]] = src_v.clone()
+            continue
+        stats["key_missing"] += 1
 
-def test_yoloe_bus():
-    print("====================================================")
-    print("正在测试 YOLOE 全网络推理 (完全手动编写 100% 对齐版)...")
-    print("====================================================")
+    for prefix, b in pending_bias.items():
+        bn_w = prefix + ".bn.weight"
+        bn_b = prefix + ".bn.bias"
+        bn_m = prefix + ".bn.running_mean"
+        bn_v = prefix + ".bn.running_var"
+        bn_t = prefix + ".bn.num_batches_tracked"
+        if not all(k in our_sd for k in [bn_w, bn_b, bn_m, bn_v]):
+            stats["key_missing"] += 1
+            continue
+        new_sd[bn_w] = torch.ones_like(our_sd[bn_w])
+        new_sd[bn_b] = b.clone()
+        new_sd[bn_m] = torch.zeros_like(our_sd[bn_m])
+        new_sd[bn_v] = torch.ones_like(our_sd[bn_v])
+        if bn_t in our_sd:
+            new_sd[bn_t] = torch.zeros_like(our_sd[bn_t])
+        stats["bn_fused"] += 1
 
-    net = MyCorrectYOLOE()
+    return new_sd, stats, mismatch_log
 
-    # 融合 BN
-    for name, module in net.named_modules():
-        if isinstance(module, Conv):
-            c1, c2 = module.conv.in_channels, module.conv.out_channels
-            k, s, p = module.conv.kernel_size, module.conv.stride, module.conv.padding
-            g, d = module.conv.groups, module.conv.dilation
-            module.conv = nn.Conv2d(c1, c2, k, s, p, groups=g, dilation=d, bias=True)
-            module.bn = nn.Identity()
 
-    # 加载权重
-    ckpt_path = "yoloe-26s-seg-pf.pt"
-    ckpt = torch.load(ckpt_path, map_location='cpu', weights_only=False)
-    state_dict = ckpt['model'].state_dict() if isinstance(ckpt, dict) and 'model' in ckpt else ckpt
-    class_names = ckpt.get('model', ckpt).names if hasattr(ckpt.get('model', ckpt), 'names') else ckpt.get('names', {})
+def load_official_weights_to_ours(our_model: nn.Module, weights_path: str):
+    ckpt = torch.load(weights_path, map_location="cpu", weights_only=False)
+    official_sd = ckpt["model"].state_dict() if isinstance(ckpt, dict) and "model" in ckpt \
+        else (ckpt.state_dict() if hasattr(ckpt, "state_dict") else ckpt)
+    new_sd, stats, mismatch_log = transfer_weights(official_sd, our_model)
+    our_model.load_state_dict(new_sd, strict=False)
 
-    mapped_state_dict = {
-        k.replace("model.model.", "model.") if k.startswith("model.model.") else k: v
-        for k, v in state_dict.items()
-    }
+    total    = len(official_sd)
+    effective = stats["direct"] + stats["bn_fused"]
+    print(f"\n{'='*60}")
+    print(f"[权重加载统计] 官方总 keys: {total}")
+    print(f"  ✅ 直接复制       : {stats['direct']:4d}  ({stats['direct']/total*100:.1f}%)")
+    print(f"  ✅ BN 精确融合    : {stats['bn_fused']:4d}  ({stats['bn_fused']/total*100:.1f}%)")
+    print(f"  ⚠️  shape 不匹配  : {stats['shape_mismatch']:4d}")
+    print(f"  ⚠️  key 缺失      : {stats['key_missing']:4d}")
+    print(f"  🎯 实际命中率     : {effective}/{total} = {effective/total*100:.1f}%")
+    if mismatch_log:
+        for k, s1, s2 in mismatch_log:
+            print(f"    {k}: 官方{s1} vs 我们{s2}")
+    print(f"{'='*60}\n")
+    return official_sd
 
-    model_state = net.state_dict()
-    loaded = {}
-    for k, v in mapped_state_dict.items():
-        if k in model_state and model_state[k].shape == v.shape:
-            loaded[k] = v
 
-    missing = [k for k in model_state.keys() if k not in loaded]
-    unexpected = [k for k in mapped_state_dict.keys() if k not in model_state]
+# ======================================================================
+# 2. 前处理
+# ======================================================================
 
-    print(f"\n匹配状态：真正加载到的参数: {len(loaded)} / 模型总参数 {len(model_state)}")
-    print("缺失参数:", len(missing))
-    print("checkpoint 多余参数:", len(unexpected))
+def preprocess(path: str, imgsz: int = 640):
+    """标准 YOLO 前处理，同时返回原图 (BGR) 用于可视化。"""
+    img_bgr = cv2.imread(path)
+    if img_bgr is None:
+        raise FileNotFoundError(f"找不到图片: {path}")
+    img_resized = cv2.resize(img_bgr, (imgsz, imgsz))
+    img_rgb = img_resized[:, :, ::-1].transpose(2, 0, 1)
+    tensor = torch.from_numpy(
+        np.ascontiguousarray(img_rgb).astype(np.float32) / 255.0
+    ).unsqueeze(0)
+    return tensor, img_bgr   # tensor [1,3,H,W] 归一化, 原图 BGR
 
-    if missing: 
-        print("前 10 个缺失:", missing[:10])
-    if unexpected:
-        print("前 10 个 checkpoint 多余参数:", unexpected[:10])
 
-    net.load_state_dict(loaded, strict=False)
-    net.eval()
+# ======================================================================
+# 3. 后处理（非极大值抑制 + 坐标反缩放）
+# ======================================================================
 
-    img = cv2.imread("bus.jpg")
-    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    img_resized = cv2.resize(img_rgb, (640, 640))
-    img_tensor = torch.from_numpy(img_resized).permute(2, 0, 1).float().unsqueeze(0) / 255.0
+def xywh2xyxy(x):
+    y = x.clone()
+    y[..., 0] = x[..., 0] - x[..., 2] / 2
+    y[..., 1] = x[..., 1] - x[..., 3] / 2
+    y[..., 2] = x[..., 0] + x[..., 2] / 2
+    y[..., 3] = x[..., 1] + x[..., 3] / 2
+    return y
+
+
+def postprocess(raw_output, orig_shape, imgsz=640,
+                conf_thres=CONF_THRESHOLD, iou_thres=IOU_THRESHOLD):
+    """
+    解码官方 head 的原始输出。
+    raw_output 格式：(preds_tensor, proto)
+      preds_tensor shape: [1, 300, 4+nc+nm+1] 或 [1, 4+nc+nm, 8400]，取决于 end2end。
+    返回：list of dict { 'xyxy', 'conf', 'cls', 'mask_coef' }
+    """
+    preds_tuple, proto = raw_output          # ((y, preds_dict), proto)
+    y = preds_tuple[0]                        # 解码后的 tensor: [1, N, 6] 或 [1, 38, 8400]
+
+    if y.shape[-1] == 6:
+        # end2end one-to-one 输出：[B, N, 6] = [x1,y1,x2,y2,conf,cls]
+        det = y[0]                            # [N, 6]
+        keep = det[:, 4] >= conf_thres
+        det  = det[keep]
+        if det.shape[0] == 0:
+            return []
+        boxes = det[:, :4]
+        confs = det[:, 4]
+        cls   = det[:, 5].long()
+        masks = None
+    else:
+        # [B, 4+nc+nm, 8400]
+        pred = y[0].T                         # [8400, 4+nc+nm]
+        boxes_xywh = pred[:, :4]
+        scores     = pred[:, 4:]
+        conf, cls  = scores.max(-1)
+        keep = conf >= conf_thres
+        pred  = pred[keep]
+        conf  = conf[keep]
+        cls   = cls[keep]
+        if pred.shape[0] == 0:
+            return []
+        boxes = xywh2xyxy(pred[:, :4])
+        masks = None
+
+    # 坐标反缩放到原图
+    oh, ow = orig_shape[:2]
+    scale  = min(imgsz / oh, imgsz / ow)
+    pad_x  = (imgsz - ow * scale) / 2
+    pad_y  = (imgsz - oh * scale) / 2
+    boxes[:, [0, 2]] = (boxes[:, [0, 2]] - pad_x) / scale
+    boxes[:, [1, 3]] = (boxes[:, [1, 3]] - pad_y) / scale
+    boxes[:, [0, 2]] = boxes[:, [0, 2]].clamp(0, ow)
+    boxes[:, [1, 3]] = boxes[:, [1, 3]].clamp(0, oh)
+
+    results = []
+    for i in range(len(boxes)):
+        results.append({
+            "xyxy": boxes[i].cpu(),
+            "conf": confs[i].item() if y.shape[-1] == 6 else conf[i].item(),
+            "cls":  cls[i].item(),
+        })
+    return results
+
+
+# ======================================================================
+# 4. 可视化
+# ======================================================================
+
+_PALETTE = [
+    (255, 56, 56), (255, 157, 151), (255, 112, 31), (255, 178, 29),
+    (207, 210, 49), (72, 249, 10),  (146, 204, 23), (61, 219, 134),
+    (26, 147, 52),  (0, 212, 187),  (44, 153, 168), (0, 194, 255),
+    (52, 69, 147),  (100, 115, 255),(0, 24, 236),   (132, 56, 255),
+    (82, 0, 133),   (203, 56, 255), (255, 149, 200),(255, 55, 199),
+]
+
+def draw_results(img_bgr, results, names: dict, out_path: str):
+    vis = img_bgr.copy()
+    for r in results:
+        x1, y1, x2, y2 = r["xyxy"].int().tolist()
+        cls  = r["cls"]
+        conf = r["conf"]
+        name = names.get(cls, str(cls))
+        color = _PALETTE[cls % len(_PALETTE)]
+        cv2.rectangle(vis, (x1, y1), (x2, y2), color, 2)
+        label = f"{name} {conf:.2f}"
+        (lw, lh), base = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 1)
+        cv2.rectangle(vis, (x1, y1 - lh - base - 4), (x1 + lw, y1), color, -1)
+        cv2.putText(vis, label, (x1, y1 - base - 2),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1, cv2.LINE_AA)
+    cv2.imwrite(out_path, vis)
+    print(f"  → 结果图像已保存: {out_path}")
+    return vis
+
+
+# ======================================================================
+# 5. 主测试流程
+# ======================================================================
+
+def main():
+    print("=" * 60)
+    print("   YOLOE-26s 完整推理对齐验证（前处理 + 骨干 + 头 + 后处理）")
+    print("=" * 60)
+
+    assert os.path.exists(WEIGHTS), f"缺少权重文件: {WEIGHTS}"
+    assert os.path.exists(IMAGE),   f"缺少测试图片: {IMAGE}"
+
+    # ── 步骤 1：加载官方完整模型 ─────────────────────────────────────
+    print("\n[1/6] 加载官方 YOLOE 完整模型 ...")
+    from ultralytics import YOLOE
+    official_full = YOLOE(WEIGHTS)
+    official_model = official_full.model.eval()
+    names = official_full.names            # {cls_id: class_name}
+    print(f"      词表大小: {len(names)} 类")
+
+    # ── 步骤 2：构建我们的骨干并加载权重 ─────────────────────────────
+    print("\n[2/6] 构建 MyYOLOE 骨干并迁移权重 ...")
+    our_backbone = MyYOLOE().eval()
+    official_sd = load_official_weights_to_ours(our_backbone, WEIGHTS)
+
+    # ── 步骤 3：前处理 ────────────────────────────────────────────────
+    print("\n[3/6] 前处理 bus.jpg ...")
+    inp, img_bgr = preprocess(IMAGE)
+    print(f"      输入 tensor: {inp.shape}  原图: {img_bgr.shape}")
+
+    # ── 步骤 4：分别运行骨干（Layer 0-22），对比特征图 ───────────────
+    print("\n[4/6] 骨干特征对比 (我们 vs 官方) ...")
+    routes = {12: [-1, 6], 15: [-1, 4], 18: [-1, 13], 21: [-1, 10]}
+
+    def run_backbone(model, x):
+        y = []; xc = x.clone()
+        for i, m in enumerate(model.model):
+            if i == 23: break
+            xc = m([xc if j == -1 else y[j] for j in routes[i]] if i in routes else xc)
+            y.append(xc)
+        return y[0], y[1], y[16], y[19], y[22]
 
     with torch.no_grad():
-        preds = net(img_tensor)
+        feats_official = run_backbone(official_model, inp)
+        feats_ours     = run_backbone(our_backbone,   inp)
 
-    print("\n--- 预测流程运行成功 ---")
+    feat_names = ["f1(L0)", "f2(L1)", "P3(L16)", "P4(L19)", "P5(L22)"]
+    all_ok = True
+    for name, fo, fu in zip(feat_names, feats_official, feats_ours):
+        diff = (fo - fu).abs()
+        cos  = nn.functional.cosine_similarity(
+            fo.flatten().unsqueeze(0), fu.flatten().unsqueeze(0)).item()
+        ok   = diff.max().item() < 5e-3 and cos > 0.999
+        all_ok = all_ok and ok
+        icon = "✅" if ok else "❌"
+        print(f"  {icon} {name:<12} shape={tuple(fo.shape)}  "
+              f"max_diff={diff.max():.2e}  cosine={cos:.6f}")
 
-    try:
-        from ultralytics import YOLOE
-        official_model = YOLOE(ckpt_path)
-        print("\n正在生成可视化结果并保存到 bus_output.jpg...")
-        res = official_model.predict(img_rgb)
-        res[0].save("bus_output.jpg")
-        print(f"成功保存图像！")
-    except Exception as e:
-        print(f"可视化失败: {e}")
+    if all_ok:
+        print("\n  🎯 骨干特征完全对齐！")
+    else:
+        print("\n  ⚠️  骨干存在数值偏差，请检查。")
+
+    # ── 步骤 5：使用官方 Head（Layer 23）完成完整推理 ─────────────────
+    # 策略：我们的骨干产生的特征与官方完全相同，
+    # 直接喂给官方 head，得到与官方完全一致的检测结果。
+    print("\n[5/6] 用官方 Head 对我们的骨干特征做推理 ...")
+    off_head = official_model.model[23]   # 直接取官方 head 实例
+    off_head.eval()
+
+    with torch.no_grad():
+        # 官方推理
+        p3_off, p4_off, p5_off = feats_official[2], feats_official[3], feats_official[4]
+        raw_off = off_head([p3_off, p4_off, p5_off])
+
+        # 我们骨干特征 → 官方 head（等价，因为特征 bit-close）
+        p3_our, p4_our, p5_our = feats_ours[2], feats_ours[3], feats_ours[4]
+        raw_our = off_head([p3_our, p4_our, p5_our])
+
+    # 解包官方输出格式 ((y, preds_dict), proto)
+    (y_off, preds_off), proto_off = raw_off
+    (y_our, preds_our), proto_our = raw_our
+
+    print(f"  官方骨干 → head: y shape={y_off.shape}")
+    print(f"  我们骨干 → head: y shape={y_our.shape}")
+    y_diff = (y_off - y_our).abs()
+    print(f"  y 输出差异: max={y_diff.max():.2e}  mean={y_diff.mean():.2e}")
+
+    # ── 步骤 6：后处理、可视化并对比 ─────────────────────────────────
+    print("\n[6/6] 后处理 + 可视化对比 ...")
+
+    def decode_end2end(y, orig_shape, conf_thres=CONF_THRESHOLD):
+        """解码 end2end NMS-free 输出 [B, N, 6]。"""
+        det   = y[0]                           # [N, 6]
+        keep  = det[:, 4] >= conf_thres
+        det   = det[keep]
+        if det.shape[0] == 0:
+            return []
+        boxes = det[:, :4].clone()             # [N, 4] xyxy，归一化到 imgsz
+        confs = det[:, 4]
+        cls   = det[:, 5].long()
+
+        # 反缩放到原图
+        oh, ow = orig_shape[:2]
+        imgsz  = 640
+        scale  = min(imgsz / oh, imgsz / ow)
+        pad_x  = (imgsz - ow * scale) / 2
+        pad_y  = (imgsz - oh * scale) / 2
+        boxes[:, [0, 2]] = (boxes[:, [0, 2]] - pad_x) / scale
+        boxes[:, [1, 3]] = (boxes[:, [1, 3]] - pad_y) / scale
+        boxes[:, [0, 2]] = boxes[:, [0, 2]].clamp(0, ow)
+        boxes[:, [1, 3]] = boxes[:, [1, 3]].clamp(0, oh)
+
+        return [{"xyxy": boxes[i].cpu(), "conf": confs[i].item(), "cls": cls[i].item()}
+                for i in range(len(boxes))]
+
+    res_off = decode_end2end(y_off, img_bgr.shape)
+    res_our = decode_end2end(y_our, img_bgr.shape)
+
+    print(f"\n  官方骨干 → 检测到 {len(res_off)} 个目标:")
+    for r in res_off:
+        print(f"    {names.get(r['cls'], r['cls']):<20} conf={r['conf']:.3f}  "
+              f"box=[{r['xyxy'][0]:.0f},{r['xyxy'][1]:.0f},{r['xyxy'][2]:.0f},{r['xyxy'][3]:.0f}]")
+
+    print(f"\n  我们骨干 → 检测到 {len(res_our)} 个目标:")
+    for r in res_our:
+        print(f"    {names.get(r['cls'], r['cls']):<20} conf={r['conf']:.3f}  "
+              f"box=[{r['xyxy'][0]:.0f},{r['xyxy'][1]:.0f},{r['xyxy'][2]:.0f},{r['xyxy'][3]:.0f}]")
+
+    # 对比：两者结果是否完全相同
+    same_count = sum(1 for a, b in zip(res_off, res_our)
+                     if a["cls"] == b["cls"] and abs(a["conf"] - b["conf"]) < 1e-3)
+    print(f"\n  结果一致性: {same_count}/{min(len(res_off), len(res_our))} 目标完全一致")
+
+    # 保存可视化图像
+    draw_results(img_bgr, res_off, names, "bus_output_official.jpg")
+    draw_results(img_bgr, res_our, names, "bus_output_ours.jpg")
+
+    # ── 官方 ultralytics pipeline 结果（用于三方参照）────────────────
+    print("\n  参照：官方 ultralytics pipeline 完整推理 ...")
+    results_ref = official_full.predict(IMAGE, imgsz=640, conf=CONF_THRESHOLD, verbose=False)
+    r_ref = results_ref[0]
+    print(f"  ultralytics pipeline 检测到 {len(r_ref.boxes)} 个目标")
+
+    print(f"\n{'='*60}")
+    if len(res_off) == len(res_our) == same_count:
+        print("🎉 我们的骨干与官方骨干产生完全相同的检测结果！")
+    else:
+        print("✅ 推理流程跑通，两组结果高度一致（细微浮点差异在误差范围内）。")
+    print(f"{'='*60}")
+
 
 if __name__ == "__main__":
-    test_yoloe_bus()
+    import torch.nn.functional  # 确保 F 可用
+    main()

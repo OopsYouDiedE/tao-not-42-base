@@ -22,7 +22,7 @@ class MyYOLOE(nn.Module):
             C3k2(256, 256, n=1, shortcut=True, c3k=True, e=0.5),  # 6 (修复: shortcut=True)
             Conv(256, 512, 3, 2),  # 7
             C3k2(512, 512, n=1, shortcut=True, c3k=True, e=0.5),  # 8 (修复: shortcut=True)
-            SPPF(512, 512, k=5),  # 9
+            SPPF(512, 512, k=5, add=True),  # 9：官方有 add=True 残差连接
             C2PSA(512, 512, n=1, e=0.5),  # 10
             nn.Upsample(scale_factor=2.0, mode='nearest'),  # 11
             Concat(1),  # 12

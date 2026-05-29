@@ -160,19 +160,21 @@ class C2PSA(nn.Module):
         return self.cv2(torch.cat((a, b), 1))
 
 class SPPF(nn.Module):
-    """快速空间金字塔池化。"""
-    def __init__(self, c1, c2, k=5):
+    """快速空间金字塔池化。完全对齐官方：支持 add（残差）和 n（pooling次数）参数。"""
+    def __init__(self, c1, c2, k=5, n=3, add=False):
         super().__init__()
         c_ = c1 // 2
-        self.cv1 = Conv(c1, c_, 1, 1)
+        self.cv1 = Conv(c1, c_, 1, 1, act=False)  # 官方 act=False（无激活）
         self.cv2 = Conv(c_ * 4, c2, 1, 1)
         self.m = nn.MaxPool2d(kernel_size=k, stride=1, padding=k // 2)
+        self.n = n
+        self.add = add  # 官方 Layer 9 有 add=True 残差连接
 
     def forward(self, x):
         y = [self.cv1(x)]
-        for _ in range(3):
-            y.append(self.m(y[-1]))
-        return self.cv2(torch.cat(y, 1))
+        y.extend(self.m(y[-1]) for _ in range(self.n))
+        y = self.cv2(torch.cat(y, 1))
+        return y + x if self.add else y
 
 # =====================================================================
 
