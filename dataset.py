@@ -60,8 +60,9 @@ def numpy_to_pinned_tensor(value):
 
 
 class AsyncDataBuffer:
-    def __init__(self, split="train", max_buffer_size=64, batch_size=16, wait_timeout_sec=180):
+    def __init__(self, split="train", max_buffer_size=64, batch_size=16, wait_timeout_sec=180, offline_path=None):
         self.split = split
+        self.offline_path = offline_path
         self.max_buffer_size = max_buffer_size
         self.batch_size = batch_size
         self.wait_timeout_sec = wait_timeout_sec
@@ -94,27 +95,87 @@ class AsyncDataBuffer:
             print(f"[DataBuffer] 获取线程失败: {type(e).__name__}: {e}", flush=True)
 
     def _fetch_loop_impl(self):
-        if tfds is None or tf is None:
+        if self.offline_path is not None:
+            print(f"[DataBuffer] 正在从离线文件 {self.offline_path} 读取数据 ...", flush=True)
+            try:
+                data = np.load(self.offline_path, allow_pickle=True)
+                item = dict(data)
+                
+                def get_nested(obj):
+                    if isinstance(obj, np.ndarray) and obj.dtype == object and obj.ndim == 0:
+                        return obj.item()
+                    return obj
+                
+                # Unpack object arrays if needed
+                for k in item:
+                    item[k] = get_nested(item[k])
+                    
+            except Exception as e:
+                raise RuntimeError(f"无法加载离线文件 {self.offline_path}: {e}")
+                
             while not self.stop_event.is_set():
-                item = {
-                    "video": maybe_pin_memory(torch.randint(0, 256, (12, 256, 256, 3), dtype=torch.uint8)),
-                    "segmentation": maybe_pin_memory(torch.randint(0, 3, (12, 256, 256), dtype=torch.int32)),
-                    "depth": maybe_pin_memory(torch.rand(12, 256, 256, dtype=torch.float32) * 15.0 + 3.0),
-                    "forward_flow": maybe_pin_memory(torch.zeros(12, 256, 256, 2, dtype=torch.float32)),
-                    "cam_pos": maybe_pin_memory(torch.zeros(12, 3, dtype=torch.float32)),
-                    "cam_quat": maybe_pin_memory(torch.tensor([1., 0., 0., 0.], dtype=torch.float32).expand(12, 4).clone()),
-                    "is_dynamic": maybe_pin_memory(torch.zeros(5, dtype=torch.bool)),
-                    "depth_range": maybe_pin_memory(torch.tensor([0.0, 100.0], dtype=torch.float32)),
-                    "forward_flow_range": maybe_pin_memory(torch.tensor([0.0, 10.0], dtype=torch.float32)),
-                    "camera_focal_length": maybe_pin_memory(torch.tensor(0.7, dtype=torch.float32)),
-                    "camera_sensor_width": maybe_pin_memory(torch.tensor(36.0, dtype=torch.float32))
-                }
+                p_item = {}
+                p_item["video"] = numpy_to_pinned_tensor(item.get("video"))
+                
+                # Check for nested camera structures from tfds
+                if "camera" in item and isinstance(item["camera"], dict):
+                    p_item["cam_pos"] = numpy_to_pinned_tensor(item["camera"].get("positions"))
+                    p_item["cam_quat"] = numpy_to_pinned_tensor(item["camera"].get("quaternions"))
+                    p_item["camera_focal_length"] = numpy_to_pinned_tensor(item["camera"].get("focal_length", 0.7))
+                    p_item["camera_sensor_width"] = numpy_to_pinned_tensor(item["camera"].get("sensor_width", 36.0))
+                else:
+                    p_item["cam_pos"] = numpy_to_pinned_tensor(item.get("cam_pos"))
+                    p_item["cam_quat"] = numpy_to_pinned_tensor(item.get("cam_quat"))
+                    p_item["camera_focal_length"] = numpy_to_pinned_tensor(item.get("camera_focal_length", np.array(0.7, dtype=np.float32)))
+                    p_item["camera_sensor_width"] = numpy_to_pinned_tensor(item.get("camera_sensor_width", np.array(36.0, dtype=np.float32)))
+
+                if "segmentations" in item:
+                    p_item["segmentation"] = numpy_to_pinned_tensor(item["segmentations"][..., 0])
+                else:
+                    p_item["segmentation"] = numpy_to_pinned_tensor(item.get("segmentation"))
+                    
+                if "depth_m" in item:
+                    p_item["depth"] = numpy_to_pinned_tensor(item["depth_m"])
+                elif "depth" in item and item["depth"].ndim > 3:
+                    p_item["depth"] = numpy_to_pinned_tensor(item["depth"][..., 0])
+                else:
+                    p_item["depth"] = numpy_to_pinned_tensor(item.get("depth"))
+
+                if "metadata" in item and isinstance(item["metadata"], dict):
+                    p_item["depth_range"] = numpy_to_pinned_tensor(item["metadata"].get("depth_range", [0.0, 100.0]))
+                    p_item["forward_flow_range"] = numpy_to_pinned_tensor(item["metadata"].get("forward_flow_range", [0.0, 10.0]))
+                else:
+                    p_item["depth_range"] = numpy_to_pinned_tensor(item.get("depth_range", np.array([0.0, 100.0], dtype=np.float32)))
+                    p_item["forward_flow_range"] = numpy_to_pinned_tensor(item.get("forward_flow_range", np.array([0.0, 10.0], dtype=np.float32)))
+
+                if "instances" in item and isinstance(item["instances"], dict):
+                    insts = item["instances"]
+                    if "is_dynamic" in insts: p_item["is_dynamic"] = numpy_to_pinned_tensor(insts["is_dynamic"])
+                    if "category" in insts: p_item["category"] = numpy_to_pinned_tensor(insts["category"])
+                    if "velocities" in insts: p_item["velocities"] = numpy_to_pinned_tensor(insts["velocities"])
+                    if "angular_velocities" in insts: p_item["angular_velocities"] = numpy_to_pinned_tensor(insts["angular_velocities"])
+                    if "visibility" in insts: p_item["visibility"] = numpy_to_pinned_tensor(insts["visibility"])
+                else:
+                    if "is_dynamic" in item: p_item["is_dynamic"] = numpy_to_pinned_tensor(item["is_dynamic"])
+                    if "category" in item: p_item["category"] = numpy_to_pinned_tensor(item["category"])
+                    if "velocities" in item: p_item["velocities"] = numpy_to_pinned_tensor(item["velocities"])
+                    if "angular_velocities" in item: p_item["angular_velocities"] = numpy_to_pinned_tensor(item["angular_velocities"])
+                    if "visibility" in item: p_item["visibility"] = numpy_to_pinned_tensor(item["visibility"])
+
+                if "forward_flow_px" in item:
+                    p_item["forward_flow"] = numpy_to_pinned_tensor(item["forward_flow_px"])
+                else:
+                    p_item["forward_flow"] = numpy_to_pinned_tensor(item.get("forward_flow"))
+
                 with self.lock:
-                    self.buffer.append(item)
+                    self.buffer.append(p_item)
                     self.num_fetched += 1
                     self.has_data.notify_all()
                 time.sleep(0.01)
             return
+
+        if tfds is None or tf is None:
+            raise ImportError("缺少 tfds 或 tensorflow 依赖，且未指定 offline_path。")
 
         print(f"[DataBuffer] 正在从 gs://kubric-public/tfds 加载 TFDS movi_e split='{self.split}' ...", flush=True)
         ds = tfds.load("movi_e", data_dir="gs://kubric-public/tfds", split=self.split,

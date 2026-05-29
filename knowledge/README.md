@@ -23,7 +23,7 @@
 * **核心内容**：
   * **SpatioTemporalMambaBlock**：Mamba 状态空间模型与傅里叶时间嵌入，以及缺失环境下的 `TemporalConvFallback` 1D 卷积退化保护。
   * **UnifiedGeometryDecoder**：多尺度单目绝对深度估计与稠密光流预测解译器。
-  * **EgoPoseHead**：相机 6D 位姿旋转矩阵与平移估计头部。
+  * **GlobalEgoMotionDecoder**：全局相机 6D 位姿旋转矩阵与平移估计头部。
   * **FeaturePredictorHead**：时空动力学特征预测头（异常自监督核心）。
   * **TrackQueryModule**：32 个持久化时序查询向量的实例追踪建模。
 

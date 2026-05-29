@@ -63,7 +63,7 @@ class SAVPE(nn.Module):
 
     def forward(self, x, vp):
         # 简化版推理逻辑，实际权重加载后将覆盖行为
-        return torch.randn(x[0].shape[0], vp.shape[1], 512, device=x[0].device)
+        raise NotImplementedError("SAVPE forward pass is not fully implemented.")
 
 # =====================================================================
 # 2. 预测头组件 (Head Components)

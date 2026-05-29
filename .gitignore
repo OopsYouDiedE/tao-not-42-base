@@ -36,6 +36,7 @@ venv.bak/
 vis_outputs/
 wandb/
 *.npz
+!movi_e_sample_0000.npz
 
 # OS generated files
 .DS_Store

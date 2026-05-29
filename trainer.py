@@ -58,6 +58,9 @@ class TAOTrainer:
         - 对于 proto.semseg.2（官方 80 类，我们 80 类）：直接复制。
         - 跳过 shape 不匹配的 key，不破坏任何结构。
         """
+        is_training = self.model.training
+        self.model.eval()
+
         if not os.path.exists(self.args.yolo_weights):
             print(f"正在从 Ultralytics 下载 {self.args.yolo_weights}...")
             urllib.request.urlretrieve(
@@ -122,6 +125,7 @@ class TAOTrainer:
         effective = direct_loaded + bias_absorbed
         print(f"  🎯 实际命中率  : {effective}/{total_src} = {effective/total_src*100:.1f}%")
         print(f"{'='*55}\n")
+        self.model.train(is_training)
 
     def _setup_finetune(self):
         for param in self.model.segmenter.parameters():

@@ -2,8 +2,6 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from scipy.optimize import linear_sum_assignment as _lsa
-
 from utils.geometry import *
 
 @torch.no_grad()
@@ -18,7 +16,8 @@ def flow_epe_px(pred_flow_norm, gt_flow_norm, valid_mask=None, img_size=256):
 
     if valid_mask is not None:
         valid = valid_mask.float().expand_as(epe)
-        return (epe * valid).sum() / valid.sum().clamp(min=1.0)
+        valid_sum = valid.sum()
+        return (epe * valid).sum() / valid_sum if valid_sum > 0 else torch.tensor(0.0, device=epe.device)
 
     return epe.mean()
 
@@ -231,10 +230,6 @@ def compute_track_loss(preds, targets, step):
     flat_gt_boxes = track_gt_boxes.flatten(0, 1)      # [B*T, M, 4]
     cost_matrix_all = torch.cdist(flat_pred_boxes.detach(), flat_gt_boxes, p=1) # [B*T, N, M]
 
-    # 在仅一次同步中将代价矩阵和有效掩码传输到 CPU！
-    cost_matrix_cpu = cost_matrix_all.cpu().numpy()
-    flat_gt_valid_cpu = track_gt_valid.flatten(0, 1).cpu().numpy()
-
     b_list, t_list, q_list, g_list = [], [], [], []
     assignments = {}  # (b, gt_idx) -> query_id
 
@@ -244,10 +239,12 @@ def compute_track_loss(preds, targets, step):
 
         for b in range(B):
             idx = b * T + t
-            valid_ids = np.where(flat_gt_valid_cpu[idx])[0].tolist()
-
-            if len(valid_ids) == 0:
+            valid_mask = track_gt_valid[b, t]
+            
+            if not valid_mask.any():
                 continue
+            
+            valid_ids = torch.where(valid_mask)[0].tolist()
 
             used_queries = {
                 q for (bb, _gid), q in assignments.items()
@@ -269,26 +266,36 @@ def compute_track_loss(preds, targets, step):
                 else:
                     new_gt_ids.append(gt_idx)
 
-            # 2. 新出现 GT 才使用 Hungarian 分配空闲 query
+            # 2. 新出现 GT 才使用 GPU Greedy 分配空闲 query
             if len(new_gt_ids) > 0:
                 free_queries = [q for q in range(N) if q not in used_queries]
                 if len(free_queries) == 0:
                     continue
 
-                cost = cost_matrix_cpu[idx][np.array(free_queries)][:, np.array(new_gt_ids)]
+                # cost shape: [len(free_queries), len(new_gt_ids)]
+                cost = cost_matrix_all[idx][free_queries][:, new_gt_ids].clone()
 
-                q_local, g_local = _lsa(cost)
-
-                for qli, gli in zip(q_local, g_local):
-                    qi = int(free_queries[qli])
-                    gt_idx = int(new_gt_ids[gli])
+                # Greedy assignment on GPU
+                for _ in range(min(len(free_queries), len(new_gt_ids))):
+                    min_val, flat_idx = torch.min(cost.view(-1), dim=0)
+                    if torch.isinf(min_val):
+                        break
+                    r = flat_idx // cost.size(1)
+                    c = flat_idx % cost.size(1)
+                    
+                    qi = int(free_queries[r.item()])
+                    gt_idx = int(new_gt_ids[c.item()])
                     assignments[(b, gt_idx)] = qi
-
+                    
                     alive_target[b, qi] = 1.0
                     b_list.append(b)
                     t_list.append(t)
                     q_list.append(qi)
                     g_list.append(gt_idx)
+                    
+                    # mask out the assigned row and col
+                    cost[r, :] = float('inf')
+                    cost[:, c] = float('inf')
 
         loss_alive = loss_alive + F.binary_cross_entropy_with_logits(
             alive_t, alive_target
@@ -349,7 +356,8 @@ def compute_instance_loss(preds, targets, step):
 
             box_l = (giou * 1.5 + dfl_loss(pdist, tb, 32)
                      * 0.5) * pos_mask.float()
-            loss_box += box_l.sum() / pos_mask.float().sum().clamp(min=1.0)
+            pos_sum = pos_mask.float().sum()
+            loss_box += box_l.sum() / pos_sum if pos_sum > 0 else torch.tensor(0.0, device=device)
 
         if w["mask"] > 0:
             pos_mask_b = pos_mask.bool()
@@ -409,7 +417,8 @@ def compute_instance_loss(preds, targets, step):
                                   (union + gt_masks_crop.sum(dim=(1, 2)).clamp(min=1.0) * 0.01)
                 
                 valid_mask_inst = (inst_ids > 0).float()
-                loss_mask += ((dice_loss * 2.0 + focal_bce) * valid_mask_inst).sum() / valid_mask_inst.sum().clamp(min=1.0)
+                inst_sum = valid_mask_inst.sum()
+                loss_mask += ((dice_loss * 2.0 + focal_bce) * valid_mask_inst).sum() / inst_sum if inst_sum > 0 else torch.tensor(0.0, device=device)
 
         # [FIX] 如果 get_loss_weights 中的 cls 为 0，此处将被跳过，保护分类器字典不被错误标签淹没。
         if w.get("cls", 0) > 0 and "dense_classification" in preds and "cls_dense" in targets:
@@ -419,8 +428,9 @@ def compute_instance_loss(preds, targets, step):
             main_cls_loss = F.cross_entropy(preds["classification"][i].permute(
                 0, 2, 3, 1).flatten(0, 2), gt_cls.flatten(0, 2), reduction="none").view_as(pos_mask)
 
+            pos_sum = pos_mask.float().sum()
             loss_cls += ((dense_cls_loss + main_cls_loss) * 0.5 *
-                         pos_mask.float()).sum() / pos_mask.float().sum().clamp(min=1.0)
+                         pos_mask.float()).sum() / pos_sum if pos_sum > 0 else torch.tensor(0.0, device=device)
 
     return loss_obj, loss_box, loss_mask, loss_cls
 
@@ -452,7 +462,8 @@ def compute_attribute_loss(preds, targets):
             loss_init = F.binary_cross_entropy_with_logits(
                 pred_attr[:, 0], init_dyn.float(), reduction="none"
             )
-            loss = loss + (loss_init * init_pos.float()).sum() / init_pos.float().sum().clamp(min=1.0)
+            init_sum = init_pos.float().sum()
+            loss = loss + (loss_init * init_pos.float()).sum() / init_sum if init_sum > 0 else loss
             n_terms += 1
 
         if cur_valid is not None:
@@ -464,7 +475,8 @@ def compute_attribute_loss(preds, targets):
             loss_cur = F.binary_cross_entropy_with_logits(
                 pred_attr[:, 1], cur_mov.float(), reduction="none"
             )
-            loss = loss + (loss_cur * cur_pos.float()).sum() / cur_pos.float().sum().clamp(min=1.0)
+            cur_sum = cur_pos.float().sum()
+            loss = loss + (loss_cur * cur_pos.float()).sum() / cur_sum if cur_sum > 0 else loss
             n_terms += 1
 
     return loss / max(n_terms, 1)
@@ -495,8 +507,9 @@ def compute_physics_loss(preds, targets, img_t=None, img_next=None, mode="superv
         loss_ego = F.smooth_l1_loss(pred_pose_vec, gt_pose)
 
         v_d_mask = (~targets["sky_mask"]).float()
+        v_d_mask_sum = v_d_mask.sum()
         l_depth_base = (F.smooth_l1_loss(
-            preds["log_depth"], targets["log_depth"], reduction="none") * v_d_mask).sum() / v_d_mask.sum().clamp(min=1)
+            preds["log_depth"], targets["log_depth"], reduction="none") * v_d_mask).sum() / v_d_mask_sum if v_d_mask_sum > 0 else torch.tensor(0.0, device=device)
 
         pd_dx = preds["depth"][:, :, 1:] - preds["depth"][:, :, :-1]
         td_dx = targets["depth"][:, :, 1:] - targets["depth"][:, :, :-1]
@@ -511,16 +524,17 @@ def compute_physics_loss(preds, targets, img_t=None, img_next=None, mode="superv
             pd_dy * mask_dy, td_dy * mask_dy, reduction="sum")
 
         loss_depth = l_depth_base + 0.5 * \
-            (l_depth_dx + l_depth_dy) / v_d_mask.sum().clamp(min=1)
+            (l_depth_dx + l_depth_dy) / v_d_mask_sum if v_d_mask_sum > 0 else l_depth_base
 
     ret_flow_epe = torch.tensor(0.0, device=device)
     if w["flow"] > 0 and preds.get("flow") is not None and "flow_target" in targets:
         if "has_next" in targets:
             has_n = targets["has_next"].view(-1, 1, 1, 1).float()
+            has_n_sum = has_n.sum()
             l_flow_raw = F.smooth_l1_loss(
                 preds["flow"], targets["flow_target"], reduction="none") * has_n
-            loss_flow = l_flow_raw.sum() / (has_n.sum().clamp(min=1) *
-                                             preds["flow"].shape[1] * H * W)
+            loss_flow = l_flow_raw.sum() / (has_n_sum *
+                                             preds["flow"].shape[1] * H * W) if has_n_sum > 0 else torch.tensor(0.0, device=device)
         else:
             loss_flow = F.smooth_l1_loss(preds["flow"], targets["flow_target"])
 
@@ -580,7 +594,8 @@ def compute_physics_loss(preds, targets, img_t=None, img_next=None, mode="superv
                 m = v_w_mask * (1 - targets["sky_mask"].float().unsqueeze(1)) * (
                     w_loss < p_loss(img_next, img_t)).float() * has_n_factor
 
-                loss_photo = (w_loss * m).sum() / m.sum().clamp(min=1)
+                m_sum = m.sum()
+                loss_photo = (w_loss * m).sum() / m_sum if m_sum > 0 else torch.tensor(0.0, device=device)
 
     loss_anom = preds["feature_error"].mean()
     loss_gate = preds["state_update_gate"].abs().mean() * 0.01

@@ -140,13 +140,8 @@ class TrackQueryModule(nn.Module):
         super().__init__()
         self.num_queries = num_queries
         
-        try:
-            from mamba_ssm import Mamba
-            self.query_mamba = Mamba(d_model=feat_channels, d_state=16, d_conv=4, expand=2)
-            self.has_mamba = True
-        except ImportError:
-            self.has_mamba = False
-            self.query_fallback = nn.GRU(feat_channels, feat_channels // 2, batch_first=True, bidirectional=True)
+        from mamba_ssm import Mamba
+        self.query_mamba = Mamba(d_model=feat_channels, d_state=16, d_conv=4, expand=2)
             
         self.query_embed = nn.Embedding(num_queries, feat_channels)
         self.query_norm = nn.LayerNorm(feat_channels)
@@ -180,10 +175,7 @@ class TrackQueryModule(nn.Module):
         q_seq = torch.stack(query_seq, dim=1)
         q_flat = q_seq.permute(0, 2, 1, 3).reshape(B * N, T, C)
         
-        if self.has_mamba:
-            q_temp = self.query_mamba(q_flat)
-        else:
-            q_temp, _ = self.query_fallback(q_flat)
+        q_temp = self.query_mamba(q_flat)
             
         q_temp = self.query_norm(q_flat + q_temp)
         q_temp = q_temp.view(B, N, T, C).permute(0, 2, 1, 3)
