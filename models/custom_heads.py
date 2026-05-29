@@ -72,22 +72,54 @@ class SAVPE(nn.Module):
 
 
 class LRPCHead(nn.Module):
-    """Lightweight Region Proposal and Classification Head (轻量级区域提议与分类头)。"""
+    """Lightweight Region Proposal and Classification Head (对齐官方 ultralytics 实现)。"""
 
     def __init__(self, vocab, pf, loc, enabled=True):
         super().__init__()
-        # 官方实现中，vocab 在推理时被转换为 Linear 层
-        self.vocab = vocab
+        self.vocab = self.conv2linear(vocab) if enabled and isinstance(vocab, nn.Conv2d) else vocab
         self.pf = pf
         self.loc = loc
         self.enabled = enabled
 
+    @staticmethod
+    def conv2linear(conv: nn.Conv2d) -> nn.Linear:
+        """将 1×1 Conv2d 转换为等价的 Linear 层（对齐官方）。"""
+        assert isinstance(conv, nn.Conv2d) and conv.kernel_size == (1, 1)
+        linear = nn.Linear(conv.in_channels, conv.out_channels)
+        linear.weight.data = conv.weight.data.view(conv.out_channels, -1)
+        linear.bias.data = conv.bias.data
+        return linear
+
     def forward(self, cls_feat, loc_feat, conf=0.001):
-        # 官方 O2O 解码逻辑
+        """处理分类与定位特征，生成检测框和类别分数。
+
+        Args:
+            cls_feat: 分类特征图 [B, c3, H, W]
+            loc_feat: 定位特征图 [B, c2, H, W]（输入 self.loc 得到 box）
+            conf: 置信度阈值（训练时设 0.0 以保留所有 anchor）
+
+        Returns:
+            (box_logits, cls_scores, mask): 与官方 LRPCHead.forward 输出格式一致。
+        """
         if self.enabled:
-            # 这是一个高度简化的逻辑，用于跑通 forward 循环
-            return self.loc(loc_feat), self.vocab(cls_feat.permute(0, 2, 3, 1)).permute(0, 3, 1, 2), None
-        return self.loc(loc_feat), self.vocab(cls_feat), None
+            # 官方路径：pf 做 anchor 过滤，vocab Linear 做分类
+            pf_score = self.pf(cls_feat)[0, 0].flatten(0)   # [H*W]
+            mask = pf_score.sigmoid() > conf
+            cls_flat = cls_feat.flatten(2).transpose(-1, -2)  # [B, H*W, c3]
+            if conf > 0:
+                cls_score = self.vocab(cls_flat[:, mask])     # [B, N_kept, nc]
+            else:
+                cls_score = self.vocab(cls_flat * mask.unsqueeze(-1).int())
+            return self.loc(loc_feat), cls_score.transpose(-1, -2), mask  # loc:[B,4,H,W], score:[B,nc,N_kept]
+        else:
+            # Conv2d 版 vocab（lrpc[2]）：直接做空间卷积
+            cls_score = self.vocab(cls_feat)                  # [B, nc, H, W]
+            loc = self.loc(loc_feat)                          # [B, 4, H, W]
+            mask = torch.ones(
+                cls_feat.shape[2] * cls_feat.shape[3],
+                device=cls_feat.device, dtype=torch.bool
+            )
+            return loc, cls_score.flatten(2), mask            # [B,4,H,W], [B,nc,H*W], all-True
 
 
 class Proto26(nn.Module):
@@ -131,8 +163,9 @@ class YOLOESegment26(nn.Module):
         self.nc = nc
         self.nl = len(ch)
         self.reg_max = 1
+        self.register_buffer("stride", torch.tensor([8.0, 16.0, 32.0]))
 
-        # 核心：Prompt-Free 变种中，Dense 预测头 (cv2, cv3) 显式为 None
+        # 核心：Prompt-Free 变种中，Dense 预测头 (cv2, cv3) 显式为 None（O2M 分支已在发布权重中删除）
         self.cv2 = None
         self.cv3 = None
         self.cv4 = None
@@ -167,18 +200,106 @@ class YOLOESegment26(nn.Module):
         # lrpc.0, lrpc.1: vocab 为 Linear(c3, nc)，对齐官方 shape (nc, c3)
         # lrpc.2: vocab 为 Conv2d(c3, nc, 1)，对齐官方 shape (nc, c3, 1, 1)
         self.lrpc = nn.ModuleList([
-            LRPCHead(nn.Linear(c3, self.nc), nn.Conv2d(
-                c3, 1, 1), nn.Conv2d(32, 4, 1)),
-            LRPCHead(nn.Linear(c3, self.nc), nn.Conv2d(
-                c3, 1, 1), nn.Conv2d(32, 4, 1)),
-            LRPCHead(nn.Conv2d(c3, self.nc, 1), nn.Conv2d(
-                c3, 1, 1), nn.Conv2d(32, 4, 1)),
+            LRPCHead(nn.Linear(c3, self.nc), nn.Conv2d(c3, 1, 1), nn.Conv2d(32, 4, 1)),
+            LRPCHead(nn.Linear(c3, self.nc), nn.Conv2d(c3, 1, 1), nn.Conv2d(32, 4, 1)),
+            LRPCHead(nn.Conv2d(c3, self.nc, 1), nn.Conv2d(c3, 1, 1), nn.Conv2d(32, 4, 1)),
         ])
 
     def forward(self, x):
-        # 模仿官方 O2O 推理返回 tuple
-        # 实际上这个 forward 在 Mock 测试中会被官方实例替换或通过属性访问
-        return (torch.randn(1, 300, 38, device=x[0].device), torch.randn(1, 32, 160, 160, device=x[0].device))
+        """前向传播。
+
+        训练时：返回逐尺度特征图字典，供 compute_instance_loss 使用。
+        推理时：执行 LRPC 解码路径，返回端到端检测结果，与 test_yoloe_bus.py 兼容。
+
+        架构说明：
+            one2one_cv3[i] 是三步 Sequential：
+              step[0]: DWConv(x,x,3) + Conv(x,c3,1) → [B, c3=128, H, W]
+              step[1]: DWConv(c3,c3,3) + Conv(c3,c3,1) → [B, c3=128, H, W]
+              step[2]: Conv2d(c3, embed=512, 1) → [B, 512, H, W]
+            lrpc[i].pf 接收 step[1] 输出（c3 维），而非最终 embed 维特征。
+
+        Args:
+            x (list[Tensor]): 三个尺度的特征图 [P3, P4, P5]。
+
+        Returns:
+            训练时：dict，含 objectness/boxes/box_dist/mask_coefficients/
+                    mask_prototypes/classification（供损失函数消费）。
+            推理时：((y_tensor, preds_dict), proto)，与官方 head 输出格式一致。
+        """
+        bs = x[0].shape[0]
+
+        # ── 原型掩膜（训练推理均需要）──────────────────────────────────
+        proto, _ = self.proto(x)   # [B, nm, H_p, W_p]
+
+        if self.training:
+            # ── 训练模式：逐尺度提取特征图，组装损失所需的 dict ──────────
+            obj_maps, box_maps, mask_coef_maps, cls_maps = [], [], [], []
+            for i in range(self.nl):
+                # 分步执行 one2one_cv3[i]，取中间 c3 维特征供 lrpc 使用
+                mid_feat = self.one2one_cv3[i][0](x[i])   # [B, c3=128, H, W]
+                mid_feat = self.one2one_cv3[i][1](mid_feat) # [B, c3, H, W]
+                # （step[2] 升到 embed=512，推理才需要，训练时节省计算）
+
+                # 1. objectness：lrpc[i].pf 为 1-channel Conv2d，接收 c3 特征
+                obj_logit = self.lrpc[i].pf(mid_feat)          # [B, 1, H, W]
+                obj_maps.append(obj_logit)
+
+                # 2. box（LRTB 距离）：one2one_cv2 → lrpc.loc（4-channel Conv2d）
+                box_feat = self.one2one_cv2[i](x[i])            # [B, c2, H, W]
+                box_raw  = self.lrpc[i].loc(box_feat)           # [B, 4, H, W]
+                # softplus 保证距离严格为正（GIoU 要求）
+                box_pos  = F.softplus(box_raw) + 1e-4
+                box_maps.append(box_pos)
+
+                # 3. classification（可选）：lrpc[i].vocab
+                # 3. classification：所有 lrpc[i].vocab 均已由 conv2linear 转为 Linear(c3, nc)
+                #    需要将空间维铺平，经过 Linear 后再还原
+                cls_i = self.lrpc[i].vocab(
+                    mid_feat.permute(0, 2, 3, 1)   # [B, H, W, c3]
+                ).permute(0, 3, 1, 2)               # [B, nc, H, W]
+                cls_maps.append(cls_i)
+
+                # 4. mask coefficients：one2one_cv5
+                mc = self.one2one_cv5[i](x[i])                  # [B, nm, H, W]
+                mask_coef_maps.append(mc)
+
+            return {
+                "objectness":        obj_maps,       # list of [B, 1, H_i, W_i]
+                "boxes":             box_maps,       # list of [B, 4, H_i, W_i]，LRTB 格式
+                "box_dist":          box_maps,       # reg_max=1，与 boxes 等价（保留梯度）
+                "mask_coefficients": mask_coef_maps, # list of [B, nm, H_i, W_i]
+                "mask_prototypes":   proto,          # [B, nm, H_p, W_p]
+                "classification":    cls_maps,       # list of [B, nc, H_i, W_i]
+            }
+
+        # ── 推理模式：LRPC 解码，输出与官方格式兼容 ─────────────────────
+        boxes_out, scores_out, index_out = [], [], []
+        for i in range(self.nl):
+            mid_feat = self.one2one_cv3[i][0](x[i])
+            mid_feat = self.one2one_cv3[i][1](mid_feat)
+            loc_feat = self.one2one_cv2[i](x[i])
+            box_out, score_out, idx = self.lrpc[i](mid_feat, loc_feat, conf=0.001)
+            boxes_out.append(box_out.view(bs, self.reg_max * 4, -1))
+            scores_out.append(score_out)
+            index_out.append(idx)
+
+        mc_flat = torch.cat(
+            [self.one2one_cv5[i](x[i]).view(bs, 32, -1) for i in range(self.nl)], dim=2
+        )
+        index_cat = torch.cat(index_out)
+
+        preds_dict = dict(
+            boxes=torch.cat(boxes_out, 2),
+            scores=torch.cat(scores_out, 2),
+            feats=x,
+            index=index_cat,
+            mask_coefficient=mc_flat[..., index_cat],
+        )
+
+        # 拼接为 [B, 4+nc_kept+nm, N_kept] 的推理结果张量
+        scores_sig = preds_dict["scores"].sigmoid()
+        y = torch.cat([preds_dict["boxes"], scores_sig, preds_dict["mask_coefficient"]], dim=1)
+        return (y, preds_dict), proto
 
 
 class BNContrastiveHead(nn.Module):

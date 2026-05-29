@@ -291,21 +291,23 @@ def main():
     else:
         print("\n  ⚠️  骨干存在数值偏差，请检查。")
 
-    # ── 步骤 5：使用官方 Head（Layer 23）完成完整推理 ─────────────────
-    # 策略：我们的骨干产生的特征与官方完全相同，
-    # 直接喂给官方 head，得到与官方完全一致的检测结果。
-    print("\n[5/6] 用官方 Head 对我们的骨干特征做推理 ...")
-    off_head = official_model.model[23]   # 直接取官方 head 实例
+    # ── 步骤 5：使用官方 Head（Layer 23）和我们自己的 Head 进行推理 ─────────────────
+    print("\n[5/6] 用我们的 Head 对我们的骨干特征做推理 ...")
+    off_head = official_model.model[23]   # 官方 head 实例
     off_head.eval()
+    
+    our_head = our_backbone.model[-1]  # 我们自己的 head 实例
+    our_head.eval()
 
     with torch.no_grad():
-        # 官方推理
+        # 官方骨干 + 官方 Head
         p3_off, p4_off, p5_off = feats_official[2], feats_official[3], feats_official[4]
         raw_off = off_head([p3_off, p4_off, p5_off])
 
-        # 我们骨干特征 → 官方 head（等价，因为特征 bit-close）
+        # 我们骨干特征 + 我们自己的 Head
         p3_our, p4_our, p5_our = feats_ours[2], feats_ours[3], feats_ours[4]
-        raw_our = off_head([p3_our, p4_our, p5_our])
+        raw_our = our_head([p3_our, p4_our, p5_our])
+
 
     # 解包官方输出格式 ((y, preds_dict), proto)
     (y_off, preds_off), proto_off = raw_off

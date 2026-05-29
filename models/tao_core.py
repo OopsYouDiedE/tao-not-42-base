@@ -93,13 +93,15 @@ class TAONot42VisionModel(nn.Module):
         next_st_p4, spatiotemporal_p4 = update_st(self.st_block_p4, p4)
         next_st_p5, spatiotemporal_p5 = update_st(self.st_block_p5, p5)
 
-        # 运行 YOLOE 分割预测头 (由于已对齐官方，此处返回 tuple)
-        # 注意：此处输入必须是 list
-        preds_raw = self.segmenter.model[-1]([
+        # 运行 YOLOE 分割预测头（训练时返回 dict，推理时返回 tuple）
+        seg_preds = self.segmenter.model[-1]([
             spatiotemporal_p3.flatten(0, 1),
             spatiotemporal_p4.flatten(0, 1),
             spatiotemporal_p5.flatten(0, 1)
         ])
+        # 训练时 seg_preds 是 dict（objectness/boxes/box_dist/mask_coefficients/...）
+        # 推理时 seg_preds 是 ((y, preds_dict), proto) tuple，此处不参与损失计算
+        seg_dict = seg_preds if isinstance(seg_preds, dict) else {}
 
         lw = get_loss_weights_fn(step) if get_loss_weights_fn else {"flow": 1, "box": 1, "mask": 1, "anom": 1}
         ego_pose = self.pose_head(spatiotemporal_p3.flatten(0, 1))
@@ -124,11 +126,15 @@ class TAONot42VisionModel(nn.Module):
         track_out = self.track_module(spatiotemporal_p3)
 
         return {
-            "raw_preds": preds_raw, # 包含 300 queries 结果
+            # ── 检测与分割预测（由 YOLOESegment26.forward 输出）──────────────
+            **seg_dict,   # objectness, boxes, box_dist, mask_coefficients, mask_prototypes, classification
+            # ── 几何与运动预测 ────────────────────────────────────────────────
             "depth": depth_pred, "log_depth": torch.log(depth_pred), "ego_pose": ego_pose,
             "flow": flow_pred,
+            # ── 时空特征与异常检测 ────────────────────────────────────────────
             "features": spatiotemporal_p3.flatten(0, 1), "anomaly_map": feat_err.flatten(0, 1),
             "feature_error": feat_err.mean(), "state_update_gate": gate,
+            # ── 追踪预测 ──────────────────────────────────────────────────────
             "track_boxes":   track_out["track_boxes"],
             "track_classes": track_out["track_classes"],
             "track_alive":   track_out["track_alive"],
