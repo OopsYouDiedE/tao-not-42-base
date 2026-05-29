@@ -1,7 +1,7 @@
 """比较方案A（Conv+BN融合加载）和方案B（直接替换为Conv+bias）的数值差异与训练影响。"""
 import sys; sys.path.insert(0, '.')
 import tests.mock_mamba as mm; mm.inject_mock_mamba()
-from models.tao_core import MyYOLOE
+from models.tao_core import YOLOEBackbone
 from models.yolo_blocks import Conv as OurConv
 from ultralytics import YOLOE
 import torch, torch.nn as nn
@@ -11,12 +11,12 @@ off = YOLOE('yoloe-26s-seg-pf.pt').model.eval()
 
 # === 方案A：保持 Conv+BN（BN融合近似加载）===
 from tests.test_yoloe_bus import load_official_weights_to_ours
-ours_bn = MyYOLOE().eval()
+ours_bn = YOLOEBackbone().eval()
 load_official_weights_to_ours(ours_bn, 'yoloe-26s-seg-pf.pt')
 
 # === 方案B：将所有 Conv+BN 替换为 Conv+bias（结构等同官方）===
 def build_fused_model(official_sd):
-    model = MyYOLOE()
+    model = YOLOEBackbone()
     for name, module in model.named_modules():
         if isinstance(module, OurConv):
             c1 = module.conv.in_channels

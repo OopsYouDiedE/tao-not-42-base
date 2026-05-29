@@ -118,3 +118,30 @@
   - 运行 `python test_mock.py`：多课程闭环与 Stage 6 时序追踪回归测试 100% 完美通过，梯度流动极为健康，可视化输出毫无偏移！
 
 
+### 10. 代码命名规范化与模型命名去冗余重构 (Naming Standardization & MyYOLOE Renaming)
+- **决策背景**：此前系统中将自定义的 YOLOE 骨干网络类命名为带有实验性质的 `MyYOLOE`。这种命名习惯不符合企业级生产化代码规范。为了提高代码的可读性、专业性与一致性，决定将其全面重构成符合业界标准的规范命名。
+- **重构方案与实现**：
+  1. **模型类名重构**：在 `models/tao_core.py` 中，将 `MyYOLOE` 类更名为 `YOLOEBackbone`，并同步更新其在主模型 `TAONot42VisionModel` 中的实例化引用。
+  2. **测试与脚本全量替换**：
+     - 修改 `tests/test_yoloe_bus.py`，导入并实例化 `YOLOEBackbone` 进行权重精确迁移与对齐推理验证。
+     - 修改 `scripts/check_backbone.py`、`scripts/compare_bn_vs_fused.py` 及 `scripts/deep_compare.py`，全量移除过时的 `MyYOLOE` 引用。
+  3. **知识库文档深度同步**：
+     - 将 `knowledge/models/tao_core/MyYOLOE.md` 文档物理更名并升级重构为 `YOLOEBackbone.md`，使用更严谨的技术用语描述其 23 层拓扑。
+     - 同步更新了 `knowledge/knowledge_base.md` 索引入口、`knowledge/models/tao_core/TAONot42VisionModel.md` 以及 `knowledge/models/yolo_blocks/YOLO_Blocks.md` 内部的所有 MyYOLOE 引用。
+     - 更新了根目录 `GEMINI.md` 说明手册。
+- **验证结果**：
+  - 运行 `python test_mock.py`：5 阶段物理与时空联合课程训练及第 6 阶段端到端追踪训练在 GPU 上 **完美闭环运行通过**，数值与物理对齐毫无偏差！
+
+### 11. 知识库专题化与单 README 规范重构 (Thematic Knowledge & Single README Restructuring)
+- **决策背景**：此前 `knowledge` 目录包含大量小文件（碎片化对应单个类），不便于从系统或专项角度进行系统性学习。同时为了规范代码库架构，提出新规范：“一个文件夹内内容仅对应一个 README 文件”。
+- **重构方案与实现**：
+  1. **知识大类合并与专题化**：将原本的 10 多个零散 Markdown 文件归并、升级和重构为 4 大系统技术专题：
+     - **`knowledge/yolo`** (YOLO 视觉底座与权重对齐专题)：合并基础算子、官方头部网络、骨干路由及 Conv-BN 精确折叠算法。
+     - **`knowledge/dataset`** (数据流、异步加载与并行预处理专题)：合并后台异步缓冲、CUDAPrefetcher 预取与 GPU 侧非阻塞边界框并行计算。
+     - **`knowledge/custom_heads`** (自研时空混合与三维物理几何头部专题)：合并时空 Mamba 混合、几何绝对深度估计、EgoPoseHead、物理预测及查询追踪。
+     - **`knowledge/system_integration`** (系统整机集成、自监督损失与课程学习专题)：合并前向整机拼装、6阶段课程调度与 SSIM 光度 warp 损失、平滑损失及 Tracklet-Aware 匈牙利时空损失。
+  2. **物理文件清理与纯净化**：
+     - 在每个子目录下，仅创建唯一的专题 `README.md`。
+     - 删除了 `knowledge/knowledge_base.md`，并在根目录 `knowledge/` 下创建了唯一的 `README.md` 作为导航入口。
+     - 彻底删除了旧有的零碎类文档和已成空文件夹的目录（`knowledge/models` 和 `knowledge/trainer`），完美符合规范约束。
+

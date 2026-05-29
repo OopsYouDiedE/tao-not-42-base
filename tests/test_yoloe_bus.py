@@ -1,7 +1,7 @@
 """
 tests/test_yoloe_bus.py
 =======================
-验证我们的 MyYOLOE 骨干与官方 yoloe-26s-seg-pf.pt 数值完全一致，
+验证我们的 YOLOEBackbone 骨干与官方 yoloe-26s-seg-pf.pt 数值完全一致，
 并使用官方头部（Head Layer 23）完成完整推理，产生与官方相同的检测结果。
 
 运行方法：
@@ -28,7 +28,7 @@ try:
 except Exception:
     pass
 
-from models.tao_core import MyYOLOE
+from models.tao_core import YOLOEBackbone
 from models.yolo_blocks import Conv as OurConv
 
 WEIGHTS = "yoloe-26s-seg-pf.pt"
@@ -252,8 +252,8 @@ def main():
     print(f"      词表大小: {len(names)} 类")
 
     # ── 步骤 2：构建我们的骨干并加载权重 ─────────────────────────────
-    print("\n[2/6] 构建 MyYOLOE 骨干并迁移权重 ...")
-    our_backbone = MyYOLOE().eval()
+    print("\n[2/6] 构建 YOLOEBackbone 骨干并迁移权重 ...")
+    our_backbone = YOLOEBackbone().eval()
     official_sd = load_official_weights_to_ours(our_backbone, WEIGHTS)
 
     # ── 步骤 3：前处理 ────────────────────────────────────────────────

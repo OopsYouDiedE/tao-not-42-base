@@ -6,7 +6,7 @@ import torch
 from ultralytics import YOLOE
 import tests.mock_mamba
 tests.mock_mamba.inject_mock_mamba()
-from models.tao_core import MyYOLOE
+from models.tao_core import YOLOEBackbone
 from models.yolo_blocks import C3k2, C3k, Conv
 
 def get_module_summary(net):
@@ -33,7 +33,7 @@ model_off = YOLOE("yoloe-26s-seg-pf.pt").model
 summary_off = get_module_summary(model_off)
 
 # Ours
-net = MyYOLOE()
+net = YOLOEBackbone()
 summary_ours = get_module_summary(net)
 
 for i in range(len(summary_off)):

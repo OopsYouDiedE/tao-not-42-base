@@ -7,7 +7,7 @@ import cv2
 import tests.mock_mamba
 tests.mock_mamba.inject_mock_mamba()
 
-from models.tao_core import MyYOLOE
+from models.tao_core import YOLOEBackbone
 from ultralytics import YOLOE
 
 img = cv2.imread("bus.jpg")
@@ -27,7 +27,7 @@ with torch.no_grad():
         x = m(x)
         y_off.append(x if m.i in official_net.save else None)
 
-net = MyYOLOE()
+net = YOLOEBackbone()
 from models.yolo_blocks import Bottleneck, C3k2, C3k
 for i, m in enumerate(net.model):
     if isinstance(m, C3k2) and hasattr(m, 'm') and len(m.m) > 0 and isinstance(m.m[0], C3k):

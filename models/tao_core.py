@@ -8,7 +8,7 @@ from models.yoloe_head import *
 
 # =====================================================================
 
-class MyYOLOE(nn.Module):
+class YOLOEBackbone(nn.Module):
     """自定义 YOLOE 网络，完全对齐官方 yoloe-26s 结构。"""
     def __init__(self):
         super().__init__()
@@ -61,7 +61,7 @@ class TAONot42VisionModel(nn.Module):
     """TAO-Not-42 视觉模型，集成了检测、分割、深度、光流和追踪功能。"""
     def __init__(self):
         super().__init__()
-        self.segmenter = MyYOLOE() 
+        self.segmenter = YOLOEBackbone() 
         self.geom_decoder = UnifiedGeometryDecoder(128, 64, 32)
         self.st_block = SpatioTemporalMambaBlock(128)
         self.st_block_p4 = SpatioTemporalMambaBlock(256)
