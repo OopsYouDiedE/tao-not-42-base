@@ -106,9 +106,6 @@ class UnifiedGeometryDecoder(nn.Module):
         }
 
 
-# EgoPoseHead is replaced by GlobalEgoMotionDecoder in custom_blocks.py. 
-# Code left empty here since SE3PhysicsHead handles it directly.
-
 
 class FeaturePredictorHead(nn.Module):
     def __init__(self, channels=256, action_dim=9):

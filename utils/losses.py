@@ -275,10 +275,21 @@ def compute_track_loss(preds, targets, step):
                 # cost shape: [len(free_queries), len(new_gt_ids)]
                 cost = cost_matrix_all[idx][free_queries][:, new_gt_ids].clone()
 
-                # Greedy assignment on GPU
-                for _ in range(min(len(free_queries), len(new_gt_ids))):
-                    min_val, flat_idx = torch.min(cost.view(-1), dim=0)
-                    if torch.isinf(min_val):
+                # GPU 原生 Sinkhorn 算法求软分配概率矩阵 (Zero CPU-GPU Sync)
+                epsilon = 0.1
+                P = torch.exp(-cost / epsilon)
+                u = torch.ones_like(P[:, 0])
+                v = torch.ones_like(P[0, :])
+                for _ in range(10):
+                    u = 1.0 / (torch.matmul(P, v) + 1e-8)
+                    v = 1.0 / (torch.matmul(P.t(), u) + 1e-8)
+                P_opt = u.unsqueeze(1) * P * v.unsqueeze(0)
+
+                # 将软概率硬化：贪婪提取最大概率分配 (完全在 GPU 上)
+                P_flat = P_opt.view(-1)
+                for _ in range(min(cost.size(0), cost.size(1))):
+                    max_val, flat_idx = torch.max(P_flat, dim=0)
+                    if max_val <= 0:
                         break
                     r = flat_idx // cost.size(1)
                     c = flat_idx % cost.size(1)
@@ -293,9 +304,9 @@ def compute_track_loss(preds, targets, step):
                     q_list.append(qi)
                     g_list.append(gt_idx)
                     
-                    # mask out the assigned row and col
-                    cost[r, :] = float('inf')
-                    cost[:, c] = float('inf')
+                    # 屏蔽已分配的行和列
+                    P_flat[r * cost.size(1) : (r + 1) * cost.size(1)] = -1.0
+                    P_flat[c :: cost.size(1)] = -1.0
 
         loss_alive = loss_alive + F.binary_cross_entropy_with_logits(
             alive_t, alive_target
@@ -413,8 +424,9 @@ def compute_instance_loss(preds, targets, step):
                 bce = F.binary_cross_entropy_with_logits(pred_logits_crop, gt_masks_crop, reduction="none")
                 focal_bce = (0.25 * (1 - torch.exp(-bce)) ** 2 * bce).mean(dim=(1, 2))
                 
-                dice_loss = 1.0 - (2.0 * intersection + gt_masks_crop.sum(dim=(1, 2)).clamp(min=1.0) * 0.01) / \
-                                  (union + gt_masks_crop.sum(dim=(1, 2)).clamp(min=1.0) * 0.01)
+                gt_area = gt_masks_crop.sum(dim=(1, 2))
+                dice_loss = 1.0 - (2.0 * intersection + gt_area * 0.01 + 1e-4) / \
+                                  (union + gt_area * 0.01 + 1e-4)
                 
                 valid_mask_inst = (inst_ids > 0).float()
                 inst_sum = valid_mask_inst.sum()

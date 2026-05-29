@@ -174,8 +174,11 @@ class AsyncDataBuffer:
                 time.sleep(0.01)
             return
 
-        if tfds is None or tf is None:
-            raise ImportError("缺少 tfds 或 tensorflow 依赖，且未指定 offline_path。")
+        try:
+            import tensorflow_datasets as tfds
+            import tensorflow as tf
+        except ImportError:
+            raise ImportError("缺少 tensorflow_datasets 或 tensorflow 依赖，且未指定 offline_path。")
 
         print(f"[DataBuffer] 正在从 gs://kubric-public/tfds 加载 TFDS movi_e split='{self.split}' ...", flush=True)
         ds = tfds.load("movi_e", data_dir="gs://kubric-public/tfds", split=self.split,

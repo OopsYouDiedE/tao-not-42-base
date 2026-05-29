@@ -13,7 +13,7 @@
 ### 2. 🕒 [custom_heads.py](file:///c:/Users/iii/Desktop/tao-not-42-base/models/custom_heads.py) (自研特定预测头)
 * **`SpatioTemporalMambaBlock`**：利用 Mamba (或时序分组空洞卷积退化模块 `TemporalConvFallback`) 在 Chunk 时间轴上混合特征。
 * **`UnifiedGeometryDecoder`**：并行联合输出绝对单目深度图与稠密像素级光流图。
-* **`EgoPoseHead`**：基于 6D 连续表示法正交化估计相机自身的相对运动变换矩阵。
+* **`GlobalEgoMotionDecoder`**：基于 6D 连续表示法正交化估计相机自身的相对运动变换矩阵。
 * **`FeaturePredictorHead`**：用于物理异常自监督的特征动力学预测头。
 * **`TrackQueryModule`**：管理 32 个持久化时序查询向量，求解实例跨帧绑定。
 
