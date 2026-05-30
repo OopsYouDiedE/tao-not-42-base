@@ -279,24 +279,70 @@ from utils.label_generator import process_batch_on_gpu
 
 
 class CUDAPrefetcher:
+    """真正的异步双缓冲预取器。
+
+    后台线程在独立 CUDA stream 上运行 process_batch_on_gpu，
+    主训练线程通过 event.synchronize() 取走已就绪的批次，
+    实现 GPU 训练计算与数据预处理在时间上完全重叠。
+    queue maxsize=2：允许后台最多超前准备 2 个批次，
+    防止主线程偶发延迟造成的预取停顿。
+    """
+
     def __init__(self, buffer, device, target_size=256, wait_timeout_sec=180):
         self.buffer = buffer
         self.device = device
         self.target_size = target_size
         self.wait_timeout_sec = wait_timeout_sec
+        self._ready = queue.Queue(maxsize=2)
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._prefetch_loop, daemon=True)
+        self._thread.start()
+        atexit.register(self.stop)
 
-    def stop(self):
-        pass
+    def _prefetch_loop(self):
+        # 每个线程拥有自己的 CUDA stream，与默认训练 stream 并发执行，
+        # PyTorch caching allocator 自 1.10 起已是线程安全的。
+        stream = torch.cuda.Stream(device=self.device)
+        while not self._stop.is_set():
+            try:
+                batch_raw = self.buffer.get_batch()
+            except Exception as e:
+                self._ready.put((e, None))
+                return
+            if batch_raw is None:
+                continue
+            try:
+                with torch.cuda.stream(stream):
+                    batch_gpu = process_batch_on_gpu(batch_raw, self.device, self.target_size)
+                event = torch.cuda.Event()
+                event.record(stream)
+                # 阻塞直到主线程消费，确保不会无限堆积 GPU 显存
+                self._ready.put((batch_gpu, event))
+            except Exception as e:
+                self._ready.put((e, None))
+                return
 
     def next(self):
-        # 直接在调用 next() 的 PyTorch 训练主线程中同步获取就绪的数据包
-        batch = self.buffer.get_batch()
-        if batch is None:
-            raise RuntimeError("[Prefetcher] 无法从数据缓冲区中获取批次。")
-        
-        # 在主线程中执行 GPU 数据规约与加载，100% 避免多线程 CUDA 内存分配死锁 (BFC Allocator Deadlock)
-        batch_gpu = process_batch_on_gpu(batch, self.device, self.target_size)
-        return batch_gpu
+        try:
+            item, event = self._ready.get(timeout=self.wait_timeout_sec)
+        except queue.Empty:
+            raise TimeoutError(f"[Prefetcher] 等待预取批次超时 ({self.wait_timeout_sec}s)")
+        if isinstance(item, Exception):
+            raise item
+        # 确保预取 stream 上的所有 GPU ops 已完成，再交给训练 stream 使用
+        if event is not None:
+            event.synchronize()
+        return item
+
+    def stop(self):
+        self._stop.set()
+        # 排空队列以解除后台线程可能卡在 put() 上的阻塞
+        try:
+            while True:
+                self._ready.get_nowait()
+        except queue.Empty:
+            pass
+        self._thread.join(timeout=3.0)
 
 
 # =====================================================================
