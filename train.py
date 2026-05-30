@@ -46,6 +46,8 @@ if __name__ == "__main__":
                         help="等待 TFDS/预取 batch 的最长秒数；超时会报出明确错误而不是静默卡住。")
     parser.add_argument("--freeze", action="store_true", default=False)
     parser.add_argument("--finetune_after_epoch", type=int, default=0)
+    parser.add_argument("--offline_path", type=str, default=None,
+                        help="指定离线 NPZ 数据集路径（例如 tests/data/movi_e_static_sample.npz），启用后不依赖在线下载。")
     args = parser.parse_args()
 
     if not torch.cuda.is_available():
@@ -83,7 +85,7 @@ if __name__ == "__main__":
     try:
         data_buffer = AsyncDataBuffer(
             max_buffer_size=args.max_buffer_size, batch_size=args.batch_size,
-            wait_timeout_sec=args.data_timeout_sec)
+            wait_timeout_sec=args.data_timeout_sec, offline_path=args.offline_path)
         prefetcher = CUDAPrefetcher(
             data_buffer, torch.device(args.device), args.img_size,
             wait_timeout_sec=args.data_timeout_sec)
