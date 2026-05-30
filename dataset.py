@@ -304,9 +304,11 @@ class CUDAPrefetcher:
                 time.sleep(1)
                 continue
             try:
-                with torch.cuda.stream(self.stream):
-                    batch_gpu = process_batch_on_gpu(
-                        batch, self.device, self.target_size)
+                # 显式同步，强制确保 pinned memory 异步拷贝已安全落入 GPU 显存，彻底切断 scatter_reduce_ 异步竞争诱发的非法访问死锁
+                torch.cuda.synchronize(self.device)
+                batch_gpu = process_batch_on_gpu(
+                    batch, self.device, self.target_size)
+                torch.cuda.synchronize(self.device)
                 while not self.stop_event.is_set():
                     try:
                         self.queue.put(batch_gpu, timeout=1.0)
