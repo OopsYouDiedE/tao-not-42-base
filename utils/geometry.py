@@ -20,8 +20,8 @@ def matrix_to_6d(matrix):
 
 def six_d_to_matrix(d6):
     x_raw, y_raw = d6[..., 0:3], d6[..., 3:6]
-    x = F.normalize(x_raw, dim=-1)
-    y = F.normalize(y_raw - (x * y_raw).sum(dim=-1, keepdim=True) * x, dim=-1)
+    x = F.normalize(x_raw, dim=-1, eps=1e-4)
+    y = F.normalize(y_raw - (x * y_raw).sum(dim=-1, keepdim=True) * x, dim=-1, eps=1e-4)
     return torch.stack([x, y, torch.cross(x, y, dim=-1)], dim=-1)
 
 

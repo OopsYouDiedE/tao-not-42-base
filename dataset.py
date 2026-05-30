@@ -239,7 +239,7 @@ class AsyncDataBuffer:
             with self.lock:
                 self.buffer.append(p_item)
                 self.num_fetched += 1
-                if self.num_fetched == 1 or self.num_fetched % 16 == 0:
+                if self.num_fetched == 1 or (self.num_fetched <= 64 and self.num_fetched % 16 == 0):
                     print(f"[DataBuffer] 已缓冲 {min(len(self.buffer), self.max_buffer_size)}/{self.batch_size} 个样本；总计已获取={self.num_fetched}", flush=True)
                 self.has_data.notify_all()
 

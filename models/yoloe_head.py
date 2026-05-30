@@ -369,6 +369,6 @@ class BNContrastiveHead(nn.Module):
 
     def forward(self, x, w):
         x = self.norm(x)
-        w = F.normalize(w, dim=-1, p=2)
+        w = F.normalize(w, dim=-1, p=2, eps=1e-4)
         x = torch.einsum("bchw,bkc->bkhw", x, w)
         return x * self.logit_scale.exp() + self.bias

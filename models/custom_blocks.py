@@ -372,11 +372,11 @@ class ObjectSE3Composer(nn.Module):
         
     def forward(self, sparse_twists, mask_weights, prototypes):
         B, C, H, W = prototypes.shape
-        P = F.normalize(prototypes.view(B, C, -1).transpose(1, 2), dim=-1)
+        P = F.normalize(prototypes.view(B, C, -1).transpose(1, 2), dim=-1, eps=1e-4)
         
         _, _, Ha, Wa = mask_weights.shape
         N = Ha * Wa
-        W_w = F.normalize(mask_weights.view(B, C, N).transpose(1, 2), dim=-1)
+        W_w = F.normalize(mask_weights.view(B, C, N).transpose(1, 2), dim=-1, eps=1e-4)
         
         A = torch.softmax((torch.bmm(P, W_w.transpose(1, 2))) / self.tau, dim=-1)
         
