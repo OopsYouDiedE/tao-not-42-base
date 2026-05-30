@@ -8,6 +8,10 @@ import os
 import sys
 import time
 
+# 确保 Colab 能够正确将本地 tao-not-42-base 项目根目录挂载进 sys.path，彻底解决 'ModuleNotFoundError: No module named models'
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
+
 def print_section(title):
     print("\n" + "=" * 60)
     print(f" 🔍 {title}")
