@@ -5,6 +5,7 @@ import urllib.request
 
 import torch
 import torch.nn as nn
+from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 
 try:
     import wandb
@@ -43,6 +44,11 @@ class TAOTrainer:
             lambda p: p.requires_grad, self.model.parameters()), lr=args.lr)
         self.scaler = torch.amp.GradScaler(
             self.device.type) if self.device.type == "cuda" else None
+        total_steps = args.epochs * args.steps_per_epoch
+        warmup_steps = min(100, total_steps // 20)
+        warmup_sched = LinearLR(self.optimizer, start_factor=0.1, end_factor=1.0, total_iters=warmup_steps)
+        cosine_sched = CosineAnnealingLR(self.optimizer, T_max=max(total_steps - warmup_steps, 1), eta_min=1e-6)
+        self.scheduler = SequentialLR(self.optimizer, schedulers=[warmup_sched, cosine_sched], milestones=[warmup_steps])
         self.global_step, self.start_time, self.best_loss, self.epochs_no_improve = 0, time.time(), float("inf"), 0
         self.mode = "supervised"
 
@@ -321,12 +327,12 @@ class TAOTrainer:
                     gt_pose = torch.cat([trans_diff, rot_diff], dim=1)
 
                 box_prompts = None
-                if prev_queries is None and "boxes" in tgts and "valid" in tgts:
+                if prev_queries is None and "track_gt_boxes" in tgts and "track_gt_valid" in tgts:
                     B_chunk = c_vids.shape[0]
                     T_chunk = c_vids.shape[1]
                     N_query = self.model.track_module.num_queries
-                    boxes_t0 = tgts["boxes"].view(B_chunk, T_chunk, -1, 4)[:, 0]
-                    valid_t0 = tgts["valid"].view(B_chunk, T_chunk, -1)[:, 0]
+                    boxes_t0 = tgts["track_gt_boxes"].view(B_chunk, T_chunk, -1, 4)[:, 0]
+                    valid_t0 = tgts["track_gt_valid"].view(B_chunk, T_chunk, -1)[:, 0]
                     box_prompts = torch.zeros(B_chunk, N_query, 4, device=self.device)
                     for b in range(B_chunk):
                         valid_b = boxes_t0[b][valid_t0[b]]
@@ -350,13 +356,14 @@ class TAOTrainer:
             if self.scaler:
                 self.scaler.scale(loss).backward()
                 self.scaler.unscale_(self.optimizer)
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 5.0)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
             else:
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 5.0)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
                 self.optimizer.step()
+            self.scheduler.step()
 
             total_loss_tensor = total_loss_tensor + loss.detach()
             for k in loss_acc:

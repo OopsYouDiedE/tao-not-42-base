@@ -52,4 +52,4 @@ Thumbs.db
 .pytest_cache/
 htmlcov/
 cov.xml
-
+colab_quickstart.ipynb

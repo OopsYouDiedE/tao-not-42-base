@@ -139,14 +139,14 @@ def get_loss_weights(step=None):
         "obj": 1.0,
         "box": 1.5,
         "mask": 1.0,
-        "depth": ramp(500, 2000, 3.0),
+        "depth": ramp(1000, 4000, 1.5),
         "photo": 0.0,
         "ego": 2.0,
-        "flow": ramp(500, 2000, 2.0),
+        "flow": ramp(1000, 4000, 1.0),
         "cls": 0.0,
         "attr": 0.5,
-        "anom": ramp(500, 2000, 0.2),
-        "smooth": ramp(500, 2000, 0.02),
+        "anom": ramp(1000, 4000, 0.1),
+        "smooth": ramp(1000, 4000, 0.01),
         "gate": 0.0,
         "track": 1.0,
     }
@@ -508,17 +508,18 @@ def compute_physics_loss(preds, targets, img_t=None, img_next=None, mode="superv
         pd_dx = preds["depth"][:, :, 1:] - preds["depth"][:, :, :-1]
         td_dx = targets["depth"][:, :, 1:] - targets["depth"][:, :, :-1]
         mask_dx = v_d_mask[:, :, 1:] * v_d_mask[:, :, :-1]
+        mask_dx_sum = mask_dx.sum().clamp(min=1)
         l_depth_dx = F.smooth_l1_loss(
-            pd_dx * mask_dx, td_dx * mask_dx, reduction="sum")
+            pd_dx * mask_dx, td_dx * mask_dx, reduction="sum") / mask_dx_sum
 
         pd_dy = preds["depth"][:, 1:, :] - preds["depth"][:, :-1, :]
         td_dy = targets["depth"][:, 1:, :] - targets["depth"][:, :-1, :]
         mask_dy = v_d_mask[:, 1:, :] * v_d_mask[:, :-1, :]
+        mask_dy_sum = mask_dy.sum().clamp(min=1)
         l_depth_dy = F.smooth_l1_loss(
-            pd_dy * mask_dy, td_dy * mask_dy, reduction="sum")
+            pd_dy * mask_dy, td_dy * mask_dy, reduction="sum") / mask_dy_sum
 
-        loss_depth = l_depth_base + 0.5 * \
-            (l_depth_dx + l_depth_dy) / v_d_mask_sum if v_d_mask_sum > 0 else l_depth_base
+        loss_depth = l_depth_base + 0.5 * (l_depth_dx + l_depth_dy)
 
     ret_flow_epe = torch.tensor(0.0, device=device)
     if w["flow"] > 0 and preds.get("flow") is not None and "flow_target" in targets:

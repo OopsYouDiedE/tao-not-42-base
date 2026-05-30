@@ -220,7 +220,7 @@ class TAONot42VisionModel(nn.Module):
         # 归一化光流，对齐系统规范约定：flow_norm = flow_px * 2.0 / img_size
         flow_final_norm = flow_final * (2.0 / float(w))
         # [FIX] 物理截断：将异常情况的光流硬截断，防止 L1/L2 回归损失反传时产生极端梯度（甚至 nan）
-        flow_final_norm = torch.clamp(flow_final_norm, min=-20.0, max=20.0)
+        flow_final_norm = torch.clamp(flow_final_norm, min=-2.0, max=2.0)
         
         depth = 1.0 / (inv_depth_resized + 1e-6)
         depth_pred = depth.view(B*T, h, w)
