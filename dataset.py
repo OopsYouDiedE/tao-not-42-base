@@ -282,82 +282,19 @@ class CUDAPrefetcher:
         self.device = device
         self.target_size = target_size
         self.wait_timeout_sec = wait_timeout_sec
-        self.queue = queue.Queue(maxsize=4)
-        self.error = None
-        self._last_wait_log = 0.0
-        self.stop_event = threading.Event()
-        self.stream = torch.cuda.Stream(device=device)
-        self.thread = threading.Thread(target=self._worker, daemon=True)
-        self.thread.start()
-        atexit.register(self.stop)
 
     def stop(self):
-        self.stop_event.set()
-        thread = getattr(self, "thread", None)
-        if thread is not None and thread.is_alive():
-            thread.join(timeout=1.0)
-
-    def _worker(self):
-        while not self.stop_event.is_set():
-            batch = self.buffer.get_batch()
-            if batch is None:
-                time.sleep(1)
-                continue
-            try:
-                # 显式同步，强制确保 pinned memory 异步拷贝已安全落入 GPU 显存，彻底切断 scatter_reduce_ 异步竞争诱发的非法访问死锁
-                torch.cuda.synchronize(self.device)
-                batch_gpu = process_batch_on_gpu(
-                    batch, self.device, self.target_size)
-                torch.cuda.synchronize(self.device)
-                while not self.stop_event.is_set():
-                    try:
-                        self.queue.put(batch_gpu, timeout=1.0)
-                        break
-                    except queue.Full:
-                        continue
-            except Exception as e:
-                self.error = e
-                try:
-                    self.queue.put_nowait(e)
-                except queue.Full:
-                    pass
-                print(f"[Prefetcher] 工作线程失败: {type(e).__name__}: {e}", flush=True)
-                return
+        pass
 
     def next(self):
-        start_wait = time.time()
-        while True:
-            if self.error is not None and self.queue.empty():
-                raise RuntimeError("CUDAPrefetcher 工作线程失败") from self.error
-            try:
-                batch = self.queue.get(timeout=2.0)
-                break
-            except queue.Empty:
-                now = time.time()
-                if now - self._last_wait_log >= 10.0:
-                    print("[Prefetcher] 正在等待处理好的 GPU 批次 ...", flush=True)
-                    self._last_wait_log = now
-                if now - start_wait > self.wait_timeout_sec:
-                    raise TimeoutError(
-                        f"等待处理好的批次 {self.wait_timeout_sec} 秒后超时。"
-                    )
+        # 直接在调用 next() 的 PyTorch 训练主线程中同步获取就绪的数据包
+        batch = self.buffer.get_batch()
+        if batch is None:
+            raise RuntimeError("[Prefetcher] 无法从数据缓冲区中获取批次。")
+        
+        # 在主线程中执行 GPU 数据规约与加载，100% 避免多线程 CUDA 内存分配死锁 (BFC Allocator Deadlock)
+        batch_gpu = process_batch_on_gpu(batch, self.device, self.target_size)
+        return batch_gpu
 
-        if isinstance(batch, Exception):
-            raise RuntimeError("CUDAPrefetcher 工作线程失败") from batch
-
-        torch.cuda.current_stream().wait_stream(self.stream)
-
-        def record(obj):
-            if isinstance(obj, torch.Tensor):
-                obj.record_stream(torch.cuda.current_stream())
-            elif isinstance(obj, (list, tuple)):
-                for x in obj:
-                    record(x)
-            elif isinstance(obj, dict):
-                for x in obj.values():
-                    record(x)
-
-        record(batch)
-        return batch
 
 # =====================================================================
