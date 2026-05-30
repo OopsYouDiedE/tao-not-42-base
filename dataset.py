@@ -18,6 +18,8 @@ except ImportError:
 try:
     import tensorflow as tf
     import tensorflow_datasets as tfds
+    # [FIX] 彻底对 TensorFlow 隐藏 GPU，防止其与 PyTorch 争夺 CUDA Context 造成死锁
+    tf.config.set_visible_devices([], 'GPU')
 except ImportError:
     tf = None
     tfds = None
