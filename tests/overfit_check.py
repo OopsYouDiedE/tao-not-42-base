@@ -68,15 +68,12 @@ def main():
     # 严格的离线隔离：为了确保快速完成测试，避免网络问题卡死，我们只有在本地已存在完整权重（>50MB）时才加载。
     # 否则，直接以随机初始化的权重进行过拟合训练。这能更严密地验证反向传播梯度流与代码的学习能力！
     weights_path = 'yoloe-26s-seg-pf.pt'
-    if os.path.exists(weights_path) and os.path.getsize(weights_path) > 50000000:
-        try:
-            print("[信息] 本地检测到完整预训练权重，正在加载...")
-            load_yoloe_weights(model, weights_path)
-            print("[信息] 预训练权重加载成功！")
-        except Exception as e:
-            print(f"[警告] 加载预训练权重失败: {e}，将以随机初始化权重继续测试。")
-    else:
-        print("[信息] 本地未检测到完整的预训练权重（或文件不完整），将直接使用随机初始化权重执行过拟合测试。")
+    try:
+        print("[信息] 正在尝试加载 YOLOE 预训练权重...")
+        load_yoloe_weights(model, weights_path)
+        print("[信息] YOLOE 预训练权重加载/下载并转换成功！")
+    except Exception as e:
+        print(f"[警告] 加载/下载预训练权重失败: {e}，将以随机初始化权重执行过拟合测试。")
         
     model.train()
     

@@ -218,9 +218,11 @@ class TAONot42VisionModel(nn.Module):
         
         # 最终输出的严谨物理流
         flow_final = flow_rigid + obj_mask * (flow_obj_rigid + res_flow)
+        # 归一化光流，对齐系统规范约定：flow_norm = flow_px * 2.0 / img_size
+        flow_final_norm = flow_final * (2.0 / float(w))
         
-        depth_pred = inv_depth_resized.view(B*T, h, w)
-        return depth_pred, flow_final, se3_out["se3_cam"]
+        depth_pred = depth.view(B*T, h, w)
+        return depth_pred, flow_final_norm, se3_out["se3_cam"]
 
     def _run_anomaly_detection(self, next_st, ego_action_vec, lw_anom, B, T, device):
         feat_err = torch.zeros(B, T, next_st.shape[-2], next_st.shape[-1], device=device)
