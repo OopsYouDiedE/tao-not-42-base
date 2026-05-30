@@ -19,7 +19,7 @@ def flow_to_color(flow_np):
     return cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
 
 
-def save_visualization(video_t, target_t, pred_t, step, warped_img=None, output_dir="vis_outputs"):
+def save_visualization(video_t, target_t, pred_t, step, warped_img=None, output_dir="vis_outputs", draw_track=None):
     os.makedirs(output_dir, exist_ok=True)
     img_tensor = video_t[0].permute(1, 2, 0).cpu().numpy()
     base_bgr = cv2.cvtColor(
@@ -54,8 +54,16 @@ def save_visualization(video_t, target_t, pred_t, step, warped_img=None, output_
             cv2.rectangle(pred_canvas, (int(b_np[0]), int(
                 b_np[1])), (int(b_np[2]), int(b_np[3])), color, 2)
                 
-    # 仅在跟踪阶段正式激活启动（step >= 5000）后才绘制跟踪框，杜绝前序阶段随机初始化的框噪干扰
-    if "track_boxes" in pred_t and "track_alive" in pred_t and step >= 5000:
+    if draw_track is None:
+        try:
+            from utils.losses import get_loss_weights
+            w = get_loss_weights(step)
+            draw_track = (w.get("track", 0.0) > 0.0)
+        except Exception:
+            draw_track = True
+
+    # 依据当前的追踪任务损失权重自适应决定是否绘制追踪框，杜绝未激活阶段的随机噪声干扰，拒绝绝对数值硬编码
+    if "track_boxes" in pred_t and "track_alive" in pred_t and draw_track:
         tb = pred_t["track_boxes"].detach()
         ta = pred_t["track_alive"].detach()
 
