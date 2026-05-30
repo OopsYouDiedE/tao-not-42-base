@@ -54,7 +54,8 @@ def save_visualization(video_t, target_t, pred_t, step, warped_img=None, output_
             cv2.rectangle(pred_canvas, (int(b_np[0]), int(
                 b_np[1])), (int(b_np[2]), int(b_np[3])), color, 2)
                 
-    if "track_boxes" in pred_t and "track_alive" in pred_t:
+    # 仅在跟踪阶段正式激活启动（step >= 5000）后才绘制跟踪框，杜绝前序阶段随机初始化的框噪干扰
+    if "track_boxes" in pred_t and "track_alive" in pred_t and step >= 5000:
         tb = pred_t["track_boxes"].detach()
         ta = pred_t["track_alive"].detach()
 

@@ -133,7 +133,7 @@ def get_loss_weights(step):
             "depth": 3.0,
             "photo": 0.0,
             "ego": 2.0,
-            "flow": 0.0,
+            "flow": 2.0,
             "cls": 0.0,
             "attr": 0.0,
             "anom": 0.0,
