@@ -90,5 +90,17 @@
         `new_sd[bn_key] = tgt[bn_key] + src_v.to(tgt[bn_key].device)`
         此修改能够自适应应对任何计算设备的调用组合（无论 CPU、CUDA:0 还是多卡环境），完全消除了设备冲突隐患，实现了 YOLO 预训练权重的安全加载与物理偏置的无损平滑折叠。
 
+### 7. TensorFlow 与 PyTorch 争夺 CUDA Context 造成的底层死锁修复
+*   **背景**：在训练启动时，主线程的 PyTorch 正在迁移模型至 GPU，而后台拉取 TFDS 数据集的子线程也在加载 TensorFlow。这导致两个框架并发尝试初始化底层 CUDA Context。由于缺少同步，在 NVIDIA 驱动层面触发了静默死锁（Deadlock），表现为数据拉取到一定数目后主循环永久挂起。
+*   **修改**：在 `dataset.py` 的 TensorFlow 模块载入处，显式加入强制过滤逻辑：`tf.config.set_visible_devices([], 'GPU')`。
+*   **成效**：彻底对 TensorFlow 隐藏 GPU 显卡，避免任何显存占用和底层 Context 初始化冲突。数据流与 PyTorch 核心计算彻底解耦，训练过程启动即平滑过渡，零延迟。
 
+### 8. 混合精度（FP16）训练下 F.normalize 除零引发光流 NaN 的 Bug 修复
+*   **物理 Bug 定位与重塑**：在混合精度 (AMP float16) 训练下，`F.normalize(x, dim=-1)` 的默认防止除零偏置项 `eps`（为 `1e-12`）在 float16 中会直接发生下溢并截断为 `0.0`。一旦网络前期的 `prototypes` 或 `mask_weights` 出现全零向量或极小局部波动，归一化操作就会直接执行除以 `0.0`，从而使得密集 SE(3) 分配矩阵 `A` 包含 NaN。这一状态会迅速扩散到 downstream 的 3D 刚体流 `flow_obj_rigid` 计算以及总损失，导致 Flow Loss 呈现 NaN 且光流可视化发生除零警告。
+*   **修复方案**：在 `models/custom_blocks.py`、`utils/geometry.py`、`models/yoloe_head.py` 等所有使用到 `F.normalize` 的地方，显式设置针对 FP16 安全的 `eps=1e-4`，彻底隔绝除零温床，保证时空光流物理重投影反向传播的数值稳定性。
 
+### 9. 训练流程进度条动态可视化（tqdm）与 DataBuffer 刷屏日志精简
+*   **体验重构背景**：原先的训练循环每 10 步就会向终端打印一条包含全部细粒度物理损失的极长日志，且后台 `DataBuffer` 会无间断输出当前缓冲水位，这造成了大量的终端 IO 刷屏，特别是在 Colab / Jupyter 交互式开发环境中极难阅读与对比。
+*   **重构方案**：
+    1.  **静默数据缓冲刷屏**：修改了 `dataset.py` 中 `AsyncDataBuffer` 的输出频率，仅在前 64 个样本载入（启动暖机阶段）打印进度，随后训练中途彻底保持静默。
+    2.  **tqdm 进度条深度结合**：重构了 `trainer.py` 中的 `_train_epoch` 循环。使用 `tqdm.auto.tqdm` 对每个 epoch 的步骤进行进度条封装。在 `_train_chunk` 进行每 10 步的指标统计时，直接将所有精细物理损失以 Postfix 字符串的形式动态反馈到进度条右侧（`self.pbar.set_postfix_str`）。这使得整个训练流在 Colab 下输出纯净清爽，仅保留一行优雅更新的交互式进度条，极大地提升了交互式调试的体验。

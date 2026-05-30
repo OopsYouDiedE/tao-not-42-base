@@ -182,8 +182,15 @@ class TAOTrainer:
                     break
 
     def _train_epoch(self, epoch):
+        from tqdm.auto import tqdm
         loss_sum = torch.tensor(0.0, device=self.device)
-        for _ in range(self.args.steps_per_epoch):
+        pbar = tqdm(
+            range(self.args.steps_per_epoch),
+            desc=f"Epoch {epoch}/{self.args.epochs}",
+            leave=True
+        )
+        self.pbar = pbar
+        for _ in pbar:
             batch = self.prefetcher.next()
             if batch is None:
                 continue
@@ -193,6 +200,7 @@ class TAOTrainer:
             # 彻底取消了所有硬设置 step / 渐进式参数解冻的调度机制，参数状态保持纯净静态控制
             pass
 
+        self.pbar = None
         return loss_sum.item() / self.args.steps_per_epoch
 
     def _extract_target_chunk(self, batch, c_start, c_end, max_t):
@@ -321,8 +329,13 @@ class TAOTrainer:
 
             self.global_step += 1
             if self.global_step % 10 == 0:
-                print(f"[{time.time()-self.start_time:.1f}s] 步数 {self.global_step} | 总计:{loss.item():.4f} | " + " ".join(
-                    [f"{k}:{loss_acc[k]/total_frames:.2f}" for k in ["Obj", "Box", "Mask", "Depth", "Ego", "Flow", "Anom", "Attr", "Track", "FlowEPEpx", "DepthAbsRel"]]))
+                metric_str = f"Loss:{loss.item():.4f} | " + " ".join(
+                    [f"{k}:{loss_acc[k]/total_frames:.2f}" for k in ["Obj", "Box", "Mask", "Depth", "Ego", "Flow", "Anom", "Attr", "Track", "FlowEPEpx", "DepthAbsRel"]]
+                )
+                if hasattr(self, "pbar") and self.pbar is not None:
+                    self.pbar.set_postfix_str(metric_str)
+                else:
+                    print(f"[{time.time()-self.start_time:.1f}s] 步数 {self.global_step} | {metric_str}")
                 if self.wandb:
                     log_dict = {
                         f"Loss/{k}": loss_acc[k]/total_frames for k in loss_acc}
