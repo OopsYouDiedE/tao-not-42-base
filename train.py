@@ -23,8 +23,9 @@ if __name__ == "__main__":
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--steps_per_epoch", type=int, default=1000)
     parser.add_argument("--early_stop_patience", type=int, default=3)
-    parser.add_argument("--unfreeze_step_1", type=int, default=1000)
-    parser.add_argument("--unfreeze_step_2", type=int, default=2000)
+    # 彻底取消任何硬设置 step 的解冻，参数解冻静态由 --freeze 控制。保留参数仅为兼容命令行
+    parser.add_argument("--unfreeze_step_1", type=int, default=1000, help="[已废弃] 骨干解冻步数（现已彻底移除动态解冻，由 --freeze 静态控制）")
+    parser.add_argument("--unfreeze_step_2", type=int, default=2000, help="[已废弃] 骨干解冻步数（现已彻底移除动态解冻，由 --freeze 静态控制）")
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--device", type=str, default="cuda",
                         help="训练使用的 GPU 设备类型。生产环境必须为 CUDA。")

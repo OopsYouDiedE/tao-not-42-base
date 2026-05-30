@@ -190,17 +190,8 @@ class TAOTrainer:
 
             loss_sum = loss_sum + self._train_chunk(batch)
 
-            # 彻底取消 500 绝对步数硬编码，改用自适应比例：解冻第一步 unfreeze_step_1 的 1/4 作为热身阈值
-            prompt_warmup = self.args.unfreeze_step_1 // 4
-            if self.global_step == prompt_warmup and self.mode == "supervised" and hasattr(self.model.segmenter.model[-1], "class_prompts"):
-                self.model.segmenter.model[-1].class_prompts.requires_grad = True
-
-            if self.mode == "supervised" and self.global_step in [self.args.unfreeze_step_1, self.args.unfreeze_step_2]:
-                target_range = range(
-                    20, 23) if self.global_step == self.args.unfreeze_step_1 else range(16, 20)
-                for n, p in self.model.segmenter.named_parameters():
-                    if any(f"model.{i}." in n for i in target_range):
-                        p.requires_grad = True
+            # 彻底取消了所有硬设置 step / 渐进式参数解冻的调度机制，参数状态保持纯净静态控制
+            pass
 
         return loss_sum.item() / self.args.steps_per_epoch
 
@@ -272,7 +263,8 @@ class TAOTrainer:
             self.optimizer.zero_grad(set_to_none=True)
 
             with torch.autocast(device_type=self.device.type, enabled=(self.scaler is not None)):
-                allow_backbone_grad = self.mode == "supervised" and self.global_step >= self.args.unfreeze_step_1
+                # 彻底去除了基于 global_step 的骨干梯度限制，根据是否显式冻结静态决定
+                allow_backbone_grad = self.mode == "supervised" and not self.args.freeze
                 with contextlib.nullcontext() if allow_backbone_grad else torch.no_grad():
                     extracted = self.model.extract_features(
                         c_vids.reshape(-1, *c_vids.shape[2:]))
@@ -283,17 +275,8 @@ class TAOTrainer:
                     (v_seq.shape[0], T_chunk), 1.0 / 24.0, device=self.device)
                 tgts = self._extract_target_chunk(batch, c_start, c_end, t_max)
 
-                # 步骤 5：在提取完 Target Chunk 后，利用 self.global_step 完成 cls_dense 重写覆盖
-                if "cls_dense" in tgts:
-                    cls_warmup = self.args.unfreeze_step_1 // 2
-                    for i, step in enumerate(range(c_start, c_end)):
-                        if self.global_step < cls_warmup or step < 2:
-                            if isinstance(tgts["cls_dense"], list):
-                                for x in tgts["cls_dense"]:
-                                    x.view(v_seq.shape[0], T_chunk, *x.shape[1:])[:, i] = -100
-                            else:
-                                tgts["cls_dense"].view(
-                                    v_seq.shape[0], T_chunk, *tgts["cls_dense"].shape[1:])[:, i] = -100
+                # 彻底去除了基于 global_step 的分类标记覆盖掩码逻辑，由分类损失权重（已固定设为 0.0）统一过滤，保持干净的端到端几何表示
+                pass
 
                 K, K_inv = None, None
                 if "camera_focal_length" in tgts:
