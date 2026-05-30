@@ -31,7 +31,9 @@ def main():
     
     # Instantiate visual model (untrained)
     model = TAONot42VisionModel().to(device)
-    model.eval() # Keep it in eval mode to prevent dropout/batchnorm updates
+    # 使用 train() 模式，确保 YOLOESegment26 分割头以 Training 模式运行并返回训练多尺度预测字典，
+    # 这样才能完美对应和展示我们实际训练的多尺度预测通道（Objectness, Box 距离, Mask Prototypes 等）
+    model.train()
     
     # Load dataset
     B, T, img_size = 1, 24, 256
@@ -66,7 +68,7 @@ def main():
         feats = [f.view(B, T, *f.shape[1:]) for f in model.extract_features(v_seq.flatten(0, 1))]
         
         dt = torch.full((B, T), 1.0 / 24.0, device=device)
-        print("未训练模型前向推理中...")
+        print("模型前向推理中...")
         preds = model.forward_physics(
             *feats, dt, step=5000, 
             get_loss_weights_fn=get_loss_weights, 
@@ -86,8 +88,10 @@ def main():
         # Compute warped image if warp loss components are present
         w_img = preds.get("warped_img", None)
         
-        # Slice target frame to visualize (Frame idx 1)
-        vis_frame_idx = 1
+        # 按照用户要求：在第 2 帧到第 20 帧之间（即 0-indexed 的 1 至 19）随机选择一帧进行测试
+        import random
+        vis_frame_idx = random.randint(1, 19)
+        print(f"\n[随机帧选择] 已随机抽取帧索引: {vis_frame_idx} (代表第 {vis_frame_idx + 1} 帧) 进行可视化测试！\n")
         
         def slice_vis_frame(v):
             if v is None:

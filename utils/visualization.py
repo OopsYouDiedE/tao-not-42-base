@@ -191,11 +191,9 @@ def extract_instances(preds, score_thresh=0.3, nms_thresh=0.5, max_det=20, with_
                 continue
 
             obj_score = torch.sigmoid(obj[b, 0])
-            if cls_list and i < len(cls_list) and cls_list[i] is not None:
-                cls_score = torch.sigmoid(cls_list[i][b]).max(dim=0)[0]
-                final_score = torch.sqrt(obj_score * cls_score)
-            else:
-                final_score = obj_score
+            # 由于实际训练为类无关的物体发现 (class-agnostic object discovery)，分类头未训练，
+            # 乘法融合会导致预测置信度被未训练的分类概率严重抑制，因此直接使用 obj_score 作为置信度。
+            final_score = obj_score
 
             valid = final_score > score_thresh
             if not valid.any():
