@@ -80,7 +80,7 @@ def main():
     optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-4)
     
     # 6. 读取单一 MOVi-E 静态样本并进行 GPU 预处理
-    B, T, img_size = 2, 6, 256
+    B, T, img_size = 1, 12, 256
     npz_path = os.path.join(os.path.dirname(__file__), "data", "movi_e_static_sample.npz")
     v_np, d_np, s_np, f_np, cp_np, cq_np, id_np, cat_np, vel_np, avel_np, vis_np, col_np = get_movi_e_or_fallback(npz_path, B, T, img_size, img_size)
     
