@@ -134,19 +134,20 @@ def get_loss_weights(step=None):
         return max_w * (step - s_start) / (s_end - s_start)
 
     # 阶段一（0-500步）：专注学习基础的 2D 物体感知、时序追踪与相机绝对运动
-    # 阶段二（500-2000步）：平滑 Warmup 引入 3D 物理重投影（真实相机位姿指导下）
+    # 阶段二（500-2500步）：Depth 独自收敛，为 rigid flow 建立可用的深度基础
+    # 阶段三（1500-4000步）：Depth 已有 1000 步沉淀后再引入 Flow，避免两路梯度互咬
     return {
         "obj": 1.0,
         "box": 1.5,
         "mask": 1.0,
-        "depth": ramp(1000, 4000, 1.5),
+        "depth": ramp(500, 2500, 1.5),
         "photo": 0.0,
         "ego": 2.0,
-        "flow": ramp(1000, 4000, 1.0),
+        "flow": ramp(1500, 4000, 1.0),
         "cls": 0.0,
         "attr": 0.5,
-        "anom": ramp(1000, 4000, 0.1),
-        "smooth": ramp(1000, 4000, 0.01),
+        "anom": ramp(1500, 4000, 0.1),
+        "smooth": ramp(500, 2500, 0.01),
         "gate": 0.0,
         "track": 1.0,
     }
