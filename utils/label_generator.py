@@ -2,6 +2,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+
 def process_batch_on_gpu(batch, device, target_size=256):
     def to_gpu(k, dtype=None):
         val = batch[k]
@@ -77,14 +78,29 @@ def process_batch_on_gpu(batch, device, target_size=256):
             return None
         return torch.tensor([x is not None for x in values], device=device, dtype=torch.bool)
 
+    # ================= 修复部分开始 =================
+    # 主动将这些容易是 uint16/int16 的特征转为 float32
+    # 彻底杜绝后续因为 "index_cuda" 不支持 uint16 导致的奔溃
     is_dyn_out = pad_instances("is_dynamic")
+    if is_dyn_out is not None:
+        is_dyn_out = is_dyn_out.float()
     is_dyn_present = instance_presence("is_dynamic")
+
     velocities_out = pad_instances("velocities")
+    if velocities_out is not None:
+        velocities_out = velocities_out.float()
     velocities_present = instance_presence("velocities")
+
     angular_velocities_out = pad_instances("angular_velocities")
+    if angular_velocities_out is not None:
+        angular_velocities_out = angular_velocities_out.float()
     angular_velocities_present = instance_presence("angular_velocities")
+
     visibility_out = pad_instances("visibility")
+    if visibility_out is not None:
+        visibility_out = visibility_out.float()
     visibility_present = instance_presence("visibility")
+    # ================= 修复部分结束 =================
 
     depth_m = torch.clamp(depth_raw, 0.01, 100.0)
     depth_m[depth_raw == 0] = 100.0
@@ -136,32 +152,45 @@ def process_batch_on_gpu(batch, device, target_size=256):
     MAX_INSTANCES = 32
 
     # 1. 准备展平的一维网格坐标
-    y_coords = torch.arange(target_size, dtype=torch.float32, device=device).view(target_size, 1).expand(target_size, target_size).flatten().view(1, 1, -1).expand(B, T, -1)
-    x_coords = torch.arange(target_size, dtype=torch.float32, device=device).view(1, target_size).expand(target_size, target_size).flatten().view(1, 1, -1).expand(B, T, -1)
+    y_coords = torch.arange(target_size, dtype=torch.float32, device=device).view(
+        target_size, 1).expand(target_size, target_size).flatten().view(1, 1, -1).expand(B, T, -1)
+    x_coords = torch.arange(target_size, dtype=torch.float32, device=device).view(
+        1, target_size).expand(target_size, target_size).flatten().view(1, 1, -1).expand(B, T, -1)
     flat_seg = seg.view(B, T, -1).long()
     valid_seg_for_scatter = (flat_seg >= 0) & (flat_seg <= MAX_INSTANCES)
-    scatter_seg = torch.where(valid_seg_for_scatter, flat_seg, torch.zeros_like(flat_seg))
+    scatter_seg = torch.where(valid_seg_for_scatter,
+                              flat_seg, torch.zeros_like(flat_seg))
 
     # 2. 利用 scatter_reduce_ 直接求出边界坐标
-    ymin_target = torch.full((B, T, MAX_INSTANCES + 1), float(target_size), dtype=torch.float32, device=device)
-    ymin_target.scatter_reduce_(dim=2, index=scatter_seg, src=y_coords, reduce="amin", include_self=False)
+    ymin_target = torch.full((B, T, MAX_INSTANCES + 1),
+                             float(target_size), dtype=torch.float32, device=device)
+    ymin_target.scatter_reduce_(
+        dim=2, index=scatter_seg, src=y_coords, reduce="amin", include_self=False)
     ymin = ymin_target[:, :, 1:].permute(2, 0, 1)
 
-    ymax_target = torch.full((B, T, MAX_INSTANCES + 1), -1.0, dtype=torch.float32, device=device)
-    ymax_target.scatter_reduce_(dim=2, index=scatter_seg, src=y_coords, reduce="amax", include_self=False)
+    ymax_target = torch.full(
+        (B, T, MAX_INSTANCES + 1), -1.0, dtype=torch.float32, device=device)
+    ymax_target.scatter_reduce_(
+        dim=2, index=scatter_seg, src=y_coords, reduce="amax", include_self=False)
     ymax = ymax_target[:, :, 1:].permute(2, 0, 1)
 
-    xmin_target = torch.full((B, T, MAX_INSTANCES + 1), float(target_size), dtype=torch.float32, device=device)
-    xmin_target.scatter_reduce_(dim=2, index=scatter_seg, src=x_coords, reduce="amin", include_self=False)
+    xmin_target = torch.full((B, T, MAX_INSTANCES + 1),
+                             float(target_size), dtype=torch.float32, device=device)
+    xmin_target.scatter_reduce_(
+        dim=2, index=scatter_seg, src=x_coords, reduce="amin", include_self=False)
     xmin = xmin_target[:, :, 1:].permute(2, 0, 1)
 
-    xmax_target = torch.full((B, T, MAX_INSTANCES + 1), -1.0, dtype=torch.float32, device=device)
-    xmax_target.scatter_reduce_(dim=2, index=scatter_seg, src=x_coords, reduce="amax", include_self=False)
+    xmax_target = torch.full(
+        (B, T, MAX_INSTANCES + 1), -1.0, dtype=torch.float32, device=device)
+    xmax_target.scatter_reduce_(
+        dim=2, index=scatter_seg, src=x_coords, reduce="amax", include_self=False)
     xmax = xmax_target[:, :, 1:].permute(2, 0, 1)
 
     # 3. 利用 scatter_add_ 直接统计实例真实面积
-    true_area_target = torch.zeros((B, T, MAX_INSTANCES + 1), dtype=torch.int32, device=device)
-    ones = torch.where(valid_seg_for_scatter, torch.ones_like(flat_seg, dtype=torch.int32), torch.zeros_like(flat_seg, dtype=torch.int32))
+    true_area_target = torch.zeros(
+        (B, T, MAX_INSTANCES + 1), dtype=torch.int32, device=device)
+    ones = torch.where(valid_seg_for_scatter, torch.ones_like(
+        flat_seg, dtype=torch.int32), torch.zeros_like(flat_seg, dtype=torch.int32))
     true_area_target.scatter_add_(dim=2, index=scatter_seg, src=ones)
     true_area = true_area_target[:, :, 1:].permute(2, 0, 1)
 
@@ -172,7 +201,8 @@ def process_batch_on_gpu(batch, device, target_size=256):
         H_f, W_f = target_size // stride, target_size // stride
         b_d = torch.zeros(B, T, 4, H_f, W_f, device=device)
         o_d = torch.zeros(B, T, 1, H_f, W_f, device=device)
-        c_d = torch.full((B, T, 1, H_f, W_f), fill_value=-100, dtype=torch.long, device=device)
+        c_d = torch.full((B, T, 1, H_f, W_f), fill_value=-
+                         100, dtype=torch.long, device=device)
         dyn_d = torch.zeros(B, T, 1, H_f, W_f, device=device)
         dyn_valid_d = torch.zeros(B, T, 1, H_f, W_f, device=device)
         cur_mov_d = torch.zeros(B, T, 1, H_f, W_f, device=device)
@@ -200,53 +230,72 @@ def process_batch_on_gpu(batch, device, target_size=256):
 
             o_d[b_idx, t_idx, 0, cy, cx] = 1.0
 
-            dyn_val = torch.zeros_like(n_idx, dtype=torch.float32, device=device)
+            dyn_val = torch.zeros_like(
+                n_idx, dtype=torch.float32, device=device)
             if is_dyn_out is not None and is_dyn_out.numel() > 0:
                 valid_dyn = n_idx.long() < is_dyn_out.shape[1]
                 if is_dyn_present is not None:
                     valid_dyn = valid_dyn & is_dyn_present[b_idx]
                 if valid_dyn.any():
-                    dyn_val[valid_dyn] = is_dyn_out[b_idx[valid_dyn], n_idx[valid_dyn].long()].float()
+                    # 这里已确保 is_dyn_out 是 float32，直接索引即可
+                    dyn_val[valid_dyn] = is_dyn_out[b_idx[valid_dyn],
+                                                    n_idx[valid_dyn].long()]
                 dyn_d[b_idx, t_idx, 0, cy, cx] = dyn_val
-                dyn_valid_d[b_idx[valid_dyn], t_idx[valid_dyn], 0, cy[valid_dyn], cx[valid_dyn]] = 1.0
+                dyn_valid_d[b_idx[valid_dyn], t_idx[valid_dyn],
+                            0, cy[valid_dyn], cx[valid_dyn]] = 1.0
 
-            cur_mov_val = torch.zeros_like(n_idx, dtype=torch.float32, device=device)
-            cur_mov_valid_val = torch.zeros_like(n_idx, dtype=torch.float32, device=device)
-            moving_flag = torch.zeros_like(n_idx, dtype=torch.bool, device=device)
-            motion_defined = torch.zeros_like(n_idx, dtype=torch.bool, device=device)
+            cur_mov_val = torch.zeros_like(
+                n_idx, dtype=torch.float32, device=device)
+            cur_mov_valid_val = torch.zeros_like(
+                n_idx, dtype=torch.float32, device=device)
+            moving_flag = torch.zeros_like(
+                n_idx, dtype=torch.bool, device=device)
+            motion_defined = torch.zeros_like(
+                n_idx, dtype=torch.bool, device=device)
 
             if velocities_out is not None and velocities_out.numel() > 0 and velocities_out.dim() >= 4:
-                valid_vel = (n_idx.long() < velocities_out.shape[1]) & (t_idx.long() < velocities_out.shape[2])
+                valid_vel = (n_idx.long() < velocities_out.shape[1]) & (
+                    t_idx.long() < velocities_out.shape[2])
                 if velocities_present is not None:
                     valid_vel = valid_vel & velocities_present[b_idx]
                 if valid_vel.any():
-                    v = velocities_out[b_idx[valid_vel], n_idx[valid_vel].long(), t_idx[valid_vel]]
-                    moving_flag[valid_vel] |= torch.linalg.vector_norm(v, dim=-1) > 0.03
+                    v = velocities_out[b_idx[valid_vel],
+                                       n_idx[valid_vel].long(), t_idx[valid_vel]]
+                    moving_flag[valid_vel] |= torch.linalg.vector_norm(
+                        v, dim=-1) > 0.03
                     motion_defined[valid_vel] = True
 
             if angular_velocities_out is not None and angular_velocities_out.numel() > 0 and angular_velocities_out.dim() >= 4:
-                valid_ang = (n_idx.long() < angular_velocities_out.shape[1]) & (t_idx.long() < angular_velocities_out.shape[2])
+                valid_ang = (n_idx.long() < angular_velocities_out.shape[1]) & (
+                    t_idx.long() < angular_velocities_out.shape[2])
                 if angular_velocities_present is not None:
                     valid_ang = valid_ang & angular_velocities_present[b_idx]
                 if valid_ang.any():
-                    av = angular_velocities_out[b_idx[valid_ang], n_idx[valid_ang].long(), t_idx[valid_ang]]
-                    moving_flag[valid_ang] |= torch.linalg.vector_norm(av, dim=-1) > 0.03
+                    av = angular_velocities_out[b_idx[valid_ang],
+                                                n_idx[valid_ang].long(), t_idx[valid_ang]]
+                    moving_flag[valid_ang] |= torch.linalg.vector_norm(
+                        av, dim=-1) > 0.03
                     motion_defined[valid_ang] = True
 
-            visible_flag = torch.ones_like(n_idx, dtype=torch.bool, device=device)
+            visible_flag = torch.ones_like(
+                n_idx, dtype=torch.bool, device=device)
             if visibility_out is not None and visibility_out.numel() > 0 and visibility_out.dim() >= 3:
-                valid_vis = (n_idx.long() < visibility_out.shape[1]) & (t_idx.long() < visibility_out.shape[2])
+                valid_vis = (n_idx.long() < visibility_out.shape[1]) & (
+                    t_idx.long() < visibility_out.shape[2])
                 if visibility_present is not None:
                     valid_vis = valid_vis & visibility_present[b_idx]
                 if valid_vis.any():
-                    vis = visibility_out[b_idx[valid_vis], n_idx[valid_vis].long(), t_idx[valid_vis]].float()
+                    # 这里 visibility_out 已经被我们在前面转为了 float32，因此不再会抛出 UInt16 的报错
+                    vis = visibility_out[b_idx[valid_vis],
+                                         n_idx[valid_vis].long(), t_idx[valid_vis]]
                     # MOVi 可见性通常是可见像素计数。
                     # 低阈值可避免对几乎隐藏的对象监督运动状态，
                     # 而分割正例仍提供边界框/掩码。
                     visible_flag[valid_vis] = vis > 10.0
 
             if motion_defined.any():
-                cur_mov_val[motion_defined] = (moving_flag[motion_defined] & visible_flag[motion_defined]).float()
+                cur_mov_val[motion_defined] = (
+                    moving_flag[motion_defined] & visible_flag[motion_defined]).float()
                 cur_mov_valid_val[motion_defined] = 1.0
                 cur_mov_d[b_idx, t_idx, 0, cy, cx] = cur_mov_val
                 cur_mov_valid_d[b_idx, t_idx, 0, cy, cx] = cur_mov_valid_val
@@ -296,17 +345,21 @@ def process_batch_on_gpu(batch, device, target_size=256):
         try:
             camera_focal_length = to_gpu("camera_focal_length", torch.float32)
         except Exception:
-            camera_focal_length = torch.tensor([35.0] * B, device=device, dtype=torch.float32)
+            camera_focal_length = torch.tensor(
+                [35.0] * B, device=device, dtype=torch.float32)
     else:
-        camera_focal_length = torch.tensor([35.0] * B, device=device, dtype=torch.float32)
+        camera_focal_length = torch.tensor(
+            [35.0] * B, device=device, dtype=torch.float32)
 
     if "camera_sensor_width" in batch and batch["camera_sensor_width"] is not None and len(batch["camera_sensor_width"]) > 0:
         try:
             camera_sensor_width = to_gpu("camera_sensor_width", torch.float32)
         except Exception:
-            camera_sensor_width = torch.tensor([32.0] * B, device=device, dtype=torch.float32)
+            camera_sensor_width = torch.tensor(
+                [32.0] * B, device=device, dtype=torch.float32)
     else:
-        camera_sensor_width = torch.tensor([32.0] * B, device=device, dtype=torch.float32)
+        camera_sensor_width = torch.tensor(
+            [32.0] * B, device=device, dtype=torch.float32)
 
     return {
         "video": video_p, "seg_raw": seg, "depth": depth_m, "log_depth": torch.log(depth_m),
