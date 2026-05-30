@@ -190,7 +190,9 @@ class TAOTrainer:
 
             loss_sum = loss_sum + self._train_chunk(batch)
 
-            if self.global_step == 500 and self.mode == "supervised" and hasattr(self.model.segmenter.model[-1], "class_prompts"):
+            # 彻底取消 500 绝对步数硬编码，改用自适应比例：解冻第一步 unfreeze_step_1 的 1/4 作为热身阈值
+            prompt_warmup = self.args.unfreeze_step_1 // 4
+            if self.global_step == prompt_warmup and self.mode == "supervised" and hasattr(self.model.segmenter.model[-1], "class_prompts"):
                 self.model.segmenter.model[-1].class_prompts.requires_grad = True
 
             if self.mode == "supervised" and self.global_step in [self.args.unfreeze_step_1, self.args.unfreeze_step_2]:
@@ -283,8 +285,9 @@ class TAOTrainer:
 
                 # 步骤 5：在提取完 Target Chunk 后，利用 self.global_step 完成 cls_dense 重写覆盖
                 if "cls_dense" in tgts:
+                    cls_warmup = self.args.unfreeze_step_1 // 2
                     for i, step in enumerate(range(c_start, c_end)):
-                        if self.global_step < 1000 or step < 2:
+                        if self.global_step < cls_warmup or step < 2:
                             if isinstance(tgts["cls_dense"], list):
                                 for x in tgts["cls_dense"]:
                                     x.view(v_seq.shape[0], T_chunk, *x.shape[1:])[:, i] = -100
