@@ -219,8 +219,8 @@ class TAONot42VisionModel(nn.Module):
         )
         # 归一化光流，对齐系统规范约定：flow_norm = flow_px * 2.0 / img_size
         flow_final_norm = flow_final * (2.0 / float(w))
-        # [FIX] 物理截断：将异常情况的光流硬截断，防止 L1/L2 回归损失反传时产生极端梯度（甚至 nan）
-        flow_final_norm = torch.clamp(flow_final_norm, min=-2.0, max=2.0)
+        # 软截断：tanh 在边界处梯度仍为 (1-tanh²) > 0，避免硬 clamp 在 ±2.0 处梯度归零导致光流头无法收敛
+        flow_final_norm = torch.tanh(flow_final_norm / 2.0) * 2.0
         
         depth = 1.0 / (inv_depth_resized + 1e-6)
         depth_pred = depth.view(B*T, h, w)
@@ -237,7 +237,9 @@ class TAONot42VisionModel(nn.Module):
             uncertainty = predicted["uncertainty"].view(B, T-1, *next_st.shape[2:])
             
             error = F.smooth_l1_loss(pred_feat, next_st[:, 1:], reduction="none")
-            anomaly_score = (error / uncertainty).mean(dim=2)
+            # float16 下 error/uncertainty 最大可达 ~13.5/1e-4=135000 > float16 上限 65504 → inf → NaN
+            # 升到 float32 计算，同时将 uncertainty 最小值提高到 1e-3 防止 loss_anom 数值爆炸
+            anomaly_score = (error.float() / uncertainty.float().clamp(min=1e-3)).to(error.dtype).mean(dim=2)
             feat_err[:, 1:] = anomaly_score
         return feat_err
 

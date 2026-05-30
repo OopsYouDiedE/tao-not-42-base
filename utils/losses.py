@@ -592,7 +592,8 @@ def compute_physics_loss(preds, targets, img_t=None, img_next=None, mode="superv
                 m_sum = m.sum()
                 loss_photo = (w_loss * m).sum() / m_sum if m_sum > 0 else torch.tensor(0.0, device=device)
 
-    loss_anom = preds["feature_error"].mean()
+    # clamp(max=10) 防止异常分数在 FeaturePredictor 冷启动期间爆表拉飞 total loss
+    loss_anom = preds["feature_error"].mean().clamp(max=10.0)
     loss_gate = preds["state_update_gate"].abs().mean() * 0.01
 
     if w.get("track", 0) > 0 and "track_boxes" in preds:
