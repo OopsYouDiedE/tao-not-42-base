@@ -45,6 +45,8 @@ if __name__ == "__main__":
                         help="WandB 初始化超时秒数，避免网络/登录问题卡住训练。")
     parser.add_argument("--data_timeout_sec", type=int, default=180,
                         help="等待 TFDS/预取 batch 的最长秒数；超时会报出明确错误而不是静默卡住。")
+    parser.add_argument("--no_benchmark", action="store_true", default=False,
+                        help="关闭 cuDNN benchmark（适合需要极速启动的单步调试阶段）。")
     parser.add_argument("--freeze", action="store_true", default=False)
     parser.add_argument("--finetune_after_epoch", type=int, default=0)
     parser.add_argument("--offline_path", type=str, default=None,
@@ -55,7 +57,8 @@ if __name__ == "__main__":
         raise RuntimeError("严格要求 CUDA 环境！核心视觉组件无法在 CPU 上运行。")
 
     if args.device.startswith("cuda") and torch.cuda.is_available():
-        torch.backends.cudnn.benchmark = True
+        if not args.no_benchmark:
+            torch.backends.cudnn.benchmark = True
         try:
             torch.set_float32_matmul_precision("high")
         except Exception:

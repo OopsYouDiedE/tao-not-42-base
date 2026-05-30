@@ -265,8 +265,11 @@ class TAOTrainer:
 
         for c_start in range(0, t_max, self.args.seq_len):
             if self.global_step == 0:
-                print(f"\n[🚀 第一次前向传播] 正在触发 cuDNN 底层算子 Benchmark 穷举搜索，寻找最优卷积算法...", flush=True)
-                cudnn_start = time.time()
+                if torch.backends.cudnn.benchmark:
+                    print(f"\n[🚀 第一次前向传播] 正在触发 cuDNN 底层算子 Benchmark 穷举搜索，寻找最优卷积算法...", flush=True)
+                else:
+                    print(f"\n[🚀 第一次前向传播] 开始第一次网络计算 (cuDNN Benchmark 已关闭，极速启动)...", flush=True)
+                first_step_start = time.time()
 
             c_end = min(c_start + self.args.seq_len, t_max)
             c_vids = v_seq[:, c_start:c_end]
@@ -329,7 +332,10 @@ class TAOTrainer:
                 loss_acc[k] += l_dict.get(k, 0.0) * T_chunk
 
             if self.global_step == 0:
-                print(f"[✅ Benchmark 完成] 耗时: {time.time() - cudnn_start:.1f}s。网络已进入极速计算模式。\n", flush=True)
+                if torch.backends.cudnn.benchmark:
+                    print(f"[✅ Benchmark 完成] 耗时: {time.time() - first_step_start:.1f}s。网络已进入极速计算模式。\n", flush=True)
+                else:
+                    print(f"[✅ 首步计算完成] 耗时: {time.time() - first_step_start:.1f}s。\n", flush=True)
 
             # 步骤 2：使用提取出的外部可视化辅助方法
             self._maybe_visualize(c_vids, tgts, preds, w_img, T_chunk)
