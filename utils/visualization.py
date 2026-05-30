@@ -85,15 +85,14 @@ def save_visualization(video_t, target_t, pred_t, step, warped_img=None, output_
 
     # --- Ground Truth ---
     gt_canvas = base_bgr.copy()
-    if target_t.get("seg_raw") is not None and target_t.get("is_dynamic") is not None:
+    if target_t.get("seg_raw") is not None:
         seg = target_t["seg_raw"][0].cpu().numpy()
-        is_dyn = target_t["is_dynamic"][0].cpu().numpy()
 
         for uid in range(1, int(np.max(seg)) + 1):
             m = seg == uid
             if np.any(m):
-                is_dynamic_obj = (uid - 1 < len(is_dyn)) and is_dyn[uid - 1]
-                color = (0, 0, 255) if is_dynamic_obj else (255, 0, 0)
+                # 统一为蓝色，因为我们现在进行的是类不可知 (class-agnostic) 的物体发现与物理追踪，不再区分动静态颜色的框
+                color = (255, 0, 0)
                 gt_canvas[m] = gt_canvas[m] * 0.5 + np.array(color) * 0.5
 
                 y_idx, x_idx = np.where(m)
@@ -106,8 +105,9 @@ def save_visualization(video_t, target_t, pred_t, step, warped_img=None, output_
         for y, x in zip(*np.where(obj_t > 0.5)):
             b = boxes_t[:, y, x] * 8.0
             gx, gy = x * 8.0 + 4.0, y * 8.0 + 4.0
+            # 统一为蓝色以保持一致性
             cv2.rectangle(gt_canvas, (int(
-                gx - b[0]), int(gy - b[1])), (int(gx + b[2]), int(gy + b[3])), (0, 255, 0), 2)
+                gx - b[0]), int(gy - b[1])), (int(gx + b[2]), int(gy + b[3])), (255, 0, 0), 2)
 
     add_title(gt_canvas, "Ground Truth")
 

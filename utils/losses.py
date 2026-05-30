@@ -122,56 +122,17 @@ def edge_aware_smoothness_loss(depth, img):
 
     return (depth_dx * torch.exp(-img_dx)).mean() + (depth_dy * torch.exp(-img_dy)).mean()
 
-# 动态损失调度阶段控制：允许外部根据超参自适应修改，彻底避免写死绝对步数
+# 彻底取消任何硬设置 step 的课程学习阶段限制，第一步即以全损失联合训练
 STAGE_STEPS = {
-    "stage2": 2000,
-    "stage3": 5000
+    "stage2": 0,
+    "stage3": 0
 }
 
 def set_stage_steps(stage2, stage3):
-    global STAGE_STEPS
-    STAGE_STEPS["stage2"] = stage2
-    STAGE_STEPS["stage3"] = stage3
+    pass
 
 
-def get_loss_weights(step):
-    # 阶段 1：先让检测、分割、深度、ego、光流对齐
-    if step < STAGE_STEPS["stage2"]:
-        return {
-            "obj": 1.0,
-            "box": 1.5,
-            "mask": 1.0,
-            "depth": 3.0,
-            "photo": 0.0,
-            "ego": 2.0,
-            "flow": 2.0,
-            "cls": 0.0,
-            "attr": 0.0,
-            "anom": 0.0,
-            "smooth": 0.02,
-            "gate": 0.0,
-            "track": 0.0,
-        }
-
-    # 阶段 2：加入监督光流，但仍不加 tracking
-    if step < STAGE_STEPS["stage3"]:
-        return {
-            "obj": 1.0,
-            "box": 1.5,
-            "mask": 1.0,
-            "depth": 3.0,
-            "photo": 0.0,
-            "ego": 2.0,
-            "flow": 2.0,
-            "cls": 0.0,
-            "attr": 0.2,
-            "anom": 0.0,
-            "smooth": 0.02,
-            "gate": 0.0,
-            "track": 0.0,
-        }
-
-    # 阶段 3：加入 tracking
+def get_loss_weights(step=None):
     return {
         "obj": 1.0,
         "box": 1.5,
@@ -377,18 +338,8 @@ def compute_instance_loss(preds, targets, step):
             tb = targets["bboxes_dense"][i].permute(0, 2, 3, 1)
             pdist = preds["box_dist"][i].permute(0, 2, 3, 1)
 
-            # 彻底取消 500 和 1000 的绝对步数硬编码，改用自适应比例：
-            # 引入阈值设为 STAGE_STEPS["stage2"] 的 1/4，过渡跨度设为 STAGE_STEPS["stage2"] 的 1/2
-            giou_start = STAGE_STEPS["stage2"] // 4
-            giou_span = STAGE_STEPS["stage2"] // 2
-            
-            l1_w = min(1.0, max(0.0, (step - giou_start) / max(1.0, float(giou_span))))
-            if step >= giou_start:
-                giou = F.smooth_l1_loss(pb, tb, beta=1.0, reduction="none").mean(
-                    dim=-1) * (1 - l1_w) + giou_loss(pb, tb) * l1_w
-            else:
-                giou = F.smooth_l1_loss(
-                    pb, tb, beta=1.0, reduction="none").mean(dim=-1)
+            # 彻底取消任何硬设置 step 限制，直接使用标准的 GIoU 损失
+            giou = giou_loss(pb, tb)
 
             box_l = (giou * 1.5 + dfl_loss(pdist, tb, 32)
                      * 0.5) * pos_mask.float()
