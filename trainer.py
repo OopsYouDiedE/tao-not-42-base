@@ -97,7 +97,7 @@ class TAOTrainer:
                     # 尝试将 bias 吸收到对应的 bn.bias
                     bn_key = remap(src_k.replace(".conv.bias", ".bn.bias"))
                     if bn_key in tgt and tgt[bn_key].shape == src_v.shape:
-                        new_sd[bn_key] = tgt[bn_key] + src_v  # 加法吸收偏移
+                        new_sd[bn_key] = tgt[bn_key] + src_v.to(tgt[bn_key].device)  # 加法吸收偏移
                         bias_absorbed += 1
                     else:
                         key_skipped += 1
