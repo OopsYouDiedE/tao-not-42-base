@@ -53,7 +53,7 @@ def main():
             config={
                 "lr": 1e-4,
                 "weight_decay": 1e-4,
-                "epochs": 2000,
+                "epochs": 4000,
                 "curriculum_step": 6000 # 保持全损失项（包括光流、深度、位姿、追踪）均激活
             }
         )
@@ -116,7 +116,7 @@ def main():
     dt = torch.full((B, T), 1.0 / 24.0, device=device)
     
     # 7. 开始收敛性训练循环（共 100 步）
-    total_steps = 2000
+    total_steps = 4000
     print("\n----------------------------------------------------")
     print(f"[开始] 开始过拟合训练循环，总计 {total_steps} 步，正在追踪损失是否稳定收缩...")
     print("----------------------------------------------------")
@@ -162,8 +162,8 @@ def main():
                 log_payload[f"Loss/{k}"] = val
             wandb.log(log_payload, step=step+1)
             
-        # 每 100 步和最后一步生成可视化，以肉眼观察预测包围框、光流、深度等是否与真值完美合流
-        if step == 0 or (step + 1) % 100 == 0 or step == total_steps - 1:
+        # 每 300 步和最后一步生成可视化，以肉眼观察预测包围框、光流、深度等是否与真值完美合流
+        if step == 0 or (step + 1) % 300 == 0 or step == total_steps - 1:
             vis_frame_idx = min(4, T - 1)  # 动态适配 T，防止越界
             
             def slice_vis_frame(v):
@@ -186,6 +186,8 @@ def main():
                 output_dir="vis_outputs"
             )
             print(f"[可视化生成] 已保存步数 {step+1} 的可视化图像到: {fp}")
+            if api_key:
+                wandb.log({"Overfit_Visualization": wandb.Image(fp)}, step=step+1)
             
             # 将最终的可视化图像保存到 Artifact 目录中以备展示
             if step == total_steps - 1:
