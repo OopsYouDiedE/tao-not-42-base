@@ -45,20 +45,19 @@ def main():
     if api_key:
         os.environ["WANDB_API_KEY"] = api_key
         wandb.login()
-        # 采用 offline 离线记录模式，彻底避免 Windows 环境下 W&B 后台守护进程 socket 锁死导致的挂起问题。
-        # 训练完成后，所有收敛数据会完整保存在本地，可通过 wandb sync 上传。
+        # 采用 online 在线实时同步模式，实时将训练收敛曲线绘制在 W&B 网页端供直观查收。
         wandb.init(
             project="tao-not-42-overfit",
             name="one-sample-overfit-check",
-            mode="offline",
+            mode="online",
             config={
                 "lr": 1e-4,
                 "weight_decay": 1e-4,
-                "epochs": 100,
+                "epochs": 2000,
                 "curriculum_step": 6000 # 保持全损失项（包括光流、深度、位姿、追踪）均激活
             }
         )
-        print("[W&B] 初始化成功，已启用离线记录模式，规避任何网络守护锁！", flush=True)
+        print("[W&B] 初始化成功，已启用实时在线同步模式！", flush=True)
     else:
         print("[警告] 未能在 .env 中读取 WANDB_API_KEY，将无法记录收敛曲线！", flush=True)
 
@@ -117,7 +116,7 @@ def main():
     dt = torch.full((B, T), 1.0 / 24.0, device=device)
     
     # 7. 开始收敛性训练循环（共 100 步）
-    total_steps = 100
+    total_steps = 2000
     print("\n----------------------------------------------------")
     print(f"[开始] 开始过拟合训练循环，总计 {total_steps} 步，正在追踪损失是否稳定收缩...")
     print("----------------------------------------------------")
@@ -163,8 +162,8 @@ def main():
                 log_payload[f"Loss/{k}"] = val
             wandb.log(log_payload, step=step+1)
             
-        # 在第 0 步、第 50 步和第 100 步生成可视化，以肉眼观察预测包围框、光流、深度等是否与真值完美合流
-        if step == 0 or step == 49 or step == 99:
+        # 每 100 步和最后一步生成可视化，以肉眼观察预测包围框、光流、深度等是否与真值完美合流
+        if step == 0 or (step + 1) % 100 == 0 or step == total_steps - 1:
             vis_frame_idx = min(4, T - 1)  # 动态适配 T，防止越界
             
             def slice_vis_frame(v):
@@ -188,8 +187,8 @@ def main():
             )
             print(f"[可视化生成] 已保存步数 {step+1} 的可视化图像到: {fp}")
             
-            # 将最终的第 100 步可视化图像保存到 Artifact 目录中以备展示
-            if step == 99:
+            # 将最终的可视化图像保存到 Artifact 目录中以备展示
+            if step == total_steps - 1:
                 artifact_dir = r"C:\Users\iii\.gemini\antigravity\brain\936eaad8-2dda-4b65-bfbc-ba438a1c9ec0"
                 if os.path.exists(artifact_dir):
                     shutil.copy(fp, os.path.join(artifact_dir, "vis_overfit_100.jpg"))
