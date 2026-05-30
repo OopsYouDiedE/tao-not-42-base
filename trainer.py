@@ -264,6 +264,10 @@ class TAOTrainer:
         prev_queries = None
 
         for c_start in range(0, t_max, self.args.seq_len):
+            if self.global_step == 0:
+                print(f"\n[🚀 第一次前向传播] 正在触发 cuDNN 底层算子 Benchmark 穷举搜索，寻找最优卷积算法...", flush=True)
+                cudnn_start = time.time()
+
             c_end = min(c_start + self.args.seq_len, t_max)
             c_vids = v_seq[:, c_start:c_end]
             T_chunk = c_end - c_start
@@ -323,6 +327,9 @@ class TAOTrainer:
             total_loss_tensor = total_loss_tensor + loss.detach()
             for k in loss_acc:
                 loss_acc[k] += l_dict.get(k, 0.0) * T_chunk
+
+            if self.global_step == 0:
+                print(f"[✅ Benchmark 完成] 耗时: {time.time() - cudnn_start:.1f}s。网络已进入极速计算模式。\n", flush=True)
 
             # 步骤 2：使用提取出的外部可视化辅助方法
             self._maybe_visualize(c_vids, tgts, preds, w_img, T_chunk)
