@@ -297,7 +297,7 @@ class TAOTrainer:
 
                 dt = torch.full(
                     (v_seq.shape[0], T_chunk), 1.0 / 24.0, device=self.device)
-                tgts = extract_target_chunk(batch, c_start, c_end, t_max, self.device)
+                tgts = self._extract_target_chunk(batch, c_start, c_end, t_max)
 
                 # 彻底去除了基于 global_step 的分类标记覆盖掩码逻辑，由分类损失权重（已固定设为 0.0）统一过滤，保持干净的端到端几何表示
                 pass
