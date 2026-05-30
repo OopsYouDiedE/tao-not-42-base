@@ -335,11 +335,18 @@ def backproject(depth, K_inv):
 
 def project(points, K):
     B, _, H, W = points.shape
-    points_flat = points.view(B, 3, -1)
-    pixel_coords = torch.bmm(K, points_flat)
+    points_flat = points.view(B, 3, -1).float()
+    K_f = K.float()
+    pixel_coords = torch.bmm(K_f, points_flat)
     pixel_coords = pixel_coords.view(B, 3, H, W)
-    z = pixel_coords[:, 2:3, :, :].clamp(min=1e-3)
-    return pixel_coords[:, :2, :, :] / z
+    
+    # [FIX] 安全 Z 截断，采用 float32 运算，防止投影奇点（z<=0）时的溢出
+    z = pixel_coords[:, 2:3, :, :].clamp(min=0.01)
+    uv = pixel_coords[:, :2, :, :] / z
+    
+    # 截断到安全范围，防止极限拉扯导致转回 float16 时 inf
+    uv = uv.clamp(min=-50000.0, max=50000.0)
+    return uv.to(points.dtype)
 
 def transform_se3(points, T):
     B, _, H, W = points.shape
