@@ -3,6 +3,7 @@ import torch
 import torch.nn.functional as F
 
 from utils.geometry import *
+from utils.matching import compute_sinkhorn_matching
 
 @torch.no_grad()
 def flow_epe_px(pred_flow_norm, gt_flow_norm, valid_mask=None, img_size=256):
@@ -122,29 +123,30 @@ def edge_aware_smoothness_loss(depth, img):
 
     return (depth_dx * torch.exp(-img_dx)).mean() + (depth_dy * torch.exp(-img_dy)).mean()
 
-# 彻底取消任何硬设置 step 的课程学习阶段限制，第一步即以全损失联合训练
-STAGE_STEPS = {
-    "stage2": 0,
-    "stage3": 0
-}
-
-def set_stage_steps(stage2, stage3):
-    pass
-
-
+# 重构阶段性课程学习限制，实现 2D/3D 物理与运动特征的解耦训练
 def get_loss_weights(step=None):
+    if step is None:
+        step = 5000
+        
+    def ramp(s_start, s_end, max_w):
+        if step < s_start: return 0.0
+        if step >= s_end: return max_w
+        return max_w * (step - s_start) / (s_end - s_start)
+
+    # 阶段一（0-500步）：专注学习基础的 2D 物体感知、时序追踪与相机绝对运动
+    # 阶段二（500-2000步）：平滑 Warmup 引入 3D 物理重投影（真实相机位姿指导下）
     return {
         "obj": 1.0,
         "box": 1.5,
         "mask": 1.0,
-        "depth": 3.0,
+        "depth": ramp(500, 2000, 3.0),
         "photo": 0.0,
         "ego": 2.0,
-        "flow": 2.0,
+        "flow": ramp(500, 2000, 2.0),
         "cls": 0.0,
         "attr": 0.5,
-        "anom": 0.2,
-        "smooth": 0.02,
+        "anom": ramp(500, 2000, 0.2),
+        "smooth": ramp(500, 2000, 0.02),
         "gate": 0.0,
         "track": 1.0,
     }
@@ -167,7 +169,9 @@ def get_ema_loss(name, current_val, alpha=0.95, ema_state=None):
 # =====================================================================
 
 
-def compute_track_loss(preds, targets, step):
+def compute_track_loss(preds, targets, step, assignments=None):
+    if assignments is None:
+        assignments = {}
     if "track_boxes" not in preds:
         device = next(iter(preds.values())
                       ).device if preds else torch.device("cuda")
@@ -203,7 +207,7 @@ def compute_track_loss(preds, targets, step):
     cost_matrix_all = torch.cdist(flat_pred_boxes.detach(), flat_gt_boxes, p=1) # [B*T, N, M]
 
     b_list, t_list, q_list, g_list = [], [], [], []
-    assignments = {}  # (b, gt_idx) -> query_id
+    # assignments 状态由外部传入，跨 Chunk 持久化
 
     for t in range(T):
         alive_t = track_alive[:, t, :, 0]
@@ -248,14 +252,7 @@ def compute_track_loss(preds, targets, step):
                 cost = cost_matrix_all[idx][free_queries][:, new_gt_ids].clone()
 
                 # GPU 原生 Sinkhorn 算法求软分配概率矩阵 (Zero CPU-GPU Sync)
-                epsilon = 0.1
-                P = torch.exp(-cost / epsilon)
-                u = torch.ones_like(P[:, 0])
-                v = torch.ones_like(P[0, :])
-                for _ in range(10):
-                    u = 1.0 / (torch.matmul(P, v) + 1e-8)
-                    v = 1.0 / (torch.matmul(P.t(), u) + 1e-8)
-                P_opt = u.unsqueeze(1) * P * v.unsqueeze(0)
+                P_opt = compute_sinkhorn_matching(cost, epsilon=0.1, iters=10)
 
                 # 将软概率向量化硬化匹配 (0 次微观 CPU 同步阻断)
                 fq_tensor = torch.tensor(free_queries, device=device, dtype=torch.long)
@@ -470,7 +467,7 @@ def compute_attribute_loss(preds, targets):
     return loss / max(n_terms, 1)
 
 
-def compute_physics_loss(preds, targets, img_t=None, img_next=None, mode="supervised", step=0, ema_state=None):
+def compute_physics_loss(preds, targets, img_t=None, img_next=None, mode="supervised", step=0, ema_state=None, assignments=None):
     device = preds["depth"].device
     H, W = preds["depth"].shape[-2:]
     w = get_loss_weights(step)
@@ -482,6 +479,13 @@ def compute_physics_loss(preds, targets, img_t=None, img_next=None, mode="superv
     loss_track = torch.tensor(0.0, device=device)
     loss_attr = torch.tensor(0.0, device=device)
 
+    B, T = preds["track_boxes"].shape[:2]
+    # 强制屏蔽所有 t=0 的时序预测（由于没有历史信息，第一帧预测纯属盲猜，屏蔽以保护前期特征）
+    if "has_next" in targets:
+        has_next_mod = targets["has_next"].view(B, T).clone()
+        has_next_mod[:, 0] = False
+        targets["has_next"] = has_next_mod.flatten(0, 1)
+
     if mode == "supervised" and "cam_pos_t" in targets and "cam_pos_next" in targets:
         R_n_inv = quaternion_to_matrix(
             targets["cam_quat_next"]).transpose(1, 2)
@@ -492,7 +496,9 @@ def compute_physics_loss(preds, targets, img_t=None, img_next=None, mode="superv
         gt_pose = torch.cat([trans_diff, rot_diff], dim=1)
 
         pred_pose_vec = torch.cat([preds["ego_pose"]["t"], preds["ego_pose"]["rot6d"]], dim=-1)
-        loss_ego = F.smooth_l1_loss(pred_pose_vec, gt_pose)
+        l_ego_raw = F.smooth_l1_loss(pred_pose_vec, gt_pose, reduction="none")
+        ego_mask = targets["has_next"].view(B * T, 1).float() if "has_next" in targets else torch.ones_like(l_ego_raw)
+        loss_ego = (l_ego_raw * ego_mask).sum() / (ego_mask.sum() * 9 + 1e-6)
 
         v_d_mask = (~targets["sky_mask"]).float()
         v_d_mask_sum = v_d_mask.sum()
@@ -589,7 +595,7 @@ def compute_physics_loss(preds, targets, img_t=None, img_next=None, mode="superv
     loss_gate = preds["state_update_gate"].abs().mean() * 0.01
 
     if w.get("track", 0) > 0 and "track_boxes" in preds:
-        loss_track = compute_track_loss(preds, targets, step)
+        loss_track = compute_track_loss(preds, targets, step, assignments)
 
     if w.get("attr", 0) > 0 and "attributes" in preds:
         loss_attr = compute_attribute_loss(preds, targets)
@@ -600,10 +606,9 @@ def compute_physics_loss(preds, targets, img_t=None, img_next=None, mode="superv
         "Flow": loss_flow, "Anom": loss_anom, "Cls": loss_cls, "Attr": loss_attr
     }
 
-    tot = sum(w.get(k.lower(), 0) *
-              (l / get_ema_loss(k[:3], l, ema_state=ema_state)) for k, l in loss_components.items())
-    tot += w.get("smooth", 0.05) * loss_smooth + w.get("gate",
-                                                       0.05) * loss_gate + w.get("track", 0) * loss_track
+    # 彻底移除 EMA 异常放大逻辑，改为标量权重直接求和
+    tot = sum(w.get(k.lower(), 0) * l for k, l in loss_components.items())
+    tot += w.get("smooth", 0.05) * loss_smooth + w.get("gate", 0.05) * loss_gate + w.get("track", 0) * loss_track
 
     ret_dict = {k: v.detach() for k, v in loss_components.items() if w.get(k.lower(), 0) > 0}
     if w.get("gate", 0) > 0:

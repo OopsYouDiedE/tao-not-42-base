@@ -155,16 +155,26 @@ def test_all_stages():
             
         dt = torch.full((B, T), 1.0 / 24.0, device=device)
         
+        # 4. 直接复用 TAOTrainer._extract_target_chunk 提取目标
+        dummy_trainer = DummyTrainer(device, step)
+        tgts = TAOTrainer._extract_target_chunk(dummy_trainer, gpu_batch, c_start=0, c_end=T, max_t=t_max)
+        
+        gt_pose = None
+        if "cam_pos_t" in tgts and "cam_pos_next" in tgts:
+            from utils.geometry import quaternion_to_matrix, matrix_to_6d
+            R_n_inv = quaternion_to_matrix(tgts["cam_quat_next"]).transpose(1, 2)
+            trans_diff = torch.bmm(R_n_inv, (tgts["cam_pos_t"] - tgts["cam_pos_next"]).unsqueeze(-1)).squeeze(-1)
+            rot_diff = matrix_to_6d(torch.bmm(R_n_inv, quaternion_to_matrix(tgts["cam_quat_t"])))
+            gt_pose = torch.cat([trans_diff, rot_diff], dim=1)
+
         # 前向传播
         preds = model.forward_physics(
             *feats, dt, step=step, 
             get_loss_weights_fn=get_loss_weights, 
-            original_shape=(img_size, img_size)
+            original_shape=(img_size, img_size),
+            tgts=tgts,
+            gt_pose=gt_pose
         )
-        
-        # 4. 直接复用 TAOTrainer._extract_target_chunk 提取目标
-        dummy_trainer = DummyTrainer(device, step)
-        tgts = TAOTrainer._extract_target_chunk(dummy_trainer, gpu_batch, c_start=0, c_end=T, max_t=t_max)
         
         # 损失计算
         loss, l_dict, w_img = compute_physics_loss(

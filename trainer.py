@@ -185,23 +185,31 @@ class TAOTrainer:
         from tqdm.auto import tqdm
         loss_sum = torch.tensor(0.0, device=self.device)
         pbar = tqdm(
-            range(self.args.steps_per_epoch),
+            total=self.args.steps_per_epoch,
             desc=f"Epoch {epoch}/{self.args.epochs}",
             leave=True
         )
         self.pbar = pbar
-        for _ in pbar:
+        steps_done = 0
+        batches_processed = 0
+        while steps_done < self.args.steps_per_epoch:
             batch = self.prefetcher.next()
             if batch is None:
                 continue
 
+            start_step = self.global_step
             loss_sum = loss_sum + self._train_chunk(batch)
+            chunks = self.global_step - start_step
+            steps_done += chunks
+            batches_processed += 1
+            pbar.update(chunks)
 
             # 彻底取消了所有硬设置 step / 渐进式参数解冻的调度机制，参数状态保持纯净静态控制
             pass
 
+        self.pbar.close()
         self.pbar = None
-        return loss_sum.item() / self.args.steps_per_epoch
+        return loss_sum.item() / max(batches_processed, 1)
 
     def _extract_target_chunk(self, batch, c_start, c_end, max_t):
         T = c_end - c_start
@@ -262,6 +270,7 @@ class TAOTrainer:
         
         # 跨 Chunk 追踪状态持久化记忆
         prev_queries = None
+        track_assignments = {}
 
         for c_start in range(0, t_max, self.args.seq_len):
             if self.global_step == 0:
@@ -288,7 +297,7 @@ class TAOTrainer:
 
                 dt = torch.full(
                     (v_seq.shape[0], T_chunk), 1.0 / 24.0, device=self.device)
-                tgts = self._extract_target_chunk(batch, c_start, c_end, t_max)
+                tgts = extract_target_chunk(batch, c_start, c_end, t_max, self.device)
 
                 # 彻底去除了基于 global_step 的分类标记覆盖掩码逻辑，由分类损失权重（已固定设为 0.0）统一过滤，保持干净的端到端几何表示
                 pass
@@ -303,10 +312,32 @@ class TAOTrainer:
                         dtype=torch.float32
                     )
 
-                # 将上一个 Chunk 遗留的查询状态以及内参送入前向传播
+                gt_pose = None
+                if self.mode == "supervised" and "cam_pos_t" in tgts and "cam_pos_next" in tgts:
+                    from utils.geometry import quaternion_to_matrix, matrix_to_6d
+                    R_n_inv = quaternion_to_matrix(tgts["cam_quat_next"]).transpose(1, 2)
+                    trans_diff = torch.bmm(R_n_inv, (tgts["cam_pos_t"] - tgts["cam_pos_next"]).unsqueeze(-1)).squeeze(-1)
+                    rot_diff = matrix_to_6d(torch.bmm(R_n_inv, quaternion_to_matrix(tgts["cam_quat_t"])))
+                    gt_pose = torch.cat([trans_diff, rot_diff], dim=1)
+
+                box_prompts = None
+                if prev_queries is None and "boxes" in tgts and "valid" in tgts:
+                    B_chunk = c_vids.shape[0]
+                    T_chunk = c_vids.shape[1]
+                    N_query = self.model.track_module.num_queries
+                    boxes_t0 = tgts["boxes"].view(B_chunk, T_chunk, -1, 4)[:, 0]
+                    valid_t0 = tgts["valid"].view(B_chunk, T_chunk, -1)[:, 0]
+                    box_prompts = torch.zeros(B_chunk, N_query, 4, device=self.device)
+                    for b in range(B_chunk):
+                        valid_b = boxes_t0[b][valid_t0[b]]
+                        num_valid = min(len(valid_b), N_query)
+                        if num_valid > 0:
+                            box_prompts[b, :num_valid] = valid_b[:num_valid]
+
+                # 将上一个 Chunk 遗留的查询状态、内参、Teacher Forcing 位姿以及追踪 Prompt 送入前向传播
                 preds = self.model.forward_physics(
                     *feats, dt, self.global_step, get_loss_weights, c_vids.shape[-2:], tgts=tgts,
-                    K=K, K_inv=K_inv, prev_queries=prev_queries)
+                    K=K, K_inv=K_inv, prev_queries=prev_queries, gt_pose=gt_pose, box_prompts=box_prompts)
                     
                 prev_queries = preds.get("next_queries", None)
 
@@ -314,7 +345,7 @@ class TAOTrainer:
 
                 # 步骤 4：显式向 compute_physics_loss 传入实例 EMA 状态
                 loss, l_dict, w_img = compute_physics_loss(preds, tgts, c_vids.flatten(
-                    0, 1), img_next.flatten(0, 1), self.mode, self.global_step, ema_state=self.loss_ema)
+                    0, 1), img_next.flatten(0, 1), self.mode, self.global_step, ema_state=self.loss_ema, assignments=track_assignments)
 
             if self.scaler:
                 self.scaler.scale(loss).backward()

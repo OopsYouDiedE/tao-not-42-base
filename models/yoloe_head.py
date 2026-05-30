@@ -205,7 +205,7 @@ class YOLOESegment26(nn.Module):
             LRPCHead(nn.Conv2d(c3, self.nc, 1), nn.Conv2d(c3, 1, 1), nn.Conv2d(32, 4, 1)),
         ])
 
-    def forward(self, x):
+    def forward(self, x, compute_cls=True):
         """前向传播。
 
         训练时：返回逐尺度特征图字典，供 compute_instance_loss 使用。
@@ -252,12 +252,12 @@ class YOLOESegment26(nn.Module):
                 box_maps.append(box_pos)
 
                 # 3. classification（可选）：lrpc[i].vocab
-                # 3. classification：所有 lrpc[i].vocab 均已由 conv2linear 转为 Linear(c3, nc)
                 #    需要将空间维铺平，经过 Linear 后再还原
-                cls_i = self.lrpc[i].vocab(
-                    mid_feat.permute(0, 2, 3, 1)   # [B, H, W, c3]
-                ).permute(0, 3, 1, 2)               # [B, nc, H, W]
-                cls_maps.append(cls_i)
+                if compute_cls:
+                    cls_i = self.lrpc[i].vocab(
+                        mid_feat.permute(0, 2, 3, 1)   # [B, H, W, c3]
+                    ).permute(0, 3, 1, 2)               # [B, nc, H, W]
+                    cls_maps.append(cls_i)
 
                 # 4. mask coefficients：one2one_cv5
                 mc = self.one2one_cv5[i](x[i])                  # [B, nm, H, W]

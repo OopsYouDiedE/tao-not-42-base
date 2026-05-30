@@ -373,3 +373,51 @@ def process_batch_on_gpu(batch, device, target_size=256):
         "camera_focal_length": camera_focal_length,
         "camera_sensor_width": camera_sensor_width,
     }
+
+def extract_target_chunk(batch, c_start, c_end, max_t, device):
+    import torch
+    T = c_end - c_start
+    B = batch["video"].shape[0]
+    tgt = {}
+    for k, v in batch.items():
+        if k in ("video", "flow"):
+            continue
+
+        if k in ("camera_focal_length", "camera_sensor_width"):
+            # [B] -> [B*T]
+            tgt[k] = v.view(B, 1).expand(B, T).reshape(B * T)
+        elif k == "is_dynamic":
+            tgt[k] = v.unsqueeze(
+                1).expand(-1, T, -1).flatten(0, 1) if v is not None else None
+        elif isinstance(v, list):
+            tgt[k] = [x[:, c_start:c_end].flatten(0, 1) for x in v]
+        else:
+            tgt[k] = v[:, c_start:c_end].flatten(
+                0, 1) if v is not None else None
+
+    flow = batch.get("flow")
+    if flow is not None:
+        flow_tgt = torch.zeros_like(flow[:, c_start:c_end])
+        for i, step in enumerate(range(c_start, c_end)):
+            flow_tgt[:, i] = flow[:, step] if step + \
+                1 < max_t else torch.zeros_like(flow[:, 0])
+        tgt["flow_target"] = flow_tgt.flatten(0, 1)
+
+    tgt["cam_pos_t"] = batch["cam_pos"][:, c_start:c_end].flatten(0, 1)
+    tgt["cam_quat_t"] = batch["cam_quat"][:, c_start:c_end].flatten(0, 1)
+
+    cam_pos_next = torch.zeros_like(batch["cam_pos"][:, c_start:c_end])
+    cam_quat_next = torch.zeros_like(batch["cam_quat"][:, c_start:c_end])
+    has_next = torch.zeros(B, T, device=device, dtype=torch.bool)
+
+    for i, step in enumerate(range(c_start, c_end)):
+        next_idx = step + 1 if step + 1 < max_t else step
+        cam_pos_next[:, i] = batch["cam_pos"][:, next_idx]
+        cam_quat_next[:, i] = batch["cam_quat"][:, next_idx]
+        has_next[:, i] = step + 1 < max_t
+
+    tgt["cam_pos_next"] = cam_pos_next.flatten(0, 1)
+    tgt["cam_quat_next"] = cam_quat_next.flatten(0, 1)
+    tgt["has_next"] = has_next.flatten(0, 1)
+
+    return tgt

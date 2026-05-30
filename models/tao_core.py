@@ -66,6 +66,7 @@ class TAONot42VisionModel(nn.Module):
         self.geom_decoder = UnifiedGeometryDecoder(128, 64, 32)
         self.se3_physics_head = SE3PhysicsHead(ch_list=[128, 256, 512], prototype_ch=32)
         self.rigid_projector = RigidFlowProjector()
+        self.obj_rigid_projector = ObjectRigidFlowProjector()
         
         self.st_block = SpatioTemporalMambaBlock(128)
         self.st_block_p4 = SpatioTemporalMambaBlock(256)
@@ -81,7 +82,7 @@ class TAONot42VisionModel(nn.Module):
     def extract_features(self, peripheral):
         return self.segmenter(peripheral)
 
-    def forward_physics(self, f1, f2, p3_fused, p4, p5, dt, step, get_loss_weights_fn=None, original_shape=None, tgts=None, K=None, K_inv=None, prev_queries=None):
+    def forward_physics(self, f1, f2, p3_fused, p4, p5, dt, step, get_loss_weights_fn=None, original_shape=None, tgts=None, K=None, K_inv=None, prev_queries=None, gt_pose=None, box_prompts=None):
         B, T = f1.shape[:2]
         h, w = original_shape if original_shape else (f1.shape[3] * 2, f1.shape[4] * 2)
         t0 = torch.rand(B, 1, device=f1.device) * 1000.0
@@ -92,19 +93,19 @@ class TAONot42VisionModel(nn.Module):
             p3_fused, p4, p5, t_abs
         )
 
+        lw = get_loss_weights_fn(step) if get_loss_weights_fn else {"flow": 1, "box": 1, "mask": 1, "anom": 1}
+
         # 2. 运行 YOLOE 分割预测头
         seg_preds = self.segmenter.model[-1]([
             spatiotemporal_p3.flatten(0, 1),
             spatiotemporal_p4.flatten(0, 1),
             spatiotemporal_p5.flatten(0, 1)
-        ])
+        ], compute_cls=(lw.get("cls", 0) > 0))
         seg_dict = seg_preds if isinstance(seg_preds, dict) else {}
-
-        lw = get_loss_weights_fn(step) if get_loss_weights_fn else {"flow": 1, "box": 1, "mask": 1, "anom": 1}
 
         # 3. 严格遵循物理方程的几何与运动解码 (深度、位姿、Object Splatting 拼装最终光流)
         depth_pred, flow_pred, ego_pose_dict = self._run_geometry_decoding(
-            f1, f2, spatiotemporal_p3, spatiotemporal_p4, spatiotemporal_p5, B, T, h, w, K, K_inv
+            f1, f2, spatiotemporal_p3, spatiotemporal_p4, spatiotemporal_p5, B, T, h, w, K, K_inv, gt_pose
         )
         
         # 将 EgoPose 的字典提取出用于 Feature Predictor 的拼接动作向量
@@ -118,7 +119,7 @@ class TAONot42VisionModel(nn.Module):
         feat_err = self._run_anomaly_detection(next_st, ego_action_vec, lw["anom"], B, T, f1.device)
 
         # 5. 跨 Chunk 持久化时序追踪
-        track_out, next_queries = self._run_tracking(spatiotemporal_p3, prev_queries)
+        track_out, next_queries = self._run_tracking(spatiotemporal_p3, prev_queries, box_prompts)
 
         # 6. 将 anomaly_map 插值到与 depth, flow 同样的高分辨率 (h, w) 以对齐空间结构
         anomaly_map_resized = F.interpolate(
@@ -158,7 +159,7 @@ class TAONot42VisionModel(nn.Module):
         next_st_p5, spatiotemporal_p5 = update_st(self.st_block_p5, p5)
         return next_st, spatiotemporal_p3, spatiotemporal_p4, spatiotemporal_p5
 
-    def _run_geometry_decoding(self, f1, f2, spatiotemporal_p3, spatiotemporal_p4, spatiotemporal_p5, B, T, h, w, K, K_inv):
+    def _run_geometry_decoding(self, f1, f2, spatiotemporal_p3, spatiotemporal_p4, spatiotemporal_p5, B, T, h, w, K, K_inv, gt_pose=None):
         f1_t = self.f1_temporal(f1.permute(0, 2, 1, 3, 4)).permute(0, 2, 1, 3, 4)
         f2_t = self.f2_temporal(f2.permute(0, 2, 1, 3, 4)).permute(0, 2, 1, 3, 4)
 
@@ -190,39 +191,38 @@ class TAONot42VisionModel(nn.Module):
             
         inv_depth_resized = F.interpolate(inv_depth_raw, size=(h, w), mode="bilinear", align_corners=False)
         
-        # 背景光流：严格由 3D 刚体反投影推导产生，严禁作弊
-        flow_rigid = self.rigid_projector(inv_depth_resized, T_cam, K, K_inv)
+        if K is not None and K.shape[0] != B * T:
+            K = K.expand(B * T, -1, -1)
+            K_inv = K_inv.expand(B * T, -1, -1)
+
+        # 引入 Teacher Forcing：如果有真实相机位姿，则强制使用真值计算背景光流以解耦梯度
+        if gt_pose is not None:
+            from models.custom_heads import rot6d_to_matrix, make_4x4_transform
+            gt_rot6d = gt_pose[:, 3:9]
+            gt_t = gt_pose[:, :3]
+            
+            # 使用与 GlobalEgoMotionDecoder 相同的正交化流程组装 T_cam_gt
+            identity_6d = torch.tensor([1.0, 0, 0, 0, 1.0, 0], dtype=gt_rot6d.dtype, device=gt_rot6d.device)
+            # 这里的 rot6d 已经在 utils/losses.py matrix_to_6d 转换，无需再做激活，但为了保证严格正交性过一遍 rot6d_to_matrix
+            R_gt = rot6d_to_matrix(gt_rot6d)
+            T_cam_gt = make_4x4_transform(R_gt, gt_t)
+            
+            flow_rigid = self.rigid_projector(inv_depth_resized, T_cam_gt, K, K_inv)
+        else:
+            # 背景光流：严格由 3D 刚体反投影推导产生，严禁作弊
+            flow_rigid = self.rigid_projector(inv_depth_resized, T_cam, K, K_inv)
         
-        # 3D 刚体光流合成：计算对象 3D 刚体流 flow_obj_rigid
-        depth = 1.0 / (inv_depth_resized + 1e-6)
-        X1 = backproject(depth, K_inv)  # Shape: [B*T, 3, h, w]
-        
-        # 从 dense_obj_twist 解码平移与旋转场
-        dense_twist_resized = F.interpolate(se3_out["dense_obj_twist"], size=(h, w), mode="bilinear", align_corners=False)
-        v = dense_twist_resized[:, :3, :, :]
-        omega = dense_twist_resized[:, 3:6, :, :]
-        
-        # 叉乘计算 3D 刚体运动场 dX = v + w x X1
-        dX = v + torch.cross(omega, X1, dim=1)  # Shape: [B*T, 3, h, w]
-        X2_obj = X1 + dX
-        
-        # 投影回 2D 并计算刚体光流
-        uv2_obj = project(X2_obj, K)
-        B_T = inv_depth_resized.shape[0]
-        grid = meshgrid(B_T, h, w, inv_depth_resized.dtype, inv_depth_resized.device)[:, :2, :, :]
-        flow_obj_rigid = uv2_obj - grid  # Shape: [B*T, 2, h, w]
-        
-        # 动态残差流：仅作用于被 Object Splatting 圈出来的对象掩码区域内
-        obj_mask = F.interpolate(se3_out["dense_obj_mask"], size=(h, w), mode="bilinear", align_corners=False)
-        res_flow = F.interpolate(se3_out["residual_flow"], size=(h, w), mode="bilinear", align_corners=False)
-        
-        # 最终输出的严谨物理流
-        flow_final = flow_rigid + obj_mask * (flow_obj_rigid + res_flow)
+        # 3D 刚体光流合成与残差流：调用抽离的组件计算最终光流
+        flow_final = self.obj_rigid_projector(
+            inv_depth_resized, se3_out["dense_obj_twist"], se3_out["dense_obj_mask"],
+            se3_out["residual_flow"], flow_rigid, K, K_inv
+        )
         # 归一化光流，对齐系统规范约定：flow_norm = flow_px * 2.0 / img_size
         flow_final_norm = flow_final * (2.0 / float(w))
         # [FIX] 物理截断：将异常情况的光流硬截断，防止 L1/L2 回归损失反传时产生极端梯度（甚至 nan）
         flow_final_norm = torch.clamp(flow_final_norm, min=-20.0, max=20.0)
         
+        depth = 1.0 / (inv_depth_resized + 1e-6)
         depth_pred = depth.view(B*T, h, w)
         return depth_pred, flow_final_norm, se3_out["se3_cam"]
 
@@ -241,5 +241,5 @@ class TAONot42VisionModel(nn.Module):
             feat_err[:, 1:] = anomaly_score
         return feat_err
 
-    def _run_tracking(self, spatiotemporal_p3, prev_queries=None):
-        return self.track_module(spatiotemporal_p3, prev_queries)
+    def _run_tracking(self, spatiotemporal_p3, prev_queries=None, box_prompts=None):
+        return self.track_module(spatiotemporal_p3, prev_queries, box_prompts)
