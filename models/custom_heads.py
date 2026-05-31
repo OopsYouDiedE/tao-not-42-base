@@ -230,10 +230,13 @@ class SE3TwistDecoder(nn.Module):
         )
         
     def forward(self, x):
-        # x: [B, C, H, W]
         out = self.conv(x)
-        # 返回刚体 twist 旋量 [v (0:3), omega (3:6)]，以及偏移量 [offset (6:8)]
-        return out[:, :6, ...], out[:, 6:8, ...]
+        # Physical bound: v ≤ 2 m/frame, ω ≤ 1 rad/frame — mirrors GlobalEgoMotionDecoder.
+        # Without this, unbounded twist feeds directly into projective division, whose
+        # gradient (−xy/Z²) explodes and poisons BN running_var permanently.
+        scale = out.new_tensor([2., 2., 2., 1., 1., 1.]).view(1, 6, 1, 1)
+        twist = torch.tanh(out[:, :6]) * scale
+        return twist, out[:, 6:8]
 
 class DepthDecoder(nn.Module):
     """预测稀疏点位的逆深度 (1维)。"""
@@ -360,9 +363,8 @@ def project(points, K):
     z = pixel_coords[:, 2:3, :, :].clamp(min=0.01)
     uv = pixel_coords[:, :2, :, :] / z
     
-    # 截断到安全范围，防止极限拉扯导致转回 float16 时 inf
     uv = uv.clamp(min=-50000.0, max=50000.0)
-    return uv.to(points.dtype)
+    return uv  # always float32 — casting back to fp16 would re-introduce overflow risk
 
 def transform_se3(points, T):
     B, _, H, W = points.shape
@@ -378,14 +380,14 @@ class RigidFlowProjector(nn.Module):
         super().__init__()
         
     def forward(self, inv_depth, T_cam, K, K_inv):
+        # Caller guarantees: all inputs are float32, inv_depth is detached.
         B, _, H, W = inv_depth.shape
         depth = 1.0 / (inv_depth + 1e-6)
         X1 = backproject(depth, K_inv)
-        X2 = transform_se3(X1, torch.linalg.inv(T_cam.float()).to(T_cam.dtype))
+        X2 = transform_se3(X1, torch.linalg.inv(T_cam))
         uv2 = project(X2, K)
-        grid = meshgrid(B, H, W, inv_depth.dtype, inv_depth.device)[:, :2, :, :]
-        flow = uv2 - grid
-        return flow
+        grid = meshgrid(B, H, W, uv2.dtype, inv_depth.device)[:, :2, :, :]
+        return uv2 - grid
 
 class ObjectSE3Composer(nn.Module):
     """使用 Sparse Splatting 将对象锚点参数映射到密集运动场"""
@@ -416,27 +418,22 @@ class ObjectRigidFlowProjector(nn.Module):
         super().__init__()
         
     def forward(self, inv_depth_resized, dense_twist, dense_obj_mask, residual_flow, flow_rigid, K, K_inv):
+        # Caller guarantees: all inputs are float32, inv_depth_resized is detached.
         h, w = inv_depth_resized.shape[-2:]
         depth = 1.0 / (inv_depth_resized + 1e-6)
         X1 = backproject(depth, K_inv)
-        
+
         dense_twist_resized = F.interpolate(dense_twist, size=(h, w), mode="bilinear", align_corners=False)
-        v = dense_twist_resized[:, :3, :, :]
-        omega = dense_twist_resized[:, 3:6, :, :]
-        
-        dX = v + torch.cross(omega, X1, dim=1)
-        X2_obj = X1 + dX
-        
-        uv2_obj = project(X2_obj, K)
+        dX = dense_twist_resized[:, :3] + torch.cross(dense_twist_resized[:, 3:6], X1, dim=1)
+        uv2_obj = project(X1 + dX, K)
+
         B_T = inv_depth_resized.shape[0]
-        grid = meshgrid(B_T, h, w, inv_depth_resized.dtype, inv_depth_resized.device)[:, :2, :, :]
+        grid = meshgrid(B_T, h, w, uv2_obj.dtype, inv_depth_resized.device)[:, :2, :, :]
         flow_obj_rigid = uv2_obj - grid
-        
+
         obj_mask = F.interpolate(dense_obj_mask, size=(h, w), mode="bilinear", align_corners=False)
         res_flow = F.interpolate(residual_flow, size=(h, w), mode="bilinear", align_corners=False)
-        
-        flow_final = flow_rigid + obj_mask * (flow_obj_rigid + res_flow)
-        return flow_final
+        return flow_rigid + obj_mask * (flow_obj_rigid + res_flow)
 
 class ResidualFlowDecoder(nn.Module):
     """带振幅截断的安全残差流解码器"""

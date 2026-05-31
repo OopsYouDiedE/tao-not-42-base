@@ -73,7 +73,6 @@ class TAONot42VisionModel(nn.Module):
         self.st_block_p5 = SpatioTemporalMambaBlock(512)
         
         self.feature_predictor = FeaturePredictorHead(128)
-        self.state_update_gate_head = nn.Sequential(nn.Linear(128, 64), nn.SiLU(), nn.Linear(64, 1))
         self.track_module = TrackQueryModule(feat_channels=128, num_queries=32, num_heads=4, nc=4585, nm=32)
 
         self.f1_temporal = nn.Conv3d(32, 32, kernel_size=(3, 1, 1), padding=(1, 0, 0), groups=32)
@@ -100,7 +99,7 @@ class TAONot42VisionModel(nn.Module):
             spatiotemporal_p3.flatten(0, 1),
             spatiotemporal_p4.flatten(0, 1),
             spatiotemporal_p5.flatten(0, 1)
-        ], compute_cls=(lw.get("cls", 0) > 0))
+        ], compute_cls=False)
         seg_dict = seg_preds if isinstance(seg_preds, dict) else {}
 
         # 3. 严格遵循物理方程的几何与运动解码 (深度、位姿、Object Splatting 拼装最终光流)
@@ -108,12 +107,7 @@ class TAONot42VisionModel(nn.Module):
             f1, f2, spatiotemporal_p3, spatiotemporal_p4, spatiotemporal_p5, B, T, h, w, K, K_inv, gt_pose
         )
         
-        # 将 EgoPose 的字典提取出用于 Feature Predictor 的拼接动作向量
         ego_action_vec = torch.cat([ego_pose_dict["t"], ego_pose_dict["rot6d"]], dim=1)
-
-        # 状态更新门计算
-        gate_logits = self.state_update_gate_head(spatiotemporal_p3.mean(dim=[3, 4]).flatten(0, 1))
-        gate = torch.sigmoid(gate_logits).view(B*T)
 
         # 4. 异常检测与自监督计算 (结合不确定性方差)
         feat_err = self._run_anomaly_detection(next_st, ego_action_vec, lw["anom"], B, T, f1.device)
@@ -137,8 +131,7 @@ class TAONot42VisionModel(nn.Module):
             "flow": flow_pred,
             "features": spatiotemporal_p3.flatten(0, 1), 
             "anomaly_map": anomaly_map_resized,
-            "feature_error": feat_err.mean(), 
-            "state_update_gate": gate,
+            "feature_error": feat_err.mean(),
             "track_boxes":   track_out["track_boxes"],
             "track_classes": track_out["track_classes"],
             "track_alive":   track_out["track_alive"],
@@ -195,35 +188,38 @@ class TAONot42VisionModel(nn.Module):
             K = K.expand(B * T, -1, -1)
             K_inv = K_inv.expand(B * T, -1, -1)
 
-        # 引入 Teacher Forcing：如果有真实相机位姿，则强制使用真值计算背景光流以解耦梯度
-        if gt_pose is not None:
-            from models.custom_heads import rot6d_to_matrix, make_4x4_transform
-            gt_rot6d = gt_pose[:, 3:9]
-            gt_t = gt_pose[:, :3]
-            
-            # 使用与 GlobalEgoMotionDecoder 相同的正交化流程组装 T_cam_gt
-            identity_6d = torch.tensor([1.0, 0, 0, 0, 1.0, 0], dtype=gt_rot6d.dtype, device=gt_rot6d.device)
-            # 这里的 rot6d 已经在 utils/losses.py matrix_to_6d 转换，无需再做激活，但为了保证严格正交性过一遍 rot6d_to_matrix
-            R_gt = rot6d_to_matrix(gt_rot6d)
-            T_cam_gt = make_4x4_transform(R_gt, gt_t)
-            
-            flow_rigid = self.rigid_projector(inv_depth_resized, T_cam_gt, K, K_inv)
-        else:
-            # 背景光流：严格由 3D 刚体反投影推导产生，严禁作弊
-            flow_rigid = self.rigid_projector(inv_depth_resized, T_cam, K, K_inv)
-        
-        # 3D 刚体光流合成与残差流：调用抽离的组件计算最终光流
-        flow_final = self.obj_rigid_projector(
-            inv_depth_resized, se3_out["dense_obj_twist"], se3_out["dense_obj_mask"],
-            se3_out["residual_flow"], flow_rigid, K, K_inv
-        )
-        # 归一化光流，对齐系统规范约定：flow_norm = flow_px * 2.0 / img_size
-        flow_final_norm = flow_final * (2.0 / float(w))
-        # 软截断：tanh 在边界处梯度仍为 (1-tanh²) > 0，避免硬 clamp 在 ±2.0 处梯度归零导致光流头无法收敛
-        flow_final_norm = torch.tanh(flow_final_norm / 2.0) * 2.0
-        
-        depth = 1.0 / (inv_depth_resized + 1e-6)
-        depth_pred = depth.view(B*T, h, w)
+        # Invariant 2 (gradient decoupling) + Invariant 3 (fp32 geometry):
+        #   All projective geometry runs in fp32 outside AMP — perspective division
+        #   K@X / Z has dynamic range that exceeds fp16 and permanently poisons BN
+        #   running_var when it overflows during the forward pass.
+        #   inv_depth is detached for the flow computation: depth trains from its own
+        #   GT-depth loss (loss_depth), so the -1/Z² amplifier on the depth→flow
+        #   gradient path is architecturally eliminated, not just clipped.
+        with torch.autocast(device_type=inv_depth_resized.device.type, enabled=False):
+            inv_d = inv_depth_resized.detach().float()
+            K32, K_inv32 = K.float(), K_inv.float()
+
+            if gt_pose is not None:
+                from models.custom_heads import rot6d_to_matrix, make_4x4_transform
+                R_gt = rot6d_to_matrix(gt_pose[:, 3:9].float())
+                T_cam_gt = make_4x4_transform(R_gt, gt_pose[:, :3].float())
+                flow_rigid = self.rigid_projector(inv_d, T_cam_gt, K32, K_inv32)
+            else:
+                flow_rigid = self.rigid_projector(inv_d, T_cam.float(), K32, K_inv32)
+
+            flow_final = self.obj_rigid_projector(
+                inv_d,
+                se3_out["dense_obj_twist"].float(),
+                se3_out["dense_obj_mask"].float(),
+                se3_out["residual_flow"].float(),
+                flow_rigid, K32, K_inv32,
+            )
+            # flow_norm = tanh(flow_px / W) * 2  (equivalent to old two-step formula)
+            flow_final_norm = torch.tanh(flow_final * (1.0 / float(w))) * 2.0
+
+            # depth_pred retains its gradient — trained by loss_depth, not by flow loss
+            depth_pred = (1.0 / (inv_depth_resized.float() + 1e-6)).view(B*T, h, w)
+
         return depth_pred, flow_final_norm, se3_out["se3_cam"]
 
     def _run_anomaly_detection(self, next_st, ego_action_vec, lw_anom, B, T, device):

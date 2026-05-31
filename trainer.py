@@ -269,7 +269,7 @@ class TAOTrainer:
         total_loss_tensor = torch.tensor(0.0, device=self.device)
 
         loss_acc = {k: 0.0 for k in [
-            "Obj", "Box", "Mask", "Depth", "Photo", "Ego", "Flow", "Anom", "Gate", "Cls",
+            "Obj", "Box", "Mask", "Depth", "Ego", "Flow", "Anom",
             "Attr", "Track", "FlowEPEpx", "DepthAbsRel", "DepthRMSElog", "DepthDelta1",
             "ObjRecall", "ObjPosConf", "TrackBoxT0", "TrackBoxTpos"
         ]}

@@ -20,17 +20,24 @@
 
 ## 2. 尺度约束深度与动态遮罩解译器 (UnifiedGeometryDecoder)
 
-本模块旨在依靠多帧时序特征与双帧相关性，求解场景的精确几何结构。**系统绝不是“纯单目”框架**。
+本模块旨在依靠多帧时序特征与双帧相关性，求解场景的精确几何结构。**系统绝不是”纯单目”框架**。
 
-### 2.1 彻底废除“自由光流作弊”
-* 以前的设计中，网络独立且自由地预测密集光流，这会导致网络“作弊”（绕过深度和位姿直接拟合像素运动）。
-* **严谨的几何推导**：光流将不再是直接由卷积输出的特征。
-  1. 刚性基础流（由深度和相机运动严格控制）：`Flow_rigid = Project( SE3_cam * Backproject(Depth_scaled, K), K )`
-  2. 最终物理流：`Flow_final = Flow_rigid + (Flow_residual * Dynamic_Mask)`
+### 2.1 彻底废除”自由光流作弊”
+* **严谨的几何推导**：光流严格由物理链组装，绝不是卷积的自由输出：
+  1. 刚性基础流（相机运动 + 深度）：`Flow_rigid = Project( SE3_cam * Backproject(Depth, K), K )`
+  2. 对象刚体流：`Flow_obj = Project( X1 + v + ω×X1, K )`（v、ω 由 `SE3TwistDecoder` 输出，经 `tanh` 硬界定 v≤2m/帧、ω≤1rad/帧）
+  3. 最终物理流：`Flow_final = Flow_rigid + obj_mask * (Flow_obj + Flow_residual)`
 
-### 2.2 尺度约束深度的来源
-* 既然使用了双帧/多帧相关性交互，深度的求解已经变成了时间轴上的立体匹配。
-* **绝对米制尺度的注入**：如果没有已知参考，深度必然存在尺度歧义（Scale Ambiguity）。本系统的深度绝对米制尺度**唯一来源于训练阶段注入的游戏引擎相机真实运动（Ego-Motion GT）**。
+### 2.2 三大数值稳定性不变量
+
+| 不变量 | 实现位置 | 作用 |
+|-------|---------|------|
+| **有界操作数**（Invariant 1）| `SE3TwistDecoder.forward`：`tanh × scale` | 消除向投影除法 1/Z² 传递无界梯度的根因 |
+| **梯度解耦**（Invariant 2）| `_run_geometry_decoding`：`inv_depth.detach()` 传入投影器 | depth 由 GT-depth loss 训练，flow loss 梯度只进入 twist + residual，-1/Z² 放大器架构级消除 |
+| **fp32 几何**（Invariant 3）| `_run_geometry_decoding`：`torch.autocast(enabled=False)` | 透视除法动态范围超 fp16 上限；fp32 保证 BN running_var 不被前向溢出永久污染 |
+
+### 2.3 尺度约束深度的来源
+* **绝对米制尺度的注入**：深度绝对米制尺度**唯一来源于训练阶段注入的游戏引擎相机真实运动（Ego-Motion GT）**。
 
 ---
 

@@ -125,36 +125,15 @@ def edge_aware_smoothness_loss(depth, img):
 
 # 重构阶段性课程学习限制，实现 2D/3D 物理与运动特征的解耦训练
 def get_loss_weights(step=None):
-    if step is None:
-        step = 5000
-        
-    def ramp(s_start, s_end, max_w):
-        if step < s_start: return 0.0
-        if step >= s_end: return max_w
-        return max_w * (step - s_start) / (s_end - s_start)
-
-    # [重构课程] 根因：Depth 是整条物理链（rigid flow / anomaly）的几何基底，
-    #   flow = f(depth, pose, K) 是硬投影；若 depth 未收敛，反投影出的 3D 点是垃圾，
-    #   flow 永远无法收敛。旧课程让 depth 到 500 步才启动、且与 flow(1500) 时间窗重叠，
-    #   导致 flow 建立在尚未收敛的 depth 上 —— 整条物理链一起死。
-    #
-    # 阶段一（0 步起）：2D 感知（obj/box/mask）、相机自运动（ego）与 *深度* 同时全速启动。
-    #   depth 直接受监督、且拥有独立的 geom_decoder，必须第一时间拿到满额梯度优先收敛。
-    # 阶段二（约 3000 步后）：确认 depth 已收敛（DepthAbsRel 应 < 0.2）再引入 flow / anomaly，
-    #   此时 backproject 的 3D 点已可靠，刚体光流投影才有物理意义。
     return {
-        "obj": 1.0,
-        "box": 1.5,
-        "mask": 1.0,
-        "depth": ramp(0, 1000, 1.5),
-        "photo": 0.0,
-        "ego": 2.0,
-        "flow": ramp(3000, 6000, 1.0),
-        "cls": 0.0,
-        "attr": 0.5,
-        "anom": ramp(3000, 6000, 0.1),
-        "smooth": ramp(0, 1000, 0.01),
-        "gate": 0.0,
+        "obj":   1.0,
+        "box":   1.5,
+        "mask":  1.0,
+        "depth": 1.5,
+        "ego":   2.0,
+        "flow":  1.0,
+        "attr":  0.5,
+        "anom":  0.1,
         "track": 1.0,
     }
 
@@ -329,7 +308,7 @@ def compute_track_loss(preds, targets, step, assignments=None, diag=None):
 
     return 1.5 * loss_box + 0.5 * loss_alive
 
-def compute_instance_loss(preds, targets, step):
+def compute_instance_loss(preds, targets):
     B = preds["objectness"][0].shape[0]
     device = preds["objectness"][0].device
     num_scales = len(preds["objectness"])
@@ -337,9 +316,6 @@ def compute_instance_loss(preds, targets, step):
     loss_obj = torch.tensor(0.0, device=device)
     loss_box = torch.tensor(0.0, device=device)
     loss_mask = torch.tensor(0.0, device=device)
-    loss_cls = torch.tensor(0.0, device=device)
-
-    w = get_loss_weights(step)
 
     for i in range(num_scales):
         p_obj, t_obj = preds["objectness"][i], targets["obj_dense"][i]
@@ -350,94 +326,61 @@ def compute_instance_loss(preds, targets, step):
 
         pos_mask = t_obj[:, 0] > 0.5
 
-        if w["box"] > 0:
-            pb = preds["boxes"][i].permute(0, 2, 3, 1)
-            tb = targets["bboxes_dense"][i].permute(0, 2, 3, 1)
-            pdist = preds["box_dist"][i].permute(0, 2, 3, 1)
+        pb = preds["boxes"][i].permute(0, 2, 3, 1)
+        tb = targets["bboxes_dense"][i].permute(0, 2, 3, 1)
+        pdist = preds["box_dist"][i].permute(0, 2, 3, 1)
+        giou = giou_loss(pb, tb)
+        box_l = (giou * 1.5 + dfl_loss(pdist, tb, 32) * 0.5) * pos_mask.float()
+        pos_sum = pos_mask.float().sum()
+        loss_box += box_l.sum() / pos_sum if pos_sum > 0 else torch.tensor(0.0, device=device)
 
-            # 彻底取消任何硬设置 step 限制，直接使用标准的 GIoU 损失
-            giou = giou_loss(pb, tb)
+        pos_mask_b = pos_mask.bool()
+        if pos_mask_b.any():
+            b_idx, y_idx, x_idx = torch.where(pos_mask_b)
+            mc = preds["mask_coefficients"][i].permute(0, 2, 3, 1)[b_idx, y_idx, x_idx]
+            protos_n = preds["mask_prototypes"][b_idx]
+            pred_logits = torch.einsum("nc,nchw->nhw", mc, protos_n)
 
-            box_l = (giou * 1.5 + dfl_loss(pdist, tb, 32)
-                     * 0.5) * pos_mask.float()
-            pos_sum = pos_mask.float().sum()
-            loss_box += box_l.sum() / pos_sum if pos_sum > 0 else torch.tensor(0.0, device=device)
+            H, W = targets["seg_raw"].shape[1], targets["seg_raw"].shape[2]
+            stride = 8 * (2 ** i)
+            gy = (y_idx.float() * stride + stride / 2.0).long().clamp(0, H - 1)
+            gx = (x_idx.float() * stride + stride / 2.0).long().clamp(0, W - 1)
 
-        if w["mask"] > 0:
-            pos_mask_b = pos_mask.bool()
-            if pos_mask_b.any():
-                b_idx, y_idx, x_idx = torch.where(pos_mask_b)
-                mc = preds["mask_coefficients"][i].permute(0, 2, 3, 1)[b_idx, y_idx, x_idx]
-                
-                protos = preds["mask_prototypes"]
-                protos_n = protos[b_idx]
-                
-                pred_logits = torch.einsum("nc,nchw->nhw", mc, protos_n)
-                
-                H, W = targets["seg_raw"].shape[1], targets["seg_raw"].shape[2]
-                stride = 8 * (2 ** i)
-                
-                gy = (y_idx.float() * stride + stride / 2.0).long().clamp(0, H - 1)
-                gx = (x_idx.float() * stride + stride / 2.0).long().clamp(0, W - 1)
-                
-                inst_ids = targets["seg_raw"][b_idx, gy, gx]
-                gt_masks_full = (targets["seg_small"][b_idx] == inst_ids.view(-1, 1, 1)).float()
-                
-                if gt_masks_full.shape[-2:] != pred_logits.shape[-2:]:
-                    gt_masks_full = F.interpolate(gt_masks_full.unsqueeze(1), size=pred_logits.shape[-2:], mode="nearest").squeeze(1)
-                
-                tb = targets["bboxes_dense"][i].permute(0, 2, 3, 1)[b_idx, y_idx, x_idx]
-                
-                mask_stride = H / pred_logits.shape[-2]
-                gy_m = (y_idx.float() * stride + stride / 2.0) / mask_stride
-                gx_m = (x_idx.float() * stride + stride / 2.0) / mask_stride
-                
-                pl_m = tb[:, 0] * stride / mask_stride
-                pt_m = tb[:, 1] * stride / mask_stride
-                pr_m = tb[:, 2] * stride / mask_stride
-                pb_m = tb[:, 3] * stride / mask_stride
-                
-                x1 = (gx_m - pl_m).clamp(0, pred_logits.shape[-1] - 1)
-                y1 = (gy_m - pt_m).clamp(0, pred_logits.shape[-2] - 1)
-                x2 = (gx_m + pr_m).clamp(0, pred_logits.shape[-1] - 1)
-                y2 = (gy_m + pb_m).clamp(0, pred_logits.shape[-2] - 1)
-                
-                rows = torch.arange(pred_logits.shape[-2], device=device).view(1, -1, 1)
-                cols = torch.arange(pred_logits.shape[-1], device=device).view(1, 1, -1)
-                
-                box_mask = (cols >= x1.view(-1, 1, 1)) & (cols <= x2.view(-1, 1, 1)) & \
-                           (rows >= y1.view(-1, 1, 1)) & (rows <= y2.view(-1, 1, 1))
-                
-                pred_logits_crop = pred_logits.masked_fill(~box_mask, -10.0)
-                gt_masks_crop = gt_masks_full * box_mask.float()
-                
-                intersection = (torch.sigmoid(pred_logits_crop) * gt_masks_crop).sum(dim=(1, 2))
-                union = torch.sigmoid(pred_logits_crop).sum(dim=(1, 2)) + gt_masks_crop.sum(dim=(1, 2))
-                
-                bce = F.binary_cross_entropy_with_logits(pred_logits_crop, gt_masks_crop, reduction="none")
-                focal_bce = (0.25 * (1 - torch.exp(-bce)) ** 2 * bce).mean(dim=(1, 2))
-                
-                gt_area = gt_masks_crop.sum(dim=(1, 2))
-                dice_loss = 1.0 - (2.0 * intersection + gt_area * 0.01 + 1e-4) / \
-                                  (union + gt_area * 0.01 + 1e-4)
-                
-                valid_mask_inst = (inst_ids > 0).float()
-                inst_sum = valid_mask_inst.sum()
-                loss_mask += ((dice_loss * 2.0 + focal_bce) * valid_mask_inst).sum() / inst_sum if inst_sum > 0 else torch.tensor(0.0, device=device)
+            inst_ids = targets["seg_raw"][b_idx, gy, gx]
+            gt_masks_full = (targets["seg_small"][b_idx] == inst_ids.view(-1, 1, 1)).float()
+            if gt_masks_full.shape[-2:] != pred_logits.shape[-2:]:
+                gt_masks_full = F.interpolate(gt_masks_full.unsqueeze(1), size=pred_logits.shape[-2:], mode="nearest").squeeze(1)
 
-        # [FIX] 如果 get_loss_weights 中的 cls 为 0，此处将被跳过，保护分类器字典不被错误标签淹没。
-        if w.get("cls", 0) > 0 and "dense_classification" in preds and "cls_dense" in targets:
-            gt_cls = targets["cls_dense"][i][:, 0].long()
-            dense_cls_loss = F.cross_entropy(preds["dense_classification"][i].permute(
-                0, 2, 3, 1).flatten(0, 2), gt_cls.flatten(0, 2), reduction="none").view_as(pos_mask)
-            main_cls_loss = F.cross_entropy(preds["classification"][i].permute(
-                0, 2, 3, 1).flatten(0, 2), gt_cls.flatten(0, 2), reduction="none").view_as(pos_mask)
+            tb = targets["bboxes_dense"][i].permute(0, 2, 3, 1)[b_idx, y_idx, x_idx]
+            mask_stride = H / pred_logits.shape[-2]
+            gy_m = (y_idx.float() * stride + stride / 2.0) / mask_stride
+            gx_m = (x_idx.float() * stride + stride / 2.0) / mask_stride
+            x1 = (gx_m - tb[:, 0] * stride / mask_stride).clamp(0, pred_logits.shape[-1] - 1)
+            y1 = (gy_m - tb[:, 1] * stride / mask_stride).clamp(0, pred_logits.shape[-2] - 1)
+            x2 = (gx_m + tb[:, 2] * stride / mask_stride).clamp(0, pred_logits.shape[-1] - 1)
+            y2 = (gy_m + tb[:, 3] * stride / mask_stride).clamp(0, pred_logits.shape[-2] - 1)
 
-            pos_sum = pos_mask.float().sum()
-            loss_cls += ((dense_cls_loss + main_cls_loss) * 0.5 *
-                         pos_mask.float()).sum() / pos_sum if pos_sum > 0 else torch.tensor(0.0, device=device)
+            rows = torch.arange(pred_logits.shape[-2], device=device).view(1, -1, 1)
+            cols = torch.arange(pred_logits.shape[-1], device=device).view(1, 1, -1)
+            box_mask = (cols >= x1.view(-1, 1, 1)) & (cols <= x2.view(-1, 1, 1)) & \
+                       (rows >= y1.view(-1, 1, 1)) & (rows <= y2.view(-1, 1, 1))
 
-    return loss_obj, loss_box, loss_mask, loss_cls
+            pred_logits_crop = pred_logits.masked_fill(~box_mask, -10.0)
+            gt_masks_crop = gt_masks_full * box_mask.float()
+
+            intersection = (torch.sigmoid(pred_logits_crop) * gt_masks_crop).sum(dim=(1, 2))
+            union = torch.sigmoid(pred_logits_crop).sum(dim=(1, 2)) + gt_masks_crop.sum(dim=(1, 2))
+            bce = F.binary_cross_entropy_with_logits(pred_logits_crop, gt_masks_crop, reduction="none")
+            focal_bce = (0.25 * (1 - torch.exp(-bce)) ** 2 * bce).mean(dim=(1, 2))
+
+            gt_area = gt_masks_crop.sum(dim=(1, 2))
+            dice_loss = 1.0 - (2.0 * intersection + gt_area * 0.01 + 1e-4) / \
+                              (union + gt_area * 0.01 + 1e-4)
+            valid_mask_inst = (inst_ids > 0).float()
+            inst_sum = valid_mask_inst.sum()
+            loss_mask += ((dice_loss * 2.0 + focal_bce) * valid_mask_inst).sum() / inst_sum if inst_sum > 0 else torch.tensor(0.0, device=device)
+
+    return loss_obj, loss_box, loss_mask
 
 def compute_attribute_loss(preds, targets):
     if "attributes" not in preds:
@@ -492,8 +435,7 @@ def compute_physics_loss(preds, targets, img_t=None, img_next=None, mode="superv
     H, W = preds["depth"].shape[-2:]
     w = get_loss_weights(step)
 
-    loss_obj, loss_box, loss_mask, loss_cls = compute_instance_loss(
-        preds, targets, step)
+    loss_obj, loss_box, loss_mask = compute_instance_loss(preds, targets)
 
     # [诊断] Obj 召回率 / 正样本平均置信度：focal loss 的数值会被“背景坍缩”骗到极小，
     # 这两个指标不可作弊——坍缩时 ObjRecall≈0，真学到时 ObjRecall→1。
@@ -512,8 +454,7 @@ def compute_physics_loss(preds, targets, img_t=None, img_next=None, mode="superv
             n_pos_total = n_pos_total.clamp(min=1.0)
             obj_recall = obj_recall / n_pos_total
             obj_pos_conf = obj_pos_conf / n_pos_total
-    loss_ego, loss_depth, loss_flow, loss_photo, loss_smooth = [
-        torch.tensor(0.0, device=device) for _ in range(5)]
+    loss_ego, loss_depth, loss_flow = [torch.tensor(0.0, device=device) for _ in range(3)]
     loss_track = torch.tensor(0.0, device=device)
     loss_attr = torch.tensor(0.0, device=device)
 
@@ -596,8 +537,6 @@ def compute_physics_loss(preds, targets, img_t=None, img_next=None, mode="superv
 
     warped_img = None
     if img_t is not None:
-        loss_smooth = edge_aware_smoothness_loss(
-            preds["depth"].unsqueeze(1), img_t)
         if img_next is not None:
             K, K_inv = generate_intrinsics(
                 H,
@@ -608,7 +547,7 @@ def compute_physics_loss(preds, targets, img_t=None, img_next=None, mode="superv
                 dtype=preds["depth"].dtype,
             )
             pred_pose_vec = torch.cat([preds["ego_pose"]["t"], preds["ego_pose"]["rot6d"]], dim=-1)
-            warped_img, v_w_mask = inverse_warp(
+            warped_img, _ = inverse_warp(
                 img_next,
                 preds["depth"].unsqueeze(1),
                 pred_pose_vec,
@@ -617,22 +556,7 @@ def compute_physics_loss(preds, targets, img_t=None, img_next=None, mode="superv
                 depth_is_distance=True,
             )
 
-            if w["photo"] > 0:
-                def p_loss(p, t):
-                    return 0.15 * F.l1_loss(p, t, reduction="none").mean(dim=1, keepdim=True) + 0.85 * ssim_loss(p, t).mean(dim=1, keepdim=True)
-
-                w_loss = p_loss(warped_img, img_t)
-                has_n_factor = targets["has_next"].view(
-                    -1, 1, 1, 1).float() if "has_next" in targets else 1.0
-                m = v_w_mask * (1 - targets["sky_mask"].float().unsqueeze(1)) * (
-                    w_loss < p_loss(img_next, img_t)).float() * has_n_factor
-
-                m_sum = m.sum()
-                loss_photo = (w_loss * m).sum() / m_sum if m_sum > 0 else torch.tensor(0.0, device=device)
-
-    # clamp(max=10) 防止异常分数在 FeaturePredictor 冷启动期间爆表拉飞 total loss
     loss_anom = preds["feature_error"].mean().clamp(max=10.0)
-    loss_gate = preds["state_update_gate"].abs().mean() * 0.01
 
     track_diag = {}
     if w.get("track", 0) > 0 and "track_boxes" in preds:
@@ -643,18 +567,15 @@ def compute_physics_loss(preds, targets, img_t=None, img_next=None, mode="superv
 
     loss_components = {
         "Obj": loss_obj, "Box": loss_box, "Mask": loss_mask,
-        "Depth": loss_depth, "Photo": loss_photo, "Ego": loss_ego,
-        "Flow": loss_flow, "Anom": loss_anom, "Cls": loss_cls, "Attr": loss_attr
+        "Depth": loss_depth, "Ego": loss_ego,
+        "Flow": loss_flow, "Anom": loss_anom, "Attr": loss_attr
     }
 
-    # 彻底移除 EMA 异常放大逻辑，改为标量权重直接求和
     tot = sum(w.get(k.lower(), 0) * l for k, l in loss_components.items())
-    tot += w.get("smooth", 0.05) * loss_smooth + w.get("gate", 0.05) * loss_gate + w.get("track", 0) * loss_track
+    tot += w["track"] * loss_track
 
     ret_dict = {k: v.detach() for k, v in loss_components.items() if w.get(k.lower(), 0) > 0}
-    if w.get("gate", 0) > 0:
-        ret_dict["Gate"] = loss_gate.detach()
-    if w.get("track", 0) > 0:
+    if w["track"] > 0:
         ret_dict["Track"] = loss_track.detach()
         ret_dict["TrackBoxT0"] = track_diag.get("TrackBoxT0", torch.tensor(0.0, device=device))
         ret_dict["TrackBoxTpos"] = track_diag.get("TrackBoxTpos", torch.tensor(0.0, device=device))
