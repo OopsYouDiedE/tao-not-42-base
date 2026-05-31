@@ -75,11 +75,16 @@ class UnifiedGeometryDecoder(nn.Module):
         self.conv2 = Conv(ch_f1 * 2, ch_f1, 3)
         
         self.depth_branch = nn.Sequential(
-            nn.Upsample(scale_factor=2.0, mode="bilinear", align_corners=False), 
-            Conv(ch_f1, ch_f1, 3), 
-            Conv(ch_f1, ch_f1 // 2, 3), 
+            nn.Upsample(scale_factor=2.0, mode="bilinear", align_corners=False),
+            Conv(ch_f1, ch_f1, 3),
+            Conv(ch_f1, ch_f1 // 2, 3),
             nn.Conv2d(ch_f1 // 2, 1, 3, padding=1)
         )
+        # [修复] 深度头冷启动偏置：inv_depth = exp(raw)，raw 初始 ≈0 → depth≈1m，
+        # 而 MOVi 典型场景深度 ~10m（log_depth≈2.3），初始 loss 直接卡在 ~1.8。
+        # 把末层 bias 预置为 log(0.1)=-2.3，使初始 inv_depth≈0.1 → depth≈10m，
+        # 让深度回归从合理尺度起步，而不是靠 Adam 慢慢把全局偏置爬过去。
+        nn.init.constant_(self.depth_branch[-1].bias, -2.3)
         self.conf_branch = nn.Sequential(
             nn.Upsample(scale_factor=2.0, mode="bilinear", align_corners=False), 
             Conv(ch_f1, ch_f1 // 2, 3), 

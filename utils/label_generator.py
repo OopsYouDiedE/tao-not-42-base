@@ -314,6 +314,42 @@ def process_batch_on_gpu(batch, device, target_size=256):
                 torch.clamp((y_max_f - gy) / stride, min=1e-4),
             ], dim=-1)
 
+            # [修复] Center-sampling：把每个物体的正样本从单中心 cell 扩展到 3×3 邻域。
+            # 根因——旧标签每物体每尺度只标 1 个正 cell（~10 正样本 vs ~1700 负样本），
+            # focal loss 的最优解是“处处预测背景”（数学上 Obj≈0.006，纯背景坍缩），
+            # 同时 Box/Mask 每张图只有几个监督点 → 高方差、训不动。
+            # 这里把中心落在 GT 框内的邻域 cell 也设为正样本，各自回归到自身中心的 ltrb，
+            # 把监督点 1→~9 个，使“背景坍缩”不再是最优解。中心样本（上面已写入）享有
+            # 最高优先级（free 掩码保证邻域不覆盖任何物体中心的精确 ltrb）。
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    if dy == 0 and dx == 0:
+                        continue
+                    ncy = torch.clamp(cy + dy, 0, H_f - 1)
+                    ncx = torch.clamp(cx + dx, 0, W_f - 1)
+                    ngx = ncx.float() * stride + stride / 2.0
+                    ngy = ncy.float() * stride + stride / 2.0
+                    nl = (ngx - x_min_f) / stride
+                    nt = (ngy - y_min_f) / stride
+                    nr = (x_max_f - ngx) / stride
+                    nb = (y_max_f - ngy) / stride
+                    inside = (nl > 0) & (nt > 0) & (nr > 0) & (nb > 0)
+                    if not inside.any():
+                        continue
+                    bi, ti, yy, xx = b_idx[inside], t_idx[inside], ncy[inside], ncx[inside]
+                    # 仅写入尚未被任何物体中心占据的 cell，保护中心样本的精确 ltrb
+                    free = o_d[bi, ti, 0, yy, xx] < 0.5
+                    if not free.any():
+                        continue
+                    bi, ti, yy, xx = bi[free], ti[free], yy[free], xx[free]
+                    o_d[bi, ti, 0, yy, xx] = 1.0
+                    b_d[bi, ti, :, yy, xx] = torch.stack([
+                        nl[inside][free].clamp(min=1e-4),
+                        nt[inside][free].clamp(min=1e-4),
+                        nr[inside][free].clamp(min=1e-4),
+                        nb[inside][free].clamp(min=1e-4),
+                    ], dim=-1)
+
         bboxes_dense.append(b_d)
         obj_dense.append(o_d)
         cls_dense.append(c_d)

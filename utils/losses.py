@@ -133,21 +133,27 @@ def get_loss_weights(step=None):
         if step >= s_end: return max_w
         return max_w * (step - s_start) / (s_end - s_start)
 
-    # 阶段一（0-500步）：专注学习基础的 2D 物体感知、时序追踪与相机绝对运动
-    # 阶段二（500-2500步）：Depth 独自收敛，为 rigid flow 建立可用的深度基础
-    # 阶段三（1500-4000步）：Depth 已有 1000 步沉淀后再引入 Flow，避免两路梯度互咬
+    # [重构课程] 根因：Depth 是整条物理链（rigid flow / anomaly）的几何基底，
+    #   flow = f(depth, pose, K) 是硬投影；若 depth 未收敛，反投影出的 3D 点是垃圾，
+    #   flow 永远无法收敛。旧课程让 depth 到 500 步才启动、且与 flow(1500) 时间窗重叠，
+    #   导致 flow 建立在尚未收敛的 depth 上 —— 整条物理链一起死。
+    #
+    # 阶段一（0 步起）：2D 感知（obj/box/mask）、相机自运动（ego）与 *深度* 同时全速启动。
+    #   depth 直接受监督、且拥有独立的 geom_decoder，必须第一时间拿到满额梯度优先收敛。
+    # 阶段二（约 3000 步后）：确认 depth 已收敛（DepthAbsRel 应 < 0.2）再引入 flow / anomaly，
+    #   此时 backproject 的 3D 点已可靠，刚体光流投影才有物理意义。
     return {
         "obj": 1.0,
         "box": 1.5,
         "mask": 1.0,
-        "depth": ramp(500, 2500, 1.5),
+        "depth": ramp(0, 1000, 1.5),
         "photo": 0.0,
         "ego": 2.0,
-        "flow": ramp(1500, 4000, 1.0),
+        "flow": ramp(3000, 6000, 1.0),
         "cls": 0.0,
         "attr": 0.5,
-        "anom": ramp(1500, 4000, 0.1),
-        "smooth": ramp(500, 2500, 0.01),
+        "anom": ramp(3000, 6000, 0.1),
+        "smooth": ramp(0, 1000, 0.01),
         "gate": 0.0,
         "track": 1.0,
     }
@@ -170,7 +176,7 @@ def get_ema_loss(name, current_val, alpha=0.95, ema_state=None):
 # =====================================================================
 
 
-def compute_track_loss(preds, targets, step, assignments=None):
+def compute_track_loss(preds, targets, step, assignments=None, diag=None):
     if assignments is None:
         assignments = {}
     if "track_boxes" not in preds:
@@ -301,6 +307,19 @@ def compute_track_loss(preds, targets, step, assignments=None):
         gt_boxes_matched = track_gt_boxes[b_idx, t_idx, g_idx]
         loss_box = F.smooth_l1_loss(pred_boxes_matched, gt_boxes_matched, beta=0.1, reduction="sum")
         n_matched_total = len(b_list)
+
+        # [诊断] 拆分 t=0（GT 播种帧，几乎免费）与 t>0（真正的时序传播）的框误差。
+        # Track loss 整体很小可能只是因为 t=0 被 GT 喂了；只有 t>0 也低、且场景有运动，
+        # 才证明它真的在“追踪”而非冻住首帧框。
+        if diag is not None:
+            with torch.no_grad():
+                per_match = F.smooth_l1_loss(
+                    pred_boxes_matched, gt_boxes_matched, beta=0.1, reduction="none").mean(dim=-1)
+                is_t0 = (t_idx == 0)
+                diag["TrackBoxT0"] = per_match[is_t0].mean().detach() if is_t0.any() \
+                    else torch.tensor(0., device=device)
+                diag["TrackBoxTpos"] = per_match[~is_t0].mean().detach() if (~is_t0).any() \
+                    else torch.tensor(0., device=device)
     else:
         n_matched_total = 1
 
@@ -475,6 +494,24 @@ def compute_physics_loss(preds, targets, img_t=None, img_next=None, mode="superv
 
     loss_obj, loss_box, loss_mask, loss_cls = compute_instance_loss(
         preds, targets, step)
+
+    # [诊断] Obj 召回率 / 正样本平均置信度：focal loss 的数值会被“背景坍缩”骗到极小，
+    # 这两个指标不可作弊——坍缩时 ObjRecall≈0，真学到时 ObjRecall→1。
+    obj_recall = torch.tensor(0.0, device=device)
+    obj_pos_conf = torch.tensor(0.0, device=device)
+    if "objectness" in preds:
+        with torch.no_grad():
+            n_pos_total = torch.tensor(0.0, device=device)
+            for i in range(len(preds["objectness"])):
+                t_pos = targets["obj_dense"][i][:, 0] > 0.5
+                if t_pos.any():
+                    p = torch.sigmoid(preds["objectness"][i][:, 0])[t_pos]
+                    obj_recall = obj_recall + (p > 0.5).float().sum()
+                    obj_pos_conf = obj_pos_conf + p.sum()
+                    n_pos_total = n_pos_total + t_pos.float().sum()
+            n_pos_total = n_pos_total.clamp(min=1.0)
+            obj_recall = obj_recall / n_pos_total
+            obj_pos_conf = obj_pos_conf / n_pos_total
     loss_ego, loss_depth, loss_flow, loss_photo, loss_smooth = [
         torch.tensor(0.0, device=device) for _ in range(5)]
     loss_track = torch.tensor(0.0, device=device)
@@ -597,8 +634,9 @@ def compute_physics_loss(preds, targets, img_t=None, img_next=None, mode="superv
     loss_anom = preds["feature_error"].mean().clamp(max=10.0)
     loss_gate = preds["state_update_gate"].abs().mean() * 0.01
 
+    track_diag = {}
     if w.get("track", 0) > 0 and "track_boxes" in preds:
-        loss_track = compute_track_loss(preds, targets, step, assignments)
+        loss_track = compute_track_loss(preds, targets, step, assignments, diag=track_diag)
 
     if w.get("attr", 0) > 0 and "attributes" in preds:
         loss_attr = compute_attribute_loss(preds, targets)
@@ -618,7 +656,11 @@ def compute_physics_loss(preds, targets, img_t=None, img_next=None, mode="superv
         ret_dict["Gate"] = loss_gate.detach()
     if w.get("track", 0) > 0:
         ret_dict["Track"] = loss_track.detach()
+        ret_dict["TrackBoxT0"] = track_diag.get("TrackBoxT0", torch.tensor(0.0, device=device))
+        ret_dict["TrackBoxTpos"] = track_diag.get("TrackBoxTpos", torch.tensor(0.0, device=device))
 
+    ret_dict["ObjRecall"] = obj_recall.detach()
+    ret_dict["ObjPosConf"] = obj_pos_conf.detach()
     ret_dict["FlowEPEpx"] = ret_flow_epe.detach()
     ret_dict["DepthAbsRel"] = depth_abs_rel.detach()
     ret_dict["DepthRMSElog"] = depth_rmse_log.detach()

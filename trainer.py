@@ -270,7 +270,8 @@ class TAOTrainer:
 
         loss_acc = {k: 0.0 for k in [
             "Obj", "Box", "Mask", "Depth", "Photo", "Ego", "Flow", "Anom", "Gate", "Cls",
-            "Attr", "Track", "FlowEPEpx", "DepthAbsRel", "DepthRMSElog", "DepthDelta1"
+            "Attr", "Track", "FlowEPEpx", "DepthAbsRel", "DepthRMSElog", "DepthDelta1",
+            "ObjRecall", "ObjPosConf", "TrackBoxT0", "TrackBoxTpos"
         ]}
         total_frames = 0
         
@@ -356,12 +357,15 @@ class TAOTrainer:
             if self.scaler:
                 self.scaler.scale(loss).backward()
                 self.scaler.unscale_(self.optimizer)
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                # [修复] grad-norm 裁剪 1.0 → 5.0：本模型是 4585 类 + 多头巨型网络，
+                # 全局梯度范数长期 >> 1.0，裁到 1.0 会把深度/光流等稠密头的有效步长压没，
+                # 与 tests/overfit_check.py（已验证可收敛）保持一致用 5.0。
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 5.0)
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
             else:
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 5.0)
                 self.optimizer.step()
             self.scheduler.step()
 
@@ -381,7 +385,7 @@ class TAOTrainer:
             self.global_step += 1
             if self.global_step % 10 == 0:
                 metric_str = f"Loss:{loss.item():.4f} | " + " ".join(
-                    [f"{k}:{loss_acc[k]/total_frames:.2f}" for k in ["Obj", "Box", "Mask", "Depth", "Ego", "Flow", "Anom", "Attr", "Track", "FlowEPEpx", "DepthAbsRel"]]
+                    [f"{k}:{loss_acc[k]/total_frames:.2f}" for k in ["Obj", "ObjRecall", "Box", "Mask", "Depth", "Ego", "Flow", "Anom", "Attr", "Track", "TrackBoxT0", "TrackBoxTpos", "FlowEPEpx", "DepthAbsRel"]]
                 )
                 if hasattr(self, "pbar") and self.pbar is not None:
                     self.pbar.set_postfix_str(metric_str)
